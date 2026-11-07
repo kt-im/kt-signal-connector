@@ -16043,7 +16043,7 @@ mod tests {
     }
 
     #[test]
-    fn message_insert_and_event_log_commit_together() {
+    fn single_account_lifecycle_acceptance() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
@@ -16111,6 +16111,48 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].3, "message.upserted");
         assert_eq!(rows[0].2.as_deref(), Some(account.id.as_str()));
+        let seq = rows[0].0;
+
+        // 1. restart: message and event survive.
+        drop(store);
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let count: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE id='atomic-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(store.list_events_since(0, 10).unwrap().len(), 1);
+
+        // 2. unlink keeps history and bumps epoch.
+        store.set_event_cursor("desktop", seq, 1).unwrap();
+        store.mark_account_device_unlinked("+15555550100").unwrap();
+        assert_eq!(store.account_engine_epoch(&account.id).unwrap(), Some(1));
+        let count: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE id='atomic-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // 3. relink bumps again; cursor replay is durable.
+        store
+            .mark_account_ready_by_id(&account.id, "upstream")
+            .unwrap();
+        assert_eq!(store.account_engine_epoch(&account.id).unwrap(), Some(2));
+        drop(store);
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert_eq!(store.event_cursor("desktop").unwrap(), Some((seq, 1)));
     }
 
     #[test]
