@@ -16183,6 +16183,22 @@ mod tests {
             .mark_account_ready_by_id(&account.id, "upstream")
             .unwrap();
         assert_eq!(store.account_engine_epoch(&account.id).unwrap(), Some(2));
+        let attempt = store
+            .record_send_attempt("atomic-1", &account.id, "req-1", "dispatch-1", 2)
+            .unwrap();
+        store.settle_send_attempt(attempt, "ok", None).unwrap();
+        let settled: (Option<i64>, Option<String>) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT returned_at, result FROM send_attempt WHERE attempt_id=?1",
+                [attempt],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(settled.0.is_some());
+        assert_eq!(settled.1.as_deref(), Some("ok"));
         drop(store);
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         assert_eq!(store.event_cursor("desktop").unwrap(), Some((seq, 1)));
