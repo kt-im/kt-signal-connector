@@ -40054,6 +40054,20 @@ mod tests {
                 .as_deref(),
             Some("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
         );
+        // Official completion-only final blob still emits the completion
+        // event even when it carries no records.
+        let account_row = service
+            .store_ref()
+            .account_by_id(&account.id)
+            .unwrap()
+            .expect("account row");
+        let completion = service
+            .apply_sync_contacts(&account_row, &[], true)
+            .unwrap();
+        assert!(matches!(
+            completion.as_slice(),
+            [HostSideEvent::ContactSyncCompleted { account_id }] if account_id == &account.id
+        ));
         // The aci-only sibling writes nothing: its peer key *is* the ACI,
         // the self-row the §4.37 ladder skips.
         assert!(
