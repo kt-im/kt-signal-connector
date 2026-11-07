@@ -7950,6 +7950,16 @@ impl ConnectorService {
     /// answers MESSAGE_NOT_FOUND (the original request never arrived — the
     /// sweep's honest error arm), a row from another conversation answers
     /// INVALID_REQUEST.
+    pub fn events_since(
+        &self,
+        after_seq: i64,
+        limit: u32,
+    ) -> Result<Vec<crate::store::EventLogRecord>, ServiceError> {
+        self.store
+            .events_since(after_seq, limit)
+            .map_err(Into::into)
+    }
+
     pub fn get_message_by_client_request(
         &self,
         account_id: &str,

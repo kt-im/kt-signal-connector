@@ -1586,6 +1586,28 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                 "this method requires empty params",
             ),
         ),
+        // B: durable event_log cursor read face. afterSeq is the subscriber's
+        // last applied seq; the answer is strictly ascending and bounded.
+        "events.list" => {
+            let after_seq = request
+                .params
+                .get("afterSeq")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let limit = request
+                .params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .clamp(1, 500) as u32;
+            match runtime.events_since(after_seq, limit).await {
+                Ok(events) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(events).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            }
+        }
         "accounts.list" if empty_params(&request.params) => match runtime.list_accounts().await {
             Ok(accounts) => HostResponse::success(
                 request_id,

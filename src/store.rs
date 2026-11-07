@@ -3572,6 +3572,26 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
+    pub fn events_since(
+        &self,
+        after_seq: i64,
+        limit: u32,
+    ) -> Result<Vec<EventLogRecord>, StoreError> {
+        Ok(self
+            .list_events_since(after_seq, limit)?
+            .into_iter()
+            .map(
+                |(seq, epoch, account_id, event_type, payload)| EventLogRecord {
+                    seq,
+                    epoch,
+                    account_id,
+                    event_type,
+                    payload,
+                },
+            )
+            .collect())
+    }
+
     pub fn record_send_attempt(
         &self,
         message_id: &str,
@@ -14373,6 +14393,16 @@ fn ensure_additive_columns(conn: &Connection) -> Result<(), StoreError> {
 
 pub(crate) type EventLogRow = (i64, u64, Option<String>, String, String);
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventLogRecord {
+    pub seq: i64,
+    pub epoch: u64,
+    pub account_id: Option<String>,
+    pub event_type: String,
+    pub payload: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct EventLogWrite {
     pub epoch: u64,
@@ -16128,6 +16158,9 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(store.list_events_since(0, 10).unwrap().len(), 1);
+        let records = store.events_since(0, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_type, "message.upserted");
 
         // 2. unlink keeps history and bumps epoch.
         store.set_event_cursor("desktop", seq, 1).unwrap();

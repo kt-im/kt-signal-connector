@@ -1621,6 +1621,16 @@ impl ProxyGroupRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn events_since(
+        &self,
+        after_seq: i64,
+        limit: u32,
+    ) -> Result<Vec<crate::store::EventLogRecord>, ServiceError> {
+        let service = self.router.lock().await;
+        service.events_since(after_seq, limit)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_text(
         &self,
         account_id: String,
