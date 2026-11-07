@@ -1222,6 +1222,12 @@ pub enum HostSideEvent {
         state: &'static str,
     },
     AccountChanged(AccountSummary),
+    /// Official contactSync:complete: the primary's contact attachment has
+    /// been parsed and applied. This — not the contacts.sync RPC return — is
+    /// the inbox gate's contacts half.
+    ContactSyncCompleted {
+        account_id: String,
+    },
     /// C: connection-axis state from the engine. Never an account terminal.
     ConnectionStateChanged {
         account_id: String,
@@ -11740,8 +11746,8 @@ impl ConnectorService {
         // addresses its own subjects (the records carry their identities),
         // never an envelope source (the envelope is our own account) — the
         // same interception family as the verified/call-event siblings above.
-        if let ControlReceive::SyncContacts { contacts } = &control {
-            return self.apply_sync_contacts(&account, contacts);
+        if let ControlReceive::SyncContacts { contacts, complete } = &control {
+            return self.apply_sync_contacts(&account, contacts, *complete);
         }
         // Contract 1.175 (§4.175): the backfill-response sync addresses its
         // own target (the face carries its conversation identity), never an
@@ -14081,9 +14087,16 @@ impl ConnectorService {
         &mut self,
         account: &AccountRow,
         contacts: &[crate::engine::SyncContactRecord],
+        complete: bool,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
         if contacts.is_empty() {
-            return Ok(Vec::new());
+            return Ok(if complete {
+                vec![HostSideEvent::ContactSyncCompleted {
+                    account_id: account.id.clone(),
+                }]
+            } else {
+                Vec::new()
+            });
         }
         let mut synced: Vec<(String, String, String)> = Vec::new();
         // Contract 1.259 (§4.243): the bindings this batch writes, collected
@@ -14174,6 +14187,11 @@ impl ConnectorService {
             }
         }
         events.extend(merge_events);
+        if complete {
+            events.push(HostSideEvent::ContactSyncCompleted {
+                account_id: account.id.clone(),
+            });
+        }
         Ok(events)
     }
 
@@ -39980,7 +39998,10 @@ mod tests {
             let mut receive = control_receive(
                 "+15555550100",
                 "+15555550100",
-                ControlReceive::SyncContacts { contacts },
+                ControlReceive::SyncContacts {
+                    contacts,
+                    complete: false,
+                },
             );
             receive.source = None;
             receive
@@ -42971,6 +42992,7 @@ mod tests {
                     number: Some(peer_number.into()),
                     name: Some("Sync Peer".into()),
                 }],
+                false,
             )
             .unwrap();
 

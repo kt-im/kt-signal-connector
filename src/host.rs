@@ -5280,6 +5280,10 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
                 }),
             ))
         }
+        HostSideEvent::ContactSyncCompleted { account_id } => Ok(HostEvent::new(
+            "contactSync.complete",
+            json!({ "accountId": account_id }),
+        )),
         HostSideEvent::ReceiveDecryptionError { account_id } => {
             // Contract 1.165, §4.163: the decryption-error envelope — the
             // fact alone (the receive.emptied posture). Observability only:

@@ -1755,6 +1755,7 @@ pub enum ControlReceive {
     /// the records name their own subjects (the read/viewed precedent).
     SyncContacts {
         contacts: Vec<SyncContactRecord>,
+        complete: bool,
     },
     /// The engine's `syncMessage.blocked` projection (contract 1.140,
     /// §4.136): the account's own linked device replaced its block list —
@@ -2656,7 +2657,7 @@ impl NormalizedReceive {
                 // The contacts sync carries heap record Vecs like the read
                 // lists — counted entry-wise so the queue budget stays
                 // honest (§4.13).
-                Some(ControlReceive::SyncContacts { contacts }) => contacts
+                Some(ControlReceive::SyncContacts { contacts, .. }) => contacts
                     .iter()
                     .map(|record| {
                         std::mem::size_of::<SyncContactRecord>()
@@ -7055,13 +7056,21 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
     // envelope is our own account and the records name their own subjects
     // (the read/viewed precedent).
     if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object) {
-        let contacts = normalized_sync_contact_records(sync.get("contacts"));
-        if !contacts.is_empty() {
+        let contacts_face = sync.get("contacts");
+        let contacts = normalized_sync_contact_records(contacts_face);
+        let complete = contacts_face
+            .and_then(Value::as_object)
+            .and_then(|face| face.get("complete"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // Official contactSync:complete is a signal in its own right: an empty
+        // final blob still completes the post-registration wait.
+        if complete || !contacts.is_empty() {
             return Some(ControlRouting {
                 direction: "incoming",
                 source: None,
                 group_id: None,
-                control: ControlReceive::SyncContacts { contacts },
+                control: ControlReceive::SyncContacts { contacts, complete },
             });
         }
     }
@@ -12851,7 +12860,7 @@ mod tests {
             .map(|routing| (routing.control, routing.source))
         };
 
-        let Some((ControlReceive::SyncContacts { contacts }, source)) = routing(json!({
+        let Some((ControlReceive::SyncContacts { contacts, complete }, source)) = routing(json!({
             "contacts": {
                 "complete": true,
                 "records": [
@@ -12872,6 +12881,7 @@ mod tests {
         })) else {
             panic!("expected a contacts control routing");
         };
+        assert!(complete);
         assert_eq!(contacts.len(), 2);
         assert_eq!(contacts[0].aci, "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae");
         assert_eq!(contacts[0].number.as_deref(), Some("+15551234567"));
@@ -12881,9 +12891,19 @@ mod tests {
         assert!(contacts[1].name.is_none());
         assert!(source.is_none(), "the envelope is our own account");
 
+        // Completion-only final blob: no records, but the complete flag still
+        // routes so the inbox gate can settle.
+        let Some((ControlReceive::SyncContacts { contacts, complete }, _)) =
+            routing(json!({ "contacts": { "complete": true, "records": [] } }))
+        else {
+            panic!("completion-only contacts must route");
+        };
+        assert!(contacts.is_empty());
+        assert!(complete);
+
         // The optional faces bound per key: a 200-char name truncates to the
         // 64-char cache-title cap the pull path applies.
-        let Some((ControlReceive::SyncContacts { contacts }, _)) = routing(json!({
+        let Some((ControlReceive::SyncContacts { contacts, .. }, _)) = routing(json!({
             "contacts": {
                 "records": [{ "aci": "a", "name": "長".repeat(200) }],
             },
@@ -12892,10 +12912,23 @@ mod tests {
         };
         assert_eq!(contacts[0].name.as_deref(), Some("長".repeat(64).as_str()));
 
-        // A completion-only envelope (the `complete` flag alone) and a face
-        // whose every record dropped are no cache write — the plain skip.
+        // A completion-only envelope still routes (the official
+        // contactSync:complete signal); a face whose every record dropped
+        // without the flag stays the plain skip.
+        let Some((ControlReceive::SyncContacts { contacts, complete }, _)) = control_routing(
+            json!({
+                "timestamp": 1727000000000u64,
+                "syncMessage": { "contacts": { "complete": true, "records": [] } },
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .map(|routing| (routing.control, routing.source)) else {
+            panic!("completion-only contacts must route");
+        };
+        assert!(contacts.is_empty());
+        assert!(complete);
         for sync in [
-            json!({ "contacts": { "complete": true, "records": [] } }),
             json!({ "contacts": { "records": [{ "number": "+15551234568" }] } }),
             json!({ "contacts": {} }),
         ] {
