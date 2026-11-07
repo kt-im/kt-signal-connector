@@ -1217,6 +1217,12 @@ pub enum HostSideEvent {
         state: &'static str,
     },
     AccountChanged(AccountSummary),
+    /// C: connection-axis state from the engine. Never an account terminal.
+    ConnectionStateChanged {
+        account_id: String,
+        state: String,
+        close_code: Option<u16>,
+    },
     ConversationChanged(ConversationSummary),
     /// Contract 1.259 (§4.243, batch Z1 · S14): one direct-identity fold
     /// completed — the number-keyed shell row named by `from_conversation_id`
@@ -2390,6 +2396,16 @@ impl ConnectorService {
         self.store.count_accounts_in_group(proxy_group).unwrap_or(0)
     }
 
+    /// Terminal account state projected for the host's mutating gate.
+    /// `device_unlinked` is the upstream authoritative terminal state; no
+    /// send-family method may reach an engine after it is observed.
+    pub fn account_state(&self, account_id: &str) -> Result<Option<&'static str>, ServiceError> {
+        Ok(self
+            .store
+            .account_summary(account_id)?
+            .map(|summary| summary.state))
+    }
+
     pub fn account_signal_number(&self, account_id: &str) -> Result<String, ServiceError> {
         self.store
             .account_by_id(account_id)?
@@ -2533,6 +2549,16 @@ impl ConnectorService {
         aci: Option<&str>,
         preferred_account_id: Option<&str>,
     ) -> Result<AccountSummary, ServiceError> {
+        // Link commit replay (contract 1.276, §4.260): a finish whose result
+        // was lost after the upstream commit must answer the same account
+        // instead of LINK_NOT_FOUND / a second device. Check before consuming
+        // or requiring the in-memory session.
+        if let Some((account_id, _)) = self.store.link_commit(link_session_id)? {
+            return self
+                .store
+                .account_summary(&account_id)?
+                .ok_or(ServiceError::Store(StoreError::AccountNotFound));
+        }
         let _ = self.require_active_link(link_session_id)?;
         // [KT 适配] Relink gate (§9.10 item 7): an unfinished local-data delete
         // for this number keeps the old account row in place. Committing a
@@ -2563,6 +2589,13 @@ impl ConnectorService {
             proxy_group,
             preferred_account_id,
         )?;
+        // Runtime state authority (contract 1.275): a successful finish is a
+        // fresh engine answer, so it may clear a prior terminal unlink. An
+        // inventory sync alone never reaches this path.
+        let summary = self
+            .store
+            .mark_account_ready_by_id(&summary.id, "engine")?
+            .unwrap_or(summary);
         // Contract 1.142 (§4.138): persist the engine's own-ACI answer when
         // the finishLink face carried one; a face without the key — or with a
         // value that does not parse as an ACI — leaves any stored identity in
@@ -2572,6 +2605,18 @@ impl ConnectorService {
         let canonical = aci.and_then(crate::store::canonical_aci);
         if let Some(aci) = canonical.as_deref() {
             self.store.set_account_aci(&summary.id, Some(aci))?;
+        }
+        if let Err(error) =
+            self.store
+                .record_link_commit(link_session_id, &summary.id, canonical.as_deref())
+        {
+            // The upstream commit is already real; a journal write failure
+            // must not turn it into a failed finish. The desktop's lost-finish
+            // adoption remains the fallback.
+            tracing::warn!(
+                error_class = error.class(),
+                "link commit journal write failed after a successful finish"
+            );
         }
         Ok(self.store.account_summary(&summary.id)?.unwrap_or(summary))
     }
@@ -2612,6 +2657,13 @@ impl ConnectorService {
         self.link
             .as_ref()
             .is_some_and(|session| !session.is_expired(now_ms()))
+    }
+
+    /// Runtime state authority: a 401 observed while a link/re-key owns the
+    /// service is provisioning noise. The event watcher defers the terminal
+    /// write until the window closes; the next real 401 or whoami decides.
+    pub fn should_persist_account_unlink(&self) -> bool {
+        !self.has_pending_link()
     }
 
     /// Whether this group's service owns the link session, expired or not:
@@ -21323,6 +21375,29 @@ mod tests {
         );
     }
 
+    /// Contract 1.276 (§4.260): a repeated finish with the same
+    /// linkSessionId replays the committed account instead of asking the
+    /// phone again or minting a second binding.
+    #[test]
+    fn repeated_finish_same_link_session_replays_committed_account() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?test".into())
+            .unwrap();
+        let link_session_id = started["linkSessionId"].as_str().unwrap().to_string();
+
+        let first = service
+            .complete_link_session(&link_session_id, "+15555550100", group, None)
+            .unwrap();
+        let second = service
+            .complete_link_session(&link_session_id, "+15555550100", group, None)
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 1);
+    }
+
     /// [KT 适配] §9.10 item 7: a relink of the number whose local-data delete
     /// is still in progress is refused at commit; once the delete completes
     /// the same number links. The official app has no multi-account delete
@@ -21757,6 +21832,19 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Runtime state authority: a 401 during an active link/re-key window is
+    /// provisioning noise; the terminal write is deferred until the window
+    /// closes.
+    #[test]
+    fn account_unlink_write_is_deferred_while_a_link_session_is_pending() {
+        let (_temp, mut service) = service();
+        let link = service.plant_link_session_for_test("KT Desktop", Duration::from_secs(60));
+        assert!(!service.should_persist_account_unlink());
+
+        service.cancel_link(&link).unwrap();
+        assert!(service.should_persist_account_unlink());
     }
 
     /// The wire error for a rejected credential is ACCOUNT_UNLINKED

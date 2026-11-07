@@ -1523,7 +1523,26 @@ async fn dispatch_within_stall_budget(
 }
 
 async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> HostResponse {
-    let request_id = request.request_id;
+    let request_id = request.request_id.clone();
+    // Single terminal-account gate for every send-family mutating method.
+    // The MRM group-send path uses a cached sender key and never calls
+    // new_message_sender, so per-method auth checks miss it; this choke point
+    // is authoritative for all current and future account-scoped mutations.
+    // deleteLocalData is deliberately exempt: unlinking must remain deletable.
+    if methods::is_account_scoped_mutating(&request.method)
+        && request.method != "accounts.deleteLocalData"
+        && let Some(account_id) = request_account_id(&request)
+        && let Ok(Some("device_unlinked")) = runtime.account_state(&account_id).await
+    {
+        return HostResponse::failure(
+            request_id,
+            ApiError::new(
+                "ACCOUNT_UNLINKED",
+                "device was unlinked by the account holder",
+                false,
+            ),
+        );
+    }
     match request.method.as_str() {
         "runtime.status" if empty_params(&request.params) => HostResponse::success(
             request_id,
@@ -4422,6 +4441,18 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
             "account.changed",
             serde_json::to_value(account).unwrap_or(Value::Null),
         )),
+        HostSideEvent::ConnectionStateChanged {
+            account_id,
+            state,
+            close_code,
+        } => Ok(HostEvent::new(
+            "connection.stateChanged",
+            json!({
+                "accountId": account_id,
+                "state": state,
+                "closeCode": close_code,
+            }),
+        )),
         HostSideEvent::ConversationChanged(conversation) => Ok(HostEvent::new(
             "conversation.changed",
             serde_json::to_value(conversation).unwrap_or(Value::Null),
@@ -6878,6 +6909,23 @@ mod tests {
                 && frame["data"].get("longTextTerminal").is_none(),
             "the empty attach list alone stays key-free: {frame}"
         );
+    }
+
+    #[tokio::test]
+    async fn connection_state_frame_stays_on_connection_axis() {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::ConnectionStateChanged {
+                account_id: "acct-1".into(),
+                state: "invalidated".into(),
+                close_code: Some(4401),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["event"], "connection.stateChanged");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["state"], "invalidated");
+        assert_eq!(frame["data"]["closeCode"], 4401);
     }
 
     /// Contract 1.195 (§4.195): the official `response.longText` state rides

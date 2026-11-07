@@ -16,6 +16,7 @@ use crate::engine::{
     NormalizedReceive, QueuedReceive, ReceiveIngress, WATCHDOG_LIVENESS_BACKOFF_CAP, event_channel,
     receive_channel,
 };
+use crate::event_publisher::EventPublisher;
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::link::now_ms;
 use crate::media::{MediaGovernor, MediaHandleTable};
@@ -819,6 +820,7 @@ impl RuntimeSupervisor {
         let receive_worker = tokio::spawn(receive_persistence_loop(
             receive_rx,
             service.clone(),
+            Arc::clone(&store),
             host_events.clone(),
             group_id.clone(),
             media.as_ref().map(|media| media.governor().clone()),
@@ -835,6 +837,7 @@ impl RuntimeSupervisor {
         let account_unlink_worker = tokio::spawn(engine_event_watch_loop(
             events.subscribe(),
             service.clone(),
+            Arc::clone(&store),
             host_events.clone(),
             background_sync_tx,
         ));
@@ -1112,11 +1115,25 @@ impl RuntimeSupervisor {
             let deleted: usize = groups.iter().map(|group| group.message_ids.len()).sum();
             let full_batch = deleted >= EXPIRE_SWEEP_BATCH as usize;
             for group in groups {
-                let _ = self.host_events.send(HostSideEvent::MessageExpired {
+                let account_id = group.account_id.clone();
+                let event = HostSideEvent::MessageExpired {
                     account_id: group.account_id,
                     conversation_id: group.conversation_id,
                     message_ids: group.message_ids,
-                });
+                };
+                let epoch = self
+                    .store
+                    .account_engine_epoch(&account_id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let publisher =
+                    EventPublisher::new(Arc::clone(&self.store), self.host_events.clone());
+                if let Err(error) =
+                    publisher.publish(epoch, Some(&account_id), "message.expired", "{}", event)
+                {
+                    tracing::warn!(?error, "durable event publish failed");
+                }
             }
             if !full_batch {
                 return Ok(());
@@ -2578,7 +2595,7 @@ impl RuntimeSupervisor {
                     .lock()
                     .await
                     .list_accounts_in_group(&self.group_id)?;
-                return Ok(self.slot_accounts(rows));
+                return Ok(self.stale_slot_accounts(rows));
             }
         };
         // Contract 1.142 (§4.138): each entry may carry the engine's own-ACI
@@ -2622,7 +2639,7 @@ impl RuntimeSupervisor {
                     .lock()
                     .await
                     .list_accounts_in_group(&self.group_id)?;
-                return Ok(self.slot_accounts(rows));
+                return Ok(self.stale_slot_accounts(rows));
             }
         };
         if numbers.is_empty() {
@@ -2640,7 +2657,7 @@ impl RuntimeSupervisor {
                 &self.group_id,
                 self.preferred_account_id.as_deref(),
             )?;
-        let accounts = self.slot_accounts(accounts);
+        let accounts = self.live_slot_accounts(accounts);
         // Contract 1.170 (§4.170): the ACI was just (re)written for these
         // accounts — fold each number-keyed memo shell into the canonical
         // ACI-keyed row and announce it.
@@ -2666,7 +2683,7 @@ impl RuntimeSupervisor {
             .lock()
             .await
             .list_accounts_in_group(&self.group_id)?;
-        Ok(self.slot_accounts(rows))
+        Ok(self.stale_slot_accounts(rows))
     }
 
     /// A legacy group supervisor returns every row of its group (the pre-pool
@@ -2682,6 +2699,29 @@ impl RuntimeSupervisor {
                 .collect(),
             None => accounts,
         }
+    }
+
+    /// Live inventory projection: non-terminal rows carry inventory evidence;
+    /// a terminal row rides only when its stored origin is an upstream/engine
+    /// answer. Legacy rows with no origin are downgraded to cache/unknown.
+    fn live_slot_accounts(&self, accounts: Vec<AccountSummary>) -> Vec<AccountSummary> {
+        let mut accounts = self.slot_accounts(accounts);
+        for account in &mut accounts {
+            apply_live_account_evidence(account);
+        }
+        accounts
+    }
+
+    /// Store-only projection when the engine cannot answer: every row is
+    /// cache evidence, and a persisted terminal unlink is downgraded to
+    /// `unknown` until a live engine/upstream answer proves it. This is the
+    /// guard that stops "engine down" from rendering as "phone unlinked".
+    fn stale_slot_accounts(&self, accounts: Vec<AccountSummary>) -> Vec<AccountSummary> {
+        let mut accounts = self.slot_accounts(accounts);
+        for account in &mut accounts {
+            apply_stale_account_evidence(account);
+        }
+        accounts
     }
 
     /// Contract 1.170 (§4.170): fold each freshly-ACI'd account's number-keyed
@@ -9966,6 +10006,28 @@ async fn sync_contacts_with(
         )
         .await
         .map_err(ServiceError::Engine)?;
+    let contact_items = contacts_result
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let named = contact_items
+        .iter()
+        .filter(|item| {
+            item.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty())
+        })
+        .count();
+    let profiled = contact_items
+        .iter()
+        .filter(|item| item.get("profile").is_some())
+        .count();
+    tracing::warn!(
+        contacts = contact_items.len(),
+        named,
+        profiled,
+        "contacts sync engine projection"
+    );
     let groups_result = engine
         .call(
             "listGroups",
@@ -11317,11 +11379,18 @@ async fn recv_stderr_line(rx: Option<&mut broadcast::Receiver<String>>) -> Optio
 /// failure keyword; normal INFO logs must not match.
 fn is_receive_fatal_stderr(line: &str) -> bool {
     let lower = line.to_lowercase();
+    // Only terminal legacy signal-cli shapes are receive-fatal. The kt engine
+    // logs normal reconnect/handover ("websocket link is dead; closing so the
+    // receive stream reconnects", "Websocket error: tungstenite error") while
+    // its receive loop keeps retrying in-process; treating those as fatal
+    // restarts the whole engine and turns a recoverable proxy blip into a
+    // process restart storm.
     lower.contains("websocketioexception")
-        || (lower.contains("websocket")
-            && ["error", "closed", "disconnected", "failed", "exception"]
-                .iter()
-                .any(|needle| lower.contains(needle)))
+        || (lower.contains("websocketconnection") && lower.contains("closed unexpectedly"))
+        || lower.contains("websocket error while receiving")
+        || lower.contains("websocket disconnected from server")
+        || lower.contains("failed to connect websocket")
+        || lower.contains("exception in websocket reader thread")
 }
 
 /// How the watchdog's stderr consumer surfaces one engine stderr line.
@@ -11398,6 +11467,7 @@ fn run_media_governor_pass(governor: MediaGovernor) -> JoinHandle<()> {
 async fn engine_event_watch_loop(
     mut engine_events: broadcast::Receiver<EngineEvent>,
     service: Arc<Mutex<ConnectorService>>,
+    store: Arc<Store>,
     host_events: broadcast::Sender<HostSideEvent>,
     background_sync: mpsc::Sender<String>,
 ) {
@@ -11406,6 +11476,16 @@ async fn engine_event_watch_loop(
             Ok(EngineEvent::AccountUnauthorized { account }) => {
                 let marked = {
                     let guard = service.lock().await;
+                    if !guard.should_persist_account_unlink() {
+                        // A link/re-key window still owns the account: the
+                        // engine's transient 401 is provisioning noise, not a
+                        // terminal unlink. Persisting it here would outlive
+                        // the window and surface as a false "phone unlinked".
+                        tracing::info!(
+                            "device-unlinked observed during an active link; deferring the terminal write"
+                        );
+                        continue;
+                    }
                     guard.mark_account_device_unlinked(&account)
                 };
                 match marked {
@@ -11419,6 +11499,34 @@ async fn engine_event_watch_loop(
                         // never take the watcher down over a store hiccup.
                         tracing::warn!(error_class = error.class(), "device-unlinked mark failed");
                     }
+                }
+            }
+            Ok(EngineEvent::ConnectionState {
+                account,
+                state,
+                close_code,
+            }) => {
+                // C: connection axis only. 4401/invalidated must never write
+                // account state; the account remains linked until 401/
+                // DeviceDelinked arrives through AccountUnauthorized.
+                let epoch = store
+                    .account_engine_epoch(&account)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let publisher = EventPublisher::new(Arc::clone(&store), host_events.clone());
+                if let Err(error) = publisher.publish(
+                    epoch,
+                    Some(&account),
+                    "connection.stateChanged",
+                    "{}",
+                    HostSideEvent::ConnectionStateChanged {
+                        account_id: account.clone(),
+                        state,
+                        close_code,
+                    },
+                ) {
+                    tracing::warn!(?error, "durable connection.stateChanged failed");
                 }
             }
             Ok(EngineEvent::ReceiveEmptied { account }) => {
@@ -11614,6 +11722,7 @@ fn emit_forwarded(
 async fn receive_persistence_loop(
     mut receives: mpsc::Receiver<QueuedReceive>,
     service: Arc<Mutex<ConnectorService>>,
+    store: Arc<Store>,
     host_events: broadcast::Sender<HostSideEvent>,
     owner_group: String,
     media_governor: Option<MediaGovernor>,
@@ -11670,7 +11779,26 @@ async fn receive_persistence_loop(
                         events.len() as u64,
                     );
                     for event in &events {
-                        let _ = host_events.send(event.clone());
+                        if let HostSideEvent::AccountChanged(account) = event {
+                            let epoch = store
+                                .account_engine_epoch(&account.id)
+                                .ok()
+                                .flatten()
+                                .unwrap_or(0);
+                            let publisher =
+                                EventPublisher::new(Arc::clone(&store), host_events.clone());
+                            if let Err(error) = publisher.publish(
+                                epoch,
+                                Some(&account.id),
+                                "account.changed",
+                                "{}",
+                                event.clone(),
+                            ) {
+                                tracing::warn!(?error, "durable account.changed failed");
+                            }
+                        } else {
+                            let _ = host_events.send(event.clone());
+                        }
                     }
                     if storage_unavailable {
                         storage_unavailable = false;
@@ -12101,6 +12229,33 @@ fn avatar_from_engine(result: &Value) -> Result<AvatarDownload, ServiceError> {
     })
 }
 
+fn apply_stale_account_evidence(account: &mut AccountSummary) {
+    account.stale = true;
+    account.state_evidence = Some("cache".to_owned());
+    if account.state == "device_unlinked" {
+        account.state = "unknown";
+    }
+}
+
+fn apply_live_account_evidence(account: &mut AccountSummary) {
+    if account.state == "device_unlinked" {
+        let trusted = matches!(
+            account.state_evidence.as_deref(),
+            Some("upstream") | Some("engine")
+        );
+        if !trusted {
+            account.state = "unknown";
+            account.state_evidence = Some("cache".to_owned());
+            account.stale = true;
+        } else {
+            account.stale = false;
+        }
+    } else {
+        account.state_evidence = Some("inventory".to_owned());
+        account.stale = false;
+    }
+}
+
 /// Test-only re-export so the service-layer projection test can pin the
 /// avatar result face (the same pattern as the engine error allowlist).
 #[cfg(test)]
@@ -12190,6 +12345,7 @@ fn story_from_engine(result: &Value) -> Result<StorySendResult, ServiceError> {
 #[cfg(test)]
 mod tests {
     use super::hidden_write_back_targets;
+    use super::{AccountSummary, apply_live_account_evidence, apply_stale_account_evidence};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
@@ -12201,6 +12357,55 @@ mod tests {
     use tempfile::TempDir;
 
     use tokio::time::{Instant, sleep, timeout};
+
+    fn account_for_evidence(state: &'static str, evidence: Option<&str>) -> AccountSummary {
+        AccountSummary {
+            id: "account-1".into(),
+            display_name: None,
+            masked_address: "•••".into(),
+            state,
+            linked_at: Some(1),
+            last_message_at: None,
+            unread_count: 0,
+            proxy_group: "default".into(),
+            aci: None,
+            capabilities: None,
+            state_evidence: evidence.map(str::to_string),
+            state_observed_at: Some(1),
+            stale: false,
+            state_revision: 0,
+            engine_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn stale_engine_fallback_never_renders_a_terminal_unlink() {
+        let mut account = account_for_evidence("device_unlinked", Some("upstream"));
+        apply_stale_account_evidence(&mut account);
+        assert_eq!(account.state, "unknown");
+        assert_eq!(account.state_evidence.as_deref(), Some("cache"));
+        assert!(account.stale);
+    }
+
+    #[test]
+    fn live_inventory_trusts_only_an_authoritative_terminal_state() {
+        let mut trusted = account_for_evidence("device_unlinked", Some("upstream"));
+        apply_live_account_evidence(&mut trusted);
+        assert_eq!(trusted.state, "device_unlinked");
+        assert!(!trusted.stale);
+
+        let mut legacy = account_for_evidence("device_unlinked", None);
+        apply_live_account_evidence(&mut legacy);
+        assert_eq!(legacy.state, "unknown");
+        assert_eq!(legacy.state_evidence.as_deref(), Some("cache"));
+        assert!(legacy.stale);
+
+        let mut ready = account_for_evidence("ready", None);
+        apply_live_account_evidence(&mut ready);
+        assert_eq!(ready.state, "ready");
+        assert_eq!(ready.state_evidence.as_deref(), Some("inventory"));
+        assert!(!ready.stale);
+    }
 
     /// §4.173: the send reply's `results` array counts into success/failure
     /// totals; direct sends (no array), empty arrays, and shape-hostile
@@ -14298,11 +14503,32 @@ mod tests {
             ),
             EngineStderrClass::ReceiveFatal
         );
+        // kt engine's recoverable reconnect/handover chatter is NOT a reason
+        // to restart the process. These lines can repeat during a proxy blip;
+        // the receive loop owns retry and the liveness watchdog owns death.
+        assert_eq!(
+            classify_engine_stderr(
+                "WARN libsignal_service::websocket: websocket link is dead; closing so the receive stream reconnects cause=\"request response timeout\""
+            ),
+            EngineStderrClass::Diagnostic
+        );
+        assert_eq!(
+            classify_engine_stderr(
+                "WARN libsignal_service::websocket: websocket handover: terminating previous identified connection before dialing"
+            ),
+            EngineStderrClass::Diagnostic
+        );
+        assert_eq!(
+            classify_engine_stderr(
+                "ERROR libsignal_service::websocket: SignalWebSocket: Websocket error: tungstenite error"
+            ),
+            EngineStderrClass::Diagnostic
+        );
         // A pathological line carrying both the banner and a fatal shape is
         // fatal first: the watchdog must never be muted by the new grading.
         assert_eq!(
             classify_engine_stderr(
-                "websocket error after network path was declared: connection reset"
+                "websocketioexception after network path was declared: connection reset"
             ),
             EngineStderrClass::ReceiveFatal
         );

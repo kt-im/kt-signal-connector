@@ -340,6 +340,15 @@ async fn main() {
         // The final exit diagnostic: `error` is the classified message of the
         // failing error type (Display is content-free across this crate).
         tracing::error!(%error, "connector exiting with an error");
+        // Structured, machine-readable fatal cause for the launcher. This is
+        // the only channel available when the store cannot open (the RPC
+        // socket never exists), so the desktop can map a rejected key to the
+        // repair surface instead of retrying the same spawn five times.
+        if error.contains("connector store key was rejected by the existing store") {
+            eprintln!("KT_FATAL code=STORE_KEY_REJECTED retryable=false");
+        } else if error.contains("connector store key is required") {
+            eprintln!("KT_FATAL code=STORE_KEY_REQUIRED retryable=false");
+        }
         std::process::exit(1);
     }
 }

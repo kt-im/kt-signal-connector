@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 42;
+const SCHEMA_VERSION: i64 = 47;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -207,7 +207,17 @@ CREATE TABLE IF NOT EXISTS accounts (
   unread_count INTEGER NOT NULL DEFAULT 0,
   proxy_group TEXT NOT NULL DEFAULT 'default',
   aci TEXT,
-  read_receipts_enabled INTEGER
+  read_receipts_enabled INTEGER,
+  state_origin TEXT,
+  state_observed_at INTEGER,
+  state_revision INTEGER NOT NULL DEFAULT 0,
+  engine_epoch INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS link_commits (
+  link_session_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  aci TEXT,
+  committed_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
@@ -269,6 +279,8 @@ CREATE TABLE IF NOT EXISTS messages (
   body_bytes INTEGER,
   body_truncated INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
+  kt_send_state TEXT CHECK(kt_send_state IS NULL OR kt_send_state IN
+    ('in_flight','unknown_outcome','reconciled_sent','reconciled_failed')),
   client_request_id TEXT,
   quote_message_id TEXT,
   quote_snapshot TEXT,
@@ -477,6 +489,50 @@ CREATE TABLE IF NOT EXISTS message_receipts (
   PRIMARY KEY(message_id, recipient),
   FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS inbound_watermark (
+  account_id TEXT PRIMARY KEY,
+  engine_epoch INTEGER NOT NULL,
+  applied_seq INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS inbound_skipped (
+  account_id TEXT NOT NULL,
+  engine_epoch INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  detail_class TEXT,
+  skipped_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, engine_epoch, seq)
+);
+CREATE TABLE IF NOT EXISTS event_log (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  epoch INTEGER NOT NULL,
+  account_id TEXT,
+  type TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS event_log_account ON event_log(account_id, seq);
+CREATE TABLE IF NOT EXISTS event_cursor (
+  subscriber TEXT PRIMARY KEY,
+  cursor INTEGER NOT NULL,
+  epoch INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS send_attempt (
+  attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  client_request_id TEXT NOT NULL,
+  dispatch_id TEXT NOT NULL,
+  engine_epoch INTEGER NOT NULL,
+  posted_at INTEGER NOT NULL,
+  returned_at INTEGER,
+  result TEXT CHECK(result IS NULL OR result IN ('ok','definite_error','timeout','transport','process_exit','no_answer')),
+  error_code TEXT,
+  FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS send_attempt_open ON send_attempt(posted_at) WHERE returned_at IS NULL;
 ";
 /// DDL that must run after [`migrate_schema`], not in [`SCHEMA_DDL`], because
 /// it references columns that older stores only gain through a migration.
@@ -735,6 +791,26 @@ pub struct AccountSummary {
     /// `false` behave alike while the raw fact stays distinguishable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<AccountCapabilities>,
+    /// Where the account's state last came from (runtime state authority):
+    /// `engine`/`upstream` are authoritative, `inventory` is a live list
+    /// observation, `cache` is a persisted value with no fresh proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_evidence: Option<String>,
+    /// Observation time for `state_evidence` (Unix ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_observed_at: Option<u64>,
+    /// True when this projection is cache-only and must not drive terminal UI.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stale: bool,
+    /// Monotonic per-account state revision (contract 1.277). Inventory reads
+    /// do not bump it; only a real state transition does.
+    pub state_revision: u64,
+    /// Signal Core C: per-account link generation, bumped by link/unlink/relink.
+    pub engine_epoch: u64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One account's live capability bits (see [`AccountSummary::capabilities`]).
@@ -3184,9 +3260,18 @@ impl Store {
             // never moves it between groups.
             self.lock_conn()?
                 .execute(
-                    "UPDATE accounts SET state='ready', linked_at=COALESCE(linked_at, ?2)
+                    "UPDATE accounts SET
+                       state = CASE WHEN state='device_unlinked' THEN state ELSE 'ready' END,
+                       linked_at = COALESCE(linked_at, ?2),
+                       state_origin = CASE WHEN state='device_unlinked' THEN state_origin ELSE 'inventory' END,
+                       state_observed_at = CASE WHEN state='device_unlinked' THEN state_observed_at ELSE ?3 END,
+                       state_revision = CASE
+                         WHEN state='device_unlinked' THEN state_revision
+                         WHEN state!='ready' THEN state_revision + 1
+                         ELSE state_revision
+                       END
                      WHERE id=?1",
-                    params![existing.id, linked_at.map(|v| v as i64)],
+                    params![existing.id, linked_at.map(|v| v as i64), now_ms() as i64],
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
             return self
@@ -3200,17 +3285,25 @@ impl Store {
         // 冲突时只恢复 ready/linked_at，proxy_group 仍保持链接时不可变。
         self.lock_conn()?
             .execute(
-                "INSERT INTO accounts(id, signal_account, masked_address, display_name, state, linked_at, unread_count, proxy_group)
-                 VALUES(?1, ?2, ?3, NULL, 'ready', ?4, 0, ?5)
+                "INSERT INTO accounts(id, signal_account, masked_address, display_name, state, linked_at, unread_count, proxy_group, state_origin, state_observed_at, state_revision)
+                 VALUES(?1, ?2, ?3, NULL, 'ready', ?4, 0, ?5, 'inventory', ?6, 1)
                  ON CONFLICT(signal_account) DO UPDATE SET
-                   state='ready',
-                   linked_at=COALESCE(accounts.linked_at, ?4)",
+                   state = CASE WHEN accounts.state='device_unlinked' THEN accounts.state ELSE 'ready' END,
+                   linked_at = COALESCE(accounts.linked_at, ?4),
+                   state_origin = CASE WHEN accounts.state='device_unlinked' THEN accounts.state_origin ELSE 'inventory' END,
+                   state_observed_at = CASE WHEN accounts.state='device_unlinked' THEN accounts.state_observed_at ELSE ?6 END,
+                   state_revision = CASE
+                     WHEN accounts.state='device_unlinked' THEN accounts.state_revision
+                     WHEN accounts.state!='ready' THEN accounts.state_revision + 1
+                     ELSE accounts.state_revision
+                   END",
                 params![
                     id,
                     signal_account,
                     masked,
                     linked_at.map(|v| v as i64),
-                    proxy_group
+                    proxy_group,
+                    now_ms() as i64
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -3240,6 +3333,63 @@ impl Store {
             .ok_or(StoreError::AccountNotFound)
     }
 
+    /// Persist the link.finish transaction receipt (contract 1.276, §4.260).
+    /// A repeated finish with the same linkSessionId returns the committed
+    /// account instead of asking the phone again or minting a second binding.
+    pub fn record_link_commit(
+        &self,
+        link_session_id: &str,
+        account_id: &str,
+        aci: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "INSERT INTO link_commits(link_session_id, account_id, aci, committed_at)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(link_session_id) DO UPDATE SET
+                   account_id=excluded.account_id,
+                   aci=excluded.aci,
+                   committed_at=excluded.committed_at",
+                params![link_session_id, account_id, aci, now_ms() as i64],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    pub fn link_commit(
+        &self,
+        link_session_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT account_id, aci FROM link_commits WHERE link_session_id=?1",
+                params![link_session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Explicitly clear a terminal account state after a fresh link or a
+    /// registered whoami answer. Inventory reconciliation never calls this;
+    /// only real evidence may erase an unlink.
+    pub fn mark_account_ready_by_id(
+        &self,
+        account_id: &str,
+        origin: &str,
+    ) -> Result<Option<AccountSummary>, StoreError> {
+        self.lock_conn()?
+            .execute(
+                "UPDATE accounts SET state='ready', state_origin=?2, state_observed_at=?3,
+                   state_revision = CASE WHEN state='ready' THEN state_revision ELSE state_revision + 1 END,
+                   engine_epoch = CASE WHEN state='ready' THEN engine_epoch ELSE engine_epoch + 1 END
+                 WHERE id=?1 AND state != 'unlinking'",
+                params![account_id, origin, now_ms() as i64],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        self.account_summary(account_id)
+    }
+
     /// The Signal server rejected this device's credentials: the account
     /// holder unlinked this device on their phone (contract 1.21). The local
     /// credential is permanently dead — no engine restart can revive it — so
@@ -3256,8 +3406,11 @@ impl Store {
         };
         self.lock_conn()?
             .execute(
-                "UPDATE accounts SET state='device_unlinked' WHERE id=?1 AND state != 'unlinking'",
-                params![existing.id],
+                "UPDATE accounts SET state='device_unlinked', state_origin='upstream', state_observed_at=?2,
+                   state_revision = CASE WHEN state='device_unlinked' THEN state_revision ELSE state_revision + 1 END,
+                   engine_epoch = CASE WHEN state='device_unlinked' THEN engine_epoch ELSE engine_epoch + 1 END
+                 WHERE id=?1 AND state != 'unlinking'",
+                params![existing.id, now_ms() as i64],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         self.account_summary(&existing.id)?
@@ -3265,29 +3418,241 @@ impl Store {
             .ok_or(StoreError::AccountNotFound)
     }
 
+    /// Signal Core B: advance the connector's applied sequence only when the
+    /// next event is contiguous. Returns false for duplicate/stale/out-of-order
+    /// input; the caller must not apply product rows in that case.
+    pub fn advance_inbound_watermark(
+        &self,
+        account_id: &str,
+        engine_epoch: u64,
+        seq: u64,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let changed = conn
+            .execute(
+                "INSERT INTO inbound_watermark(account_id, engine_epoch, applied_seq, updated_at)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(account_id) DO UPDATE SET
+                   engine_epoch=excluded.engine_epoch,
+                   applied_seq=excluded.applied_seq,
+                   updated_at=excluded.updated_at
+                 WHERE inbound_watermark.engine_epoch < excluded.engine_epoch
+                    OR (inbound_watermark.engine_epoch = excluded.engine_epoch
+                        AND inbound_watermark.applied_seq = excluded.applied_seq - 1)",
+                rusqlite::params![account_id, engine_epoch, seq, now_ms()],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed > 0)
+    }
+
+    /// Signal Core B: abandoning/skipping an inbound event must leave a durable
+    /// marker; it must never be a silent watermark advance.
+    pub fn mark_inbound_skipped(
+        &self,
+        account_id: &str,
+        engine_epoch: u64,
+        seq: u64,
+        reason: &str,
+        detail_class: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO inbound_skipped
+               (account_id, engine_epoch, seq, reason, detail_class, skipped_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                account_id,
+                engine_epoch,
+                seq,
+                reason,
+                detail_class,
+                now_ms()
+            ],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// Signal Core B: append one event in the same transaction as its product
+    /// write. The caller supplies the epoch; seq is store-assigned.
+    pub fn append_event_log(
+        &self,
+        epoch: u64,
+        account_id: Option<&str>,
+        event_type: &str,
+        payload: &str,
+    ) -> Result<i64, StoreError> {
+        let conn = self.lock_conn()?;
+        append_event_log_on(&conn, epoch, account_id, event_type, payload)
+    }
+
+    /// Run product writes and their event_log rows in one SQLite transaction.
+    /// The closure must not call any Store method that locks the connection;
+    /// use append_event_log_on(tx, ...) instead.
+    pub fn write_transaction<T>(
+        &self,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut conn = self.lock_conn()?;
+        let transaction = conn
+            .transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let value = write(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(value)
+    }
+
+    pub fn set_event_cursor(
+        &self,
+        subscriber: &str,
+        cursor: i64,
+        epoch: u64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO event_cursor(subscriber, cursor, epoch, updated_at)
+             VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(subscriber) DO UPDATE SET
+               cursor=excluded.cursor, epoch=excluded.epoch, updated_at=excluded.updated_at",
+            rusqlite::params![subscriber, cursor, epoch, now_ms()],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    pub fn event_cursor(&self, subscriber: &str) -> Result<Option<(i64, u64)>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare("SELECT cursor, epoch FROM event_cursor WHERE subscriber=?1")
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut rows = stmt
+            .query(rusqlite::params![subscriber])
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some(row) = rows
+            .next()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+        else {
+            return Ok(None);
+        };
+        let cursor = row
+            .get::<_, i64>(0)
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let epoch = row
+            .get::<_, u64>(1)
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(Some((cursor, epoch)))
+    }
+
+    pub fn list_events_since(
+        &self,
+        after_seq: i64,
+        limit: u32,
+    ) -> Result<Vec<EventLogRow>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, epoch, account_id, type, payload
+                   FROM event_log WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(rusqlite::params![after_seq, i64::from(limit)], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    pub fn record_send_attempt(
+        &self,
+        message_id: &str,
+        account_id: &str,
+        client_request_id: &str,
+        dispatch_id: &str,
+        engine_epoch: u64,
+    ) -> Result<i64, StoreError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO send_attempt
+               (message_id, account_id, client_request_id, dispatch_id, engine_epoch, posted_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                message_id,
+                account_id,
+                client_request_id,
+                dispatch_id,
+                engine_epoch,
+                now_ms()
+            ],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn settle_send_attempt(
+        &self,
+        attempt_id: i64,
+        result: &str,
+        error_code: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE send_attempt SET returned_at=?2, result=?3, error_code=?4
+             WHERE attempt_id=?1 AND returned_at IS NULL",
+            rusqlite::params![attempt_id, now_ms(), result, error_code],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    pub fn account_engine_epoch(&self, account_id: &str) -> Result<Option<u64>, StoreError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT engine_epoch FROM accounts WHERE id=?1",
+            rusqlite::params![account_id],
+            |row| row.get::<_, u64>(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Bump the account generation inside the caller's transaction. Link,
+    /// unlink, and relink each advance it exactly once.
+    pub fn bump_account_engine_epoch(&self, account_id: &str) -> Result<u64, StoreError> {
+        self.write_transaction(|tx| {
+            tx.execute(
+                "UPDATE accounts SET engine_epoch = engine_epoch + 1 WHERE id=?1",
+                rusqlite::params![account_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            tx.query_row(
+                "SELECT engine_epoch FROM accounts WHERE id=?1",
+                rusqlite::params![account_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+        })
+    }
+
     pub fn list_accounts(&self) -> Result<Vec<AccountSummary>, StoreError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch
                  FROM accounts ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(AccountSummary {
-                    id: row.get(0)?,
-                    masked_address: row.get(1)?,
-                    display_name: row.get(2)?,
-                    state: static_state(row.get::<_, String>(3)?),
-                    linked_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
-                    last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
-                    unread_count: row.get::<_, i64>(6)? as u32,
-                    proxy_group: row.get(7)?,
-                    aci: row.get(8)?,
-                    capabilities: None,
-                })
-            })
+            .query_map([], account_summary_from_row)
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Unavailable(Some(error)))
@@ -3327,26 +3692,13 @@ impl Store {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch
                  FROM accounts WHERE proxy_group=?1
                  ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let rows = stmt
-            .query_map(params![proxy_group], |row| {
-                Ok(AccountSummary {
-                    id: row.get(0)?,
-                    masked_address: row.get(1)?,
-                    display_name: row.get(2)?,
-                    state: static_state(row.get::<_, String>(3)?),
-                    linked_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
-                    last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
-                    unread_count: row.get::<_, i64>(6)? as u32,
-                    proxy_group: row.get(7)?,
-                    aci: row.get(8)?,
-                    capabilities: None,
-                })
-            })
+            .query_map(params![proxy_group], account_summary_from_row)
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Unavailable(Some(error)))
@@ -3483,23 +3835,10 @@ impl Store {
     pub fn account_summary(&self, account_id: &str) -> Result<Option<AccountSummary>, StoreError> {
         self.lock_conn()?
             .query_row(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch
                  FROM accounts WHERE id=?1",
                 params![account_id],
-                |row| {
-                    Ok(AccountSummary {
-                        id: row.get(0)?,
-                        masked_address: row.get(1)?,
-                        display_name: row.get(2)?,
-                        state: static_state(row.get::<_, String>(3)?),
-                        linked_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
-                        last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
-                        unread_count: row.get::<_, i64>(6)? as u32,
-                        proxy_group: row.get(7)?,
-                        aci: row.get(8)?,
-                        capabilities: None,
-                    })
-                },
+                account_summary_from_row,
             )
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))
@@ -10348,8 +10687,7 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let mut delete = transaction
             .prepare(
-                "DELETE , delete_failed
-                 FROM messages
+                "DELETE FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  RETURNING id",
             )
@@ -13993,6 +14331,24 @@ fn ensure_additive_columns(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+pub(crate) type EventLogRow = (i64, u64, Option<String>, String, String);
+
+pub(crate) fn append_event_log_on(
+    conn: &Connection,
+    epoch: u64,
+    account_id: Option<&str>,
+    event_type: &str,
+    payload: &str,
+) -> Result<i64, StoreError> {
+    conn.execute(
+        "INSERT INTO event_log(epoch, account_id, type, payload, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![epoch, account_id, event_type, payload, now_ms()],
+    )
+    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(conn.last_insert_rowid())
+}
+
 fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
     let current: i64 = conn
         .query_row(
@@ -14844,6 +15200,55 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         conn.execute(&sql, [])
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
+    if current < 43 {
+        // Contract revision 1.275 (runtime state authority): the account
+        // terminal state needs a source and an observation time. Legacy rows
+        // carry NULL origin = cache; they are not authoritative until an
+        // engine/upstream answer rewrites them.
+        if !table_has_column(conn, "accounts", "state_origin")? {
+            conn.execute("ALTER TABLE accounts ADD COLUMN state_origin TEXT", [])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        if !table_has_column(conn, "accounts", "state_observed_at")? {
+            conn.execute(
+                "ALTER TABLE accounts ADD COLUMN state_observed_at INTEGER",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
+    if current < 45 {
+        // Contract revision 1.277 (runtime state authority): per-account state
+        // revision. Legacy rows start at 0; only a real state transition bumps
+        // it (inventory reads do not).
+        if !table_has_column(conn, "accounts", "state_revision")? {
+            conn.execute(
+                "ALTER TABLE accounts ADD COLUMN state_revision INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
+    if current < 46 {
+        // Signal Core B: durable inbound watermark, event log/cursor, skipped
+        // ledger, and exact send-attempt ledger. Additive only; no backfill.
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS inbound_watermark (\n  account_id TEXT PRIMARY KEY,\n  engine_epoch INTEGER NOT NULL,\n  applied_seq INTEGER NOT NULL,\n  updated_at INTEGER NOT NULL\n);\nCREATE TABLE IF NOT EXISTS inbound_skipped (\n  account_id TEXT NOT NULL,\n  engine_epoch INTEGER NOT NULL,\n  seq INTEGER NOT NULL,\n  reason TEXT NOT NULL,\n  detail_class TEXT,\n  skipped_at INTEGER NOT NULL,\n  PRIMARY KEY(account_id, engine_epoch, seq)\n);\nCREATE TABLE IF NOT EXISTS event_log (\n  seq INTEGER PRIMARY KEY AUTOINCREMENT,\n  epoch INTEGER NOT NULL,\n  account_id TEXT,\n  type TEXT NOT NULL,\n  payload TEXT NOT NULL,\n  created_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS event_log_account ON event_log(account_id, seq);\nCREATE TABLE IF NOT EXISTS event_cursor (\n  subscriber TEXT PRIMARY KEY,\n  cursor INTEGER NOT NULL,\n  epoch INTEGER NOT NULL,\n  updated_at INTEGER NOT NULL\n);\nCREATE TABLE IF NOT EXISTS send_attempt (\n  attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,\n  message_id TEXT NOT NULL,\n  account_id TEXT NOT NULL,\n  client_request_id TEXT NOT NULL,\n  dispatch_id TEXT NOT NULL,\n  engine_epoch INTEGER NOT NULL,\n  posted_at INTEGER NOT NULL,\n  returned_at INTEGER,\n  result TEXT CHECK(result IS NULL OR result IN ('ok','definite_error','timeout','transport','process_exit','no_answer')),\n  error_code TEXT,\n  FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE\n);\nCREATE INDEX IF NOT EXISTS send_attempt_open ON send_attempt(posted_at) WHERE returned_at IS NULL;\n")
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if !table_has_column(conn, "messages", "kt_send_state")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN kt_send_state TEXT CHECK(kt_send_state IS NULL OR kt_send_state IN ('in_flight','unknown_outcome','reconciled_sent','reconciled_failed'))",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
+    if current < 47 && !table_has_column(conn, "accounts", "engine_epoch")? {
+        conn.execute(
+            "ALTER TABLE accounts ADD COLUMN engine_epoch INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -14991,8 +15396,29 @@ fn static_state(value: String) -> &'static str {
         "disabled" => "disabled",
         "unlinking" => "unlinking",
         "device_unlinked" => "device_unlinked",
+        "unknown" => "unknown",
         _ => "error",
     }
+}
+
+fn account_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountSummary> {
+    Ok(AccountSummary {
+        id: row.get(0)?,
+        masked_address: row.get(1)?,
+        display_name: row.get(2)?,
+        state: static_state(row.get::<_, String>(3)?),
+        linked_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+        last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+        unread_count: row.get::<_, i64>(6)? as u32,
+        proxy_group: row.get(7)?,
+        aci: row.get(8)?,
+        capabilities: None,
+        state_evidence: row.get(9)?,
+        state_observed_at: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+        stale: false,
+        state_revision: row.get::<_, i64>(11)? as u64,
+        engine_epoch: row.get::<_, i64>(12)? as u64,
+    })
 }
 
 fn static_kind(value: String) -> &'static str {
@@ -15520,6 +15946,156 @@ mod tests {
     use crate::DEFAULT_PROXY_GROUP_ID;
     use tempfile::TempDir;
 
+    #[test]
+    fn account_engine_epoch_bumps_monotonically() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts(id, signal_account, masked_address, state)
+                 VALUES('a', '+15550001', '+15***01', 'ready')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.account_engine_epoch("a").unwrap(), Some(0));
+        assert_eq!(store.bump_account_engine_epoch("a").unwrap(), 1);
+        assert_eq!(store.bump_account_engine_epoch("a").unwrap(), 2);
+        assert_eq!(store.account_engine_epoch("a").unwrap(), Some(2));
+        assert_eq!(store.account_engine_epoch("missing").unwrap(), None);
+        let summary = store.account_summary("a").unwrap().unwrap();
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["engineEpoch"], 2);
+    }
+
+    #[test]
+    fn engine_epoch_bumps_on_link_and_unlink_transitions_only() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts(id, signal_account, masked_address, state, engine_epoch)
+                 VALUES('e', '+15550002', '+15***02', 'device_unlinked', 0)",
+                [],
+            )
+            .unwrap();
+        store.mark_account_ready_by_id("e", "upstream").unwrap();
+        assert_eq!(store.account_engine_epoch("e").unwrap(), Some(1));
+        store.mark_account_ready_by_id("e", "upstream").unwrap();
+        assert_eq!(store.account_engine_epoch("e").unwrap(), Some(1));
+        store.mark_account_device_unlinked("+15550002").unwrap();
+        assert_eq!(store.account_engine_epoch("e").unwrap(), Some(2));
+        store.mark_account_device_unlinked("+15550002").unwrap();
+        assert_eq!(store.account_engine_epoch("e").unwrap(), Some(2));
+    }
+
+    #[test]
+    fn core_queue_schema_is_created() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let conn = store.conn.lock().unwrap();
+        for table in [
+            "inbound_watermark",
+            "inbound_skipped",
+            "event_log",
+            "event_cursor",
+            "send_attempt",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing {table}");
+        }
+        let has_column: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='kt_send_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1);
+    }
+
+    #[test]
+    fn core_watermark_is_contiguous_and_event_log_replays() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(store.advance_inbound_watermark("a", 1, 1).unwrap());
+        assert!(!store.advance_inbound_watermark("a", 1, 3).unwrap());
+        assert!(store.advance_inbound_watermark("a", 1, 2).unwrap());
+        assert!(!store.advance_inbound_watermark("a", 1, 2).unwrap());
+        assert!(store.advance_inbound_watermark("a", 2, 1).unwrap());
+
+        let first = store
+            .append_event_log(1, Some("a"), "account.changed", "{}")
+            .unwrap();
+        let second = store
+            .append_event_log(1, Some("a"), "message.upserted", "{}")
+            .unwrap();
+        assert_eq!(second, first + 1);
+        let rows = store.list_events_since(0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, 1);
+
+        store.set_event_cursor("sub", second, 1).unwrap();
+        assert_eq!(store.event_cursor("sub").unwrap(), Some((second, 1)));
+        store
+            .mark_inbound_skipped("a", 1, 9, "stale_epoch", Some("unit"))
+            .unwrap();
+        let skipped: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM inbound_skipped WHERE account_id='a' AND seq=9",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn event_log_rolls_back_with_product_transaction() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let result: Result<(), StoreError> = store.write_transaction(|tx| {
+            append_event_log_on(tx, 1, Some("a"), "must.rollback", "{}")?;
+            Err(StoreError::Unavailable(None))
+        });
+        assert!(result.is_err());
+        let count: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM event_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        store
+            .write_transaction(|tx| {
+                append_event_log_on(tx, 1, Some("a"), "must.commit", "{}")?;
+                Ok(())
+            })
+            .unwrap();
+        let count: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM event_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
     /// Every unit-test store is encrypted: the fixture key exercises the same
     /// keyed-open path production uses (optimization-plan Phase 3).
     const TEST_KEY_BYTES: [u8; 32] = [0x5A; 32];
@@ -15606,6 +16182,89 @@ mod tests {
                 ],
             )
             .unwrap();
+    }
+
+    /// Runtime state authority (contract 1.275): inventory reconciliation may
+    /// not erase a terminal unlink; only an explicit link/whoami answer does.
+    #[test]
+    fn inventory_upsert_preserves_terminal_unlink_until_explicit_ready() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .mark_account_device_unlinked("+15555550100")
+            .unwrap()
+            .expect("account row");
+
+        let after_inventory = store
+            .upsert_account_from_signal("+15555550100", Some(2), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(after_inventory.state, "device_unlinked");
+        assert_eq!(after_inventory.state_evidence.as_deref(), Some("upstream"));
+
+        let after_ready = store
+            .mark_account_ready_by_id(&account.id, "engine")
+            .unwrap()
+            .expect("account row");
+        assert_eq!(after_ready.state, "ready");
+        assert_eq!(after_ready.state_evidence.as_deref(), Some("engine"));
+        assert!(after_ready.state_observed_at.is_some());
+    }
+
+    /// Contract 1.277: state revision moves only on a real transition, never
+    /// on a plain inventory re-read.
+    #[test]
+    fn account_state_revision_bumps_only_on_real_transitions() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(account.state_revision, 1);
+
+        let inventory = store
+            .upsert_account_from_signal("+15555550100", Some(2), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(inventory.state_revision, 1);
+
+        let unlinked = store
+            .mark_account_device_unlinked("+15555550100")
+            .unwrap()
+            .expect("account row");
+        assert_eq!(unlinked.state_revision, 2);
+
+        let inventory_again = store
+            .upsert_account_from_signal("+15555550100", Some(3), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(inventory_again.state_revision, 2);
+
+        let ready = store
+            .mark_account_ready_by_id(&account.id, "engine")
+            .unwrap()
+            .expect("account row");
+        assert_eq!(ready.state_revision, 3);
+    }
+
+    /// The wire projection carries the new evidence only when present and
+    /// keeps `stale:false` off the frame (additive shape).
+    #[test]
+    fn terminal_state_evidence_serializes_additively() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let terminal = store
+            .mark_account_device_unlinked("+15555550100")
+            .unwrap()
+            .expect("account row");
+        let value = serde_json::to_value(terminal).unwrap();
+        assert_eq!(value["state"], "device_unlinked");
+        assert_eq!(value["stateEvidence"], "upstream");
+        assert!(value.get("stale").is_none());
+        assert!(value["stateObservedAt"].as_u64().is_some());
     }
 
     /// 契约 1.207（M5）：会话外观八字段——官方 ConversationAttributesType 对位。

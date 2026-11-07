@@ -426,6 +426,14 @@ pub enum EngineEvent {
     AccountUnauthorized {
         account: String,
     },
+    /// Engine receive-close classification. Invalidated is not an account
+    /// terminal state; 4401 only reconnects. The supervisor keeps this on the
+    /// health/connection axis, never on account state.
+    ConnectionState {
+        account: String,
+        state: String,
+        close_code: Option<u16>,
+    },
     /// The engine's `receive.emptied` notification (contract 1.134, §4.117):
     /// the account's history queue drained (the official
     /// ApiEmptyQueue→EmptyEvent peer) — advisory receive-stream state the
@@ -3292,6 +3300,7 @@ async fn run_actor(
     // when admission succeeds again so a `recovered` state is emitted once.
     let mut receive_degraded = false;
     let terminal_state;
+    let terminal_cause: &'static str;
 
     loop {
         tokio::select! {
@@ -3339,6 +3348,7 @@ async fn run_actor(
                                 };
                                 let _ = response.send(Err(failure));
                                 terminal_state = EngineState::Exited;
+                                terminal_cause = "stdin_writer_closed";
                                 break;
                             }
                         }
@@ -3351,12 +3361,14 @@ async fn run_actor(
                         stop_child(&child, limits.shutdown_grace).await;
                         let _ = response.send(());
                         terminal_state = EngineState::Stopped;
+                        terminal_cause = "shutdown_requested";
                         break;
                     }
                     None => {
                         writer.abort();
                         stop_child(&child, limits.shutdown_grace).await;
                         terminal_state = EngineState::Stopped;
+                        terminal_cause = "command_channel_closed";
                         break;
                     }
                 }
@@ -3366,6 +3378,7 @@ async fn run_actor(
             // failures, exactly as an inline write error used to.
             _ = writer_failed_rx.recv() => {
                 terminal_state = EngineState::Exited;
+                terminal_cause = "stdin_writer_failed";
                 break;
             }
             line = lines.recv() => {
@@ -3379,11 +3392,13 @@ async fn run_actor(
                             &mut receive_degraded,
                         ).await.is_err() {
                             terminal_state = EngineState::Faulted;
+                            terminal_cause = "upstream_protocol_error";
                             break;
                         }
                     }
                     Some(PumpedLine::FramingError) => {
                         terminal_state = EngineState::Faulted;
+                        terminal_cause = "stdout_framing_error";
                         break;
                     }
                     // The pump returned: the child's stdout hit EOF, so the
@@ -3391,6 +3406,7 @@ async fn run_actor(
                     // inline `None` arm.
                     None => {
                         terminal_state = EngineState::Exited;
+                        terminal_cause = "stdout_eof";
                         break;
                     }
                 }
@@ -3405,16 +3421,24 @@ async fn run_actor(
         // The loop only breaks on a terminal state; this arm is unreachable.
         EngineState::Running => "running",
     };
+    let child_exit = {
+        let mut guard = child.lock().await;
+        guard.try_wait().ok().flatten()
+    };
     if matches!(terminal_state, EngineState::Stopped) {
         tracing::info!(
             state = terminal_class,
+            cause = terminal_cause,
             pid = process_pid,
+            exit = ?child_exit,
             "engine process stopped"
         );
     } else {
         tracing::warn!(
             state = terminal_class,
+            cause = terminal_cause,
             pid = process_pid,
+            exit = ?child_exit,
             "engine terminated without a shutdown request"
         );
     }
@@ -3464,7 +3488,14 @@ async fn run_stdin_writer(
     failed: mpsc::Sender<()>,
 ) {
     while let Some(frame) = frames.recv().await {
-        if stdin.write_all(&frame).await.is_err() || stdin.flush().await.is_err() {
+        let bytes = frame.len();
+        if let Err(error) = stdin.write_all(&frame).await {
+            tracing::warn!(bytes, error = %error, "engine stdin writer failed");
+            let _ = failed.try_send(());
+            break;
+        }
+        if let Err(error) = stdin.flush().await {
+            tracing::warn!(bytes, error = %error, "engine stdin flush failed");
             let _ = failed.try_send(());
             break;
         }
@@ -3680,6 +3711,31 @@ async fn handle_upstream_line(
                         }
                     }
                 }
+            }
+        } else if method == "connectionState" {
+            let params = object.get("params");
+            let account = params
+                .and_then(|params| params.get("account"))
+                .and_then(Value::as_str)
+                .filter(|account| !account.is_empty());
+            let state = params
+                .and_then(|params| params.get("state"))
+                .and_then(Value::as_str)
+                .filter(|state| !state.is_empty());
+            let close_code = params
+                .and_then(|params| params.get("closeCode"))
+                .and_then(Value::as_u64)
+                .map(|code| code as u16);
+            if let (Some(account), Some(state)) = (account, state) {
+                let _ = events.send(EngineEvent::ConnectionState {
+                    account: account.to_string(),
+                    state: state.to_string(),
+                    close_code,
+                });
+            } else {
+                let _ = events.send(EngineEvent::ProtocolWarning {
+                    kind: "unknownNotification",
+                });
             }
         } else if method == "accountUnbound" {
             // Contract 1.113 §4.94: the engine's unbound stop-ring (B4) pushes

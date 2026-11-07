@@ -584,6 +584,7 @@ impl ProxyGroupRuntime {
                 let _ = self.events.send(RegistryEvent::StorageChanged { state });
             }
             EngineEvent::AccountUnauthorized { .. }
+            | EngineEvent::ConnectionState { .. }
             | EngineEvent::ReceiveEmptied { .. }
             | EngineEvent::ReceiveClockSkew { .. }
             | EngineEvent::ConversationState { .. }
@@ -625,6 +626,7 @@ impl ProxyGroupRuntime {
             }
             EngineEvent::ResourcePressure { .. }
             | EngineEvent::AccountUnauthorized { .. }
+            | EngineEvent::ConnectionState { .. }
             | EngineEvent::ReceiveEmptied { .. }
             | EngineEvent::ReceiveClockSkew { .. }
             | EngineEvent::ConversationState { .. }
@@ -953,6 +955,16 @@ impl ProxyGroupRuntime {
     /// are asked **in parallel** under one budget (design F9); a slot that
     /// misses it degrades to its local store rows, so a single wedged engine
     /// cannot stretch the host's list latency to O(N × engine timeout).
+    /// Read the account terminal state through the shared router. Used by
+    /// the host mutating gate before any send-family method reaches an engine.
+    pub async fn account_state(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<&'static str>, ServiceError> {
+        let service = self.router.lock().await;
+        service.account_state(account_id)
+    }
+
     pub async fn list_accounts(&self) -> Result<Vec<AccountSummary>, ServiceError> {
         let budget = self
             .pool

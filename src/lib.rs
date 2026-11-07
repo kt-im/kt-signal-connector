@@ -5,6 +5,7 @@ pub mod backup_export;
 pub mod datalock;
 pub mod doctor;
 pub mod engine;
+pub(crate) mod event_publisher;
 pub mod groups;
 pub mod history_attachment;
 pub mod history_import;
