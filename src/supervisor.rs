@@ -9998,7 +9998,7 @@ async fn sync_contacts_with(
 ) -> Result<ContactsSyncOutcome, ServiceError> {
     let number = service.lock().await.account_signal_number(account_id)?;
     // Contacts registered on the account only (no allRecipients walk).
-    let contacts_result = engine
+    let mut contacts_result = engine
         .call(
             "listContacts",
             json!({ "account": number }),
@@ -10006,6 +10006,36 @@ async fn sync_contacts_with(
         )
         .await
         .map_err(ServiceError::Engine)?;
+    let has_unnamed = contacts_result.as_array().is_some_and(|items| {
+        !items.is_empty()
+            && items.iter().all(|item| {
+                item.get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| name.trim().is_empty())
+            })
+    });
+    if has_unnamed {
+        // A fresh/relinked account can land contacts before any profile
+        // material does. Refresh once and re-read the projection instead of
+        // leaving every row as 未知联系人 until the next link.
+        let _ = engine
+            .call(
+                "profiles.refreshContacts",
+                json!({ "account": number }),
+                CallClass::ReadOnly,
+            )
+            .await;
+        if let Ok(refreshed) = engine
+            .call(
+                "listContacts",
+                json!({ "account": number }),
+                CallClass::ReadOnly,
+            )
+            .await
+        {
+            contacts_result = refreshed;
+        }
+    }
     let contact_items = contacts_result
         .as_array()
         .map(Vec::as_slice)
