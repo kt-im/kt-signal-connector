@@ -13189,6 +13189,18 @@ impl Store {
         Ok(())
     }
 
+    /// Invalidate the 60s contacts-sync throttle after a ContactSync
+    /// attachment changes the cache; the next sync must project titles.
+    pub fn clear_contacts_synced_at(&self, account_id: &str) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "DELETE FROM meta WHERE key=?1",
+                params![format!("contacts_synced_at:{account_id}")],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
     /// Test-only wrapper; production writes the marker inside the
     /// `upsert_synced_contacts` transaction.
     #[cfg(test)]

@@ -14089,6 +14089,9 @@ impl ConnectorService {
         contacts: &[crate::engine::SyncContactRecord],
         complete: bool,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        // The passive attachment changed the contact cache; the 60s sync
+        // throttle must not hide it from the gate's immediate projection.
+        self.store.clear_contacts_synced_at(&account.id)?;
         if contacts.is_empty() {
             if complete {
                 tracing::warn!(
