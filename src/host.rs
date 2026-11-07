@@ -7497,6 +7497,16 @@ mod tests {
         assert_eq!(frame["data"]["accountId"], "acct-1");
 
         let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::ContactSyncCompleted {
+                account_id: "acct-1".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["event"], "contactSync.complete");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+
+        let frame: Value = serde_json::to_value(
             host_event_frame(HostSideEvent::PniChanged {
                 account_id: "acct-1".into(),
                 registration_id: Some(2718),
