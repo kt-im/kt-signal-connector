@@ -1053,6 +1053,11 @@ impl ServiceError {
                 "the upstream rate-limited the send",
                 false,
             ),
+            ServiceError::Engine(EngineError::AppExpired) => ApiError::new(
+                "SEND_APP_EXPIRED",
+                "the client version is no longer accepted; upgrade required",
+                false,
+            ),
             ServiceError::Engine(EngineError::ProofRequired) => ApiError::new(
                 "SEND_PROOF_REQUIRED",
                 "the upstream requires a proof challenge before the send",

@@ -319,6 +319,8 @@ pub enum EngineError {
     },
     #[error("engine rejected the device credentials")]
     Unauthorized,
+    #[error("engine send was rejected because the client version expired")]
+    AppExpired,
     /// Contract 1.99 §4.80: the engine's send-chain transport families. The
     /// engine folds a transport-layer send failure into the plain
     /// internal_error JSON-RPC face (-32603) whose `message` embeds the cause
@@ -387,6 +389,7 @@ impl EngineError {
             EngineError::ProofRequired => "proof_required",
             EngineError::ServerUnavailable => "server_unavailable",
             EngineError::IdentityUnverified => "identity_unverified",
+            EngineError::AppExpired => "app_expired",
             EngineError::UpstreamCode { .. } => "upstream_code",
         }
     }
@@ -4151,6 +4154,7 @@ const ENGINE_SEND_RATE_LIMITED_ANCHOR: &str = "(RateLimitExceeded)";
 const ENGINE_SEND_PROOF_REQUIRED_ANCHOR: &str = "(ProofRequiredException)";
 const ENGINE_SEND_SERVER_UNAVAILABLE_ANCHOR: &str = "(ServerUnavailableException)";
 const ENGINE_SEND_IDENTITY_UNVERIFIED_ANCHOR: &str = "(UntrustedIdentityException)";
+const ENGINE_SEND_APP_EXPIRED_ANCHOR: &str = "(AppExpiredException)";
 
 /// Classify a send-chain error (contract 1.99 §4.80, joined by the 1.114
 /// §4.95 identity gate) from the raw JSON-RPC error body: `Some` variant when
@@ -4178,6 +4182,8 @@ fn upstream_error_send_class(error: Option<&Value>) -> Option<EngineError> {
         Some(EngineError::ServerUnavailable)
     } else if message.contains(ENGINE_SEND_IDENTITY_UNVERIFIED_ANCHOR) {
         Some(EngineError::IdentityUnverified)
+    } else if message.contains(ENGINE_SEND_APP_EXPIRED_ANCHOR) {
+        Some(EngineError::AppExpired)
     } else {
         None
     }
@@ -9715,6 +9721,13 @@ mod tests {
             Some(EngineError::RateLimited {
                 retry_after_secs: None
             })
+        );
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Client version expired. (AppExpiredException)"
+            })),
+            Some(EngineError::AppExpired)
         );
     }
 
