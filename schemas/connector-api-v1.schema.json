@@ -4822,6 +4822,7 @@
             "identity.pniChanged",
             "group.terminated",
             "contact.profileUpdated",
+            "contactSync.complete",
             "receive.emptied",
             "receive.clockSkew",
             "conversation.stateChanged",
@@ -5806,6 +5807,25 @@
                     "$ref": "#/$defs/opaqueId",
                     "description": "The mutation's resolved local conversation — the id form the desktop addresses (the §4.85 ladder over the peerId); absent when the identity resolved to nothing (the desktop joins by peerId alone)."
                   }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "contactSync.complete" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId"],
+                "description": "Official contactSync:complete (background.preload.ts:1894/1928): the primary's contact attachment has been parsed and applied. The inbox gate's contacts half settles on this event, never on the contacts.sync RPC return. A completion-only final blob (no records) still emits it.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" }
                 }
               }
             }
