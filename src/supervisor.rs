@@ -10071,7 +10071,10 @@ async fn sync_contacts_with(
     let mut contact_count = 0_u64;
     let mut group_count = 0_u64;
     for item in contacts_result.as_array().cloned().unwrap_or_default() {
-        let peer_key = ["number", "uuid", "numberUuid"]
+        // Prefer the ACI: direct conversation rows are keyed by serviceId on
+        // the receive path. Picking the number first materialized a second
+        // number-keyed row and left the live ACI row's title masked.
+        let peer_key = ["uuid", "number", "numberUuid"]
             .iter()
             .find_map(|field| item.get(field).and_then(Value::as_str))
             .map(str::trim)
