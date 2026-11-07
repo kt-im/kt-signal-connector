@@ -4015,7 +4015,11 @@ impl ConnectorService {
             pending_id,
             account_id: account_id.to_string(),
             conversation_id: conversation_id.to_string(),
-            params,
+            params: {
+                let mut params = params;
+                params["dispatchId"] = json!(client_request_id);
+                params
+            },
             pending_sent_at: pending.sent_at,
         })
     }
@@ -22938,6 +22942,9 @@ mod tests {
             PreparedSend::Dispatch { params, .. } => params,
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
+        assert!(dispatch["dispatchId"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
         assert_eq!(dispatch["previewUrl"], json!("https://example.com/a"));
         assert_eq!(dispatch["previewTitle"], json!("Example"));
         assert_eq!(dispatch["previewDescription"], json!("A page"));
@@ -23005,6 +23012,7 @@ mod tests {
                 "recipient": ["+15555550101"],
                 "storyReplyAuthor": "22222222-2222-2222-2222-222222222222",
                 "storyReplyTimestamp": 1_727_000_000_000u64,
+                "dispatchId": "req-story-reply-both",
             })
         );
 
@@ -23043,6 +23051,7 @@ mod tests {
                 "account": "+15555550100",
                 "message": "plain body",
                 "recipient": ["+15555550101"],
+                "dispatchId": "req-story-reply-plain",
             })
         );
     }
