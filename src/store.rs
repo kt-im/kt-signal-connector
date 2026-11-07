@@ -16073,6 +16073,43 @@ mod tests {
     }
 
     #[test]
+    fn account_row_reuses_id_for_same_signal_account() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let first = store
+            .upsert_account_from_signal("+15550009999", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let second = store
+            .upsert_account_from_signal("+15550009999", Some(2), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(store.list_accounts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn conversation_id_is_deterministic_and_survives_unlink() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15550009998", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let first = store
+            .ensure_conversation(&account.id, "direct", "+15550009997", "peer")
+            .unwrap();
+        let second = store
+            .ensure_conversation(&account.id, "direct", "+15550009997", "peer renamed")
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        store.mark_account_device_unlinked("+15550009998").unwrap();
+        drop(store);
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let after = store
+            .ensure_conversation(&account.id, "direct", "+15550009997", "peer")
+            .unwrap();
+        assert_eq!(first.id, after.id);
+    }
+
+    #[test]
     fn single_account_lifecycle_acceptance() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
