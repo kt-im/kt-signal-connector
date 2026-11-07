@@ -14090,6 +14090,12 @@ impl ConnectorService {
         complete: bool,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
         if contacts.is_empty() {
+            if complete {
+                tracing::warn!(
+                    account_id = %account.id,
+                    "contactSync complete consumed (empty final blob)"
+                );
+            }
             return Ok(if complete {
                 vec![HostSideEvent::ContactSyncCompleted {
                     account_id: account.id.clone(),
@@ -14188,6 +14194,11 @@ impl ConnectorService {
         }
         events.extend(merge_events);
         if complete {
+            tracing::warn!(
+                account_id = %account.id,
+                records = contacts.len(),
+                "contactSync complete consumed"
+            );
             events.push(HostSideEvent::ContactSyncCompleted {
                 account_id: account.id.clone(),
             });
