@@ -6774,6 +6774,37 @@ impl Store {
         preview: Option<&str>,
         increment_unread: bool,
     ) -> Result<bool, StoreError> {
+        self.insert_message_inner(message, client_request_id, preview, increment_unread, None)
+    }
+
+    /// B: message insert and its event_log row commit together. Only the
+    /// receive main path passes an event; every other writer keeps
+    /// insert_message.
+    pub fn insert_message_with_event(
+        &self,
+        message: &MessageRecord,
+        client_request_id: Option<&str>,
+        preview: Option<&str>,
+        increment_unread: bool,
+        event: &EventLogWrite,
+    ) -> Result<bool, StoreError> {
+        self.insert_message_inner(
+            message,
+            client_request_id,
+            preview,
+            increment_unread,
+            Some(event),
+        )
+    }
+
+    fn insert_message_inner(
+        &self,
+        message: &MessageRecord,
+        client_request_id: Option<&str>,
+        preview: Option<&str>,
+        increment_unread: bool,
+        event: Option<&EventLogWrite>,
+    ) -> Result<bool, StoreError> {
         let conn = self.lock_conn()?;
         let transaction = conn
             .unchecked_transaction()
@@ -6918,6 +6949,15 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         if account_updated != 1 {
             return Err(StoreError::AccountNotFound);
+        }
+        if let Some(event) = event {
+            append_event_log_on(
+                &transaction,
+                event.epoch,
+                event.account_id.as_deref(),
+                &event.event_type,
+                &event.payload,
+            )?;
         }
         transaction
             .commit()
@@ -14333,6 +14373,14 @@ fn ensure_additive_columns(conn: &Connection) -> Result<(), StoreError> {
 
 pub(crate) type EventLogRow = (i64, u64, Option<String>, String, String);
 
+#[derive(Clone, Debug)]
+pub struct EventLogWrite {
+    pub epoch: u64,
+    pub account_id: Option<String>,
+    pub event_type: String,
+    pub payload: String,
+}
+
 pub(crate) fn append_event_log_on(
     conn: &Connection,
     epoch: u64,
@@ -15992,6 +16040,77 @@ mod tests {
         assert_eq!(store.account_engine_epoch("e").unwrap(), Some(2));
         store.mark_account_device_unlinked("+15550002").unwrap();
         assert_eq!(store.account_engine_epoch("e").unwrap(), Some(2));
+    }
+
+    #[test]
+    fn message_insert_and_event_log_commit_together() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let message = MessageRecord {
+            is_erased: false,
+            delete_failed: false,
+            required_protocol_version: None,
+            author_aci: None,
+            id: "atomic-1".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "sender".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 1_700_000_000_000,
+            received_at: None,
+            text: Some("atomic".into()),
+            text_bytes: Some(6),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "received",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            admin_deleted: false,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        let event = EventLogWrite {
+            epoch: store
+                .account_engine_epoch(&account.id)
+                .unwrap()
+                .unwrap_or(0),
+            account_id: Some(account.id.clone()),
+            event_type: "message.upserted".into(),
+            payload: "{}".into(),
+        };
+        assert!(
+            store
+                .insert_message_with_event(&message, None, Some("atomic"), true, &event)
+                .unwrap()
+        );
+        let rows = store.list_events_since(0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3, "message.upserted");
+        assert_eq!(rows[0].2.as_deref(), Some(account.id.as_str()));
     }
 
     #[test]

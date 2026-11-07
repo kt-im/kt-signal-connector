@@ -10827,9 +10827,21 @@ impl ConnectorService {
             .as_deref()
             .map(|text| text.chars().take(120).collect::<String>());
         let increment_unread = direction == "incoming";
-        let inserted =
-            self.store
-                .insert_message(&message, None, preview.as_deref(), increment_unread)?;
+        let event_payload = serde_json::to_string(&project_message_for_host(message.clone()))
+            .unwrap_or_else(|_| "{}".to_string());
+        let event = crate::store::EventLogWrite {
+            epoch: self.store.account_engine_epoch(&account.id)?.unwrap_or(0),
+            account_id: Some(account.id.clone()),
+            event_type: "message.upserted".to_string(),
+            payload: event_payload,
+        };
+        let inserted = self.store.insert_message_with_event(
+            &message,
+            None,
+            preview.as_deref(),
+            increment_unread,
+            &event,
+        )?;
         if !inserted {
             // A race lost to the identity check above: `insert_message`'s
             // duplicate arm merged this envelope's descriptor/locator faces
@@ -22942,9 +22954,11 @@ mod tests {
             PreparedSend::Dispatch { params, .. } => params,
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
-        assert!(dispatch["dispatchId"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty()));
+        assert!(
+            dispatch["dispatchId"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
         assert_eq!(dispatch["previewUrl"], json!("https://example.com/a"));
         assert_eq!(dispatch["previewTitle"], json!("Example"));
         assert_eq!(dispatch["previewDescription"], json!("A page"));
