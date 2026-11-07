@@ -9971,6 +9971,13 @@ impl RuntimeSupervisor {
                 true,
             )))
         });
+        // An empty projection means the engine store was not ready yet; do
+        // not let that empty result arm the 60s throttle. The gate retries
+        // until the contact attachment has landed.
+        if matches!(&outcome, Ok(outcome) if outcome.contact_count == 0) {
+            let service = self.service.lock().await;
+            let _ = service.store_ref().clear_contacts_synced_at(account_id);
+        }
         if outcome.is_ok() {
             // 契约 1.270（§4.254 · 批 Z14）：真实落库（非 60s 节流早退）后
             // 一轮头像 backfill——首轮链接/换机/重启后的冷缓存收敛点。
