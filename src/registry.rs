@@ -2526,10 +2526,24 @@ impl ProxyGroupRuntime {
         media_handle: String,
         offset: u64,
     ) -> Result<crate::service::MediaChunkView, ServiceError> {
-        self.groups[0]
+        self.media_slot()?
             .supervisor
             .read_media_chunk(media_handle, offset)
             .await
+    }
+
+    /// Media handles are process-wide (ADR 0004), but full-pool mode has no
+    /// legacy groups. Pick any live supervisor; the handle table resolves it.
+    fn media_slot(&self) -> Result<Arc<ProxyGroupSlot>, ServiceError> {
+        self.groups
+            .first()
+            .cloned()
+            .or_else(|| {
+                self.pool
+                    .as_ref()
+                    .and_then(|pool| pool.slots().first().map(|slot| slot.routing()))
+            })
+            .ok_or_else(engine_not_provisioned_error)
     }
 
     /// `closeHandle` — same process-wide-table reasoning as `readChunk`.
@@ -2537,7 +2551,7 @@ impl ProxyGroupRuntime {
         &self,
         media_handle: String,
     ) -> Result<crate::service::MediaCloseView, ServiceError> {
-        self.groups[0]
+        self.media_slot()?
             .supervisor
             .close_media_handle(media_handle)
             .await
