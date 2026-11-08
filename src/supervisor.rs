@@ -8307,18 +8307,10 @@ impl RuntimeSupervisor {
         params: MessagesDeleteForMeMessagesParams,
     ) -> Result<&'static str, ServiceError> {
         let engine = self.running_engine().await?;
-        // Resolve entries before the local delete (the self-sync still needs
-        // the rows' upstream timestamps).
         let upstream = {
             let service = self.service.lock().await;
             service.prepare_messages_delete_for_me_messages(&params)?
         };
-        // Official deleteMessages is local-first: remove the connector's own
-        // rows even when the engine has no mirror row (imported history).
-        {
-            let mut service = self.service.lock().await;
-            service.delete_local_messages_for_me(&params)?;
-        }
         match engine
             .call("deleteForMeMessages", upstream, CallClass::Mutating)
             .await
