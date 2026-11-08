@@ -6949,6 +6949,40 @@ impl ConnectorService {
     /// destructive-intent rule). The conversation resolves through the
     /// §4.83 ladder; `kind` derives from the local row (direct → contact,
     /// group → group; a legacy/unknown kind refuses).
+    /// Official local-first leg of messages.deleteForMeMessages: remove the
+    /// connector's own rows before the self-sync rides upstream. History
+    /// rows imported into the connector need not exist in the engine store,
+    /// so the engine's delete-for-self mirror cannot be the only writer.
+    pub fn delete_local_messages_for_me(
+        &mut self,
+        params: &MessagesDeleteForMeMessagesParams,
+    ) -> Result<(), ServiceError> {
+        let account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        let mut timestamps = Vec::new();
+        for message_id in &params.message_ids {
+            if let Ok(message) = self.resolve_message(
+                &params.account_id,
+                &params.conversation_id,
+                message_id,
+            ) {
+                if message.sent_at != 0 {
+                    timestamps.push(message.sent_at);
+                }
+            }
+        }
+        if timestamps.is_empty() {
+            return Ok(());
+        }
+        self.store.delete_messages_by_sent_at(
+            &account.id,
+            &conversation.id,
+            &timestamps,
+        )?;
+        Ok(())
+    }
+
     pub fn prepare_messages_delete_for_me_messages(
         &self,
         params: &MessagesDeleteForMeMessagesParams,
