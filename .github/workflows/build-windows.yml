@@ -14,6 +14,7 @@ jobs:
   build:
     name: Build Windows x64 connector
     runs-on: windows-latest
+    environment: prod
     steps:
       - uses: actions/checkout@v4
 
@@ -53,10 +54,11 @@ jobs:
           path: target/release/kt-signal-connector.exe
           if-no-files-found: error
 
-      # OIDC → OSS（download.ktai.im）。role 由 kt-cloud-infra 建好后启用，
-      # 目标：oss://kongtian-update/kt/signal-runtime/connector/<version>/<artifact>
-      # 未配置变量时该步跳过，不影响构建产物。
-      - name: Publish to download.ktai.im (OIDC)
+      # OIDC → OSS（download.ktai.im）。role 由 KTAIorg/kt-cloud-infra#196 建：
+      #   acs:ram::5590716371345016:role/gha-ktim-signal-runtime-prod
+      # 只授权写 kontian-assets/kt/signal-runtime/*（显式 Deny Delete）。
+      - name: Assume Aliyun OIDC role for OSS publish
+        id: aliyun-oidc
         if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
         uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6
         with:
@@ -65,13 +67,27 @@ jobs:
           audience: sts.aliyuncs.com
           role-session-name: kt-signal-runtime-connector
 
-      - name: Upload connector.exe to OSS
+      - name: Publish connector to download.ktai.im
         if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
         shell: pwsh
         env:
-          ALIYUN_ACCESS_KEY_ID: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-id }}
-          ALIYUN_ACCESS_KEY_SECRET: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-secret }}
-          ALIYUN_SECURITY_TOKEN: ${{ steps.aliyun-oidc.outputs.aliyun-security-token }}
+          OSS_ACCESS_KEY_ID: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-id }}
+          OSS_ACCESS_KEY_SECRET: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-secret }}
+          OSS_STS_TOKEN: ${{ steps.aliyun-oidc.outputs.aliyun-security-token }}
+          OSS_BUCKET: kontian-assets
+          OSS_ENDPOINT: oss-us-west-1.aliyuncs.com
+          OSS_PREFIX: kt/signal-runtime/connector
         run: |
-          Write-Host "OSS publish not wired yet: needs role + endpoint. Artifact kept as workflow artifact."
-
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:OSS_ACCESS_KEY_ID) { throw "OIDC STS outputs missing" }
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $obj = "$env:OSS_PREFIX/$ver/kt-signal-connector-windows-x64.exe"
+          Write-Host "publishing target/release/kt-signal-connector.exe -> oss://$env:OSS_BUCKET/$obj"
+          # ossutil 官方 CLI（支持 STS token）
+          Invoke-WebRequest -Uri "https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil64.exe" -OutFile ossutil.exe
+          ./ossutil.exe config -e $env:OSS_ENDPOINT -i $env:OSS_ACCESS_KEY_ID -k $env:OSS_ACCESS_KEY_SECRET -t $env:OSS_STS_TOKEN --force
+          ./ossutil.exe cp -f target/release/kt-signal-connector.exe "oss://$env:OSS_BUCKET/$obj"
+          ./ossutil.exe stat "oss://$env:OSS_BUCKET/$obj"
+          $hash = (Get-FileHash target/release/kt-signal-connector.exe -Algorithm SHA256).Hash.ToLower()
+          Write-Host "sha256=$hash"
+          Write-Host "public url: https://download.ktai.im/$obj"
