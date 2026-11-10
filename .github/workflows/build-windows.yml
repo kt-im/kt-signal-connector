@@ -1,0 +1,77 @@
+name: build-windows-connector
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-windows.yml'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+jobs:
+  build:
+    name: Build Windows x64 connector
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      # rusqlite 的 bundled-sqlcipher 需要 OpenSSL；windows-latest 自带 vcpkg。
+      - name: Install OpenSSL (vcpkg)
+        shell: pwsh
+        run: |
+          vcpkg install openssl:x64-windows-static-md
+          "OPENSSL_DIR=C:\vcpkg\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # OpenSSL 系统库链接参数放在 .cargo/config.toml（数组形式），
+      # 不用 RUSTFLAGS 环境变量（空格会被切分成多个输入文件）。
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Show artifact
+        shell: pwsh
+        run: |
+          Get-Item target/release/kt-signal-connector.exe | Format-List Name,Length
+          Get-FileHash target/release/kt-signal-connector.exe -Algorithm SHA256 | Format-List
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kt-signal-connector-windows-x64
+          path: target/release/kt-signal-connector.exe
+          if-no-files-found: error
+
+      # OIDC → OSS（download.ktai.im）。role 由 kt-cloud-infra 建好后启用，
+      # 目标：oss://kongtian-update/kt/signal-runtime/connector/<version>/<artifact>
+      # 未配置变量时该步跳过，不影响构建产物。
+      - name: Publish to download.ktai.im (OIDC)
+        if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
+        uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6
+        with:
+          role-to-assume: ${{ vars.KT_SIGNAL_RUNTIME_RAM_ROLE }}
+          oidc-provider-arn: acs:ram::5590716371345016:oidc-provider/github-actions-KT-Settlement
+          audience: sts.aliyuncs.com
+          role-session-name: kt-signal-runtime-connector
+
+      - name: Upload connector.exe to OSS
+        if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
+        shell: pwsh
+        env:
+          ALIYUN_ACCESS_KEY_ID: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-id }}
+          ALIYUN_ACCESS_KEY_SECRET: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-secret }}
+          ALIYUN_SECURITY_TOKEN: ${{ steps.aliyun-oidc.outputs.aliyun-security-token }}
+        run: |
+          Write-Host "OSS publish not wired yet: needs role + endpoint. Artifact kept as workflow artifact."
+

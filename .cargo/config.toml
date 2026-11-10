@@ -1,14 +1,11 @@
-# rust-lang/rust#157750: on macOS 27, dyld rejects dylibs whose LINKEDIT
-# string pool is not pointer-size aligned ("mis-aligned LINKEDIT string
-# pool"). The misalignment is produced by rustc's bundled rust-objcopy, which
-# cargo runs in debug-free profiles (release defaults to strip=debuginfo), so
-# every release-profile proc-macro dylib fails to dlopen and release builds
-# cannot compile proc-macro dependents. `-C strip=none` alone is the confirmed
-# fix: the objcopy pass never runs and the linker's own (correct) alignment
-# stands. Dev profiles default to strip=none already, so this is a no-op
-# there; Linux CI is unaffected (macOS-only by cfg). Trade-off: release
-# artifacts keep their symbol tables — strip them at packaging time if size
-# matters. Remove this file once the project toolchain is rustc >= 1.98.0
-# (first stable carrying the LLVM fix).
-[target.'cfg(target_os = "macos")']
-rustflags = ["-C", "strip=none"]
+# Windows x64 构建：vcpkg 的 openssl 是静态库（x64-windows-static-md），
+# 需要显式链接它依赖的 Windows 系统库，否则链接阶段报：
+#   libcrypto.lib(...cryptlib.obj) : error LNK2019: unresolved external symbol
+#     __imp_GetProcessWindowStation (OPENSSL_isservice)
+#     __imp_GetUserObjectInformationW
+#     __imp_MessageBoxW (OPENSSL_showfatal)
+#
+# 注意：不要用 RUSTFLAGS 环境变量传（空格会被 cargo 当多个参数切分，
+# 报 "multiple input filenames provided"），config.toml 的数组形式是安全的。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=user32.lib advapi32.lib crypt32.lib ws2_32.lib gdi32.lib"]
