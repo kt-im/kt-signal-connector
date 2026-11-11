@@ -234,13 +234,13 @@ async fn a_contract_mismatch_is_a_structured_fatal_without_self_healing() {
     assert_eq!(error["code"], json!("ENGINE_CONTRACT_MISMATCH"));
     assert_eq!(error["retryable"], json!(false));
     assert_eq!(error["data"]["engine"], json!("0.1.0-fixture"));
-    assert_eq!(error["data"]["supported"], json!("1.200-1.285"));
+    assert_eq!(error["data"]["supported"], json!("1.200-1.286"));
     assert_eq!(error["data"]["reason"], json!("revision_out_of_range"));
     assert!(
         stderr_contains(
             &stderr_path,
             "KT_FATAL code=ENGINE_CONTRACT_MISMATCH retryable=false engine=0.1.0-fixture \
-             supported=1.200-1.285",
+             supported=1.200-1.286",
             Duration::from_secs(10),
         )
         .await,

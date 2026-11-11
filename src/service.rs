@@ -60,7 +60,7 @@ fn mrr_has_spam(response_type: u8) -> bool {
 
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, random_id, stable_hash_id};
-use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, LinkSessionState, now_ms};
+use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, LinkSlotState, now_ms};
 use crate::media::{MEDIA_CHUNK_BYTES, MediaGovernor, MediaHandleError, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::store::{
@@ -2585,11 +2585,28 @@ impl ConnectorService {
         device_name: String,
         device_link_uri: String,
     ) -> Result<Value, ServiceError> {
+        self.begin_link_with_engine_attempt(device_name, device_link_uri, None)
+    }
+
+    /// `link.start` with the engine's own rotate key (contract 1.286, §4.272).
+    /// The response keeps the pre-rotate shape — `linkSessionId` is slot 0's
+    /// id, `qrPayload` its code — and adds the attempt face: `linkAttemptId`,
+    /// `deviceLinkUri` (the same slot-0 code under the rotate contract's name)
+    /// and `slots` (`[{deviceLinkUri, slot}]`, live slots only). A host that
+    /// predates the rotate face ignores the three new members and keeps
+    /// linking exactly as before.
+    pub fn begin_link_with_engine_attempt(
+        &mut self,
+        device_name: String,
+        device_link_uri: String,
+        engine_attempt_id: Option<String>,
+    ) -> Result<Value, ServiceError> {
         validate_device_name(&device_name)?;
         if let Some(existing) = self.link.as_ref() {
-            // QR B1: a lost session is terminal, never a live occupant — a
-            // fresh QR replaces it instead of answering LINK_IN_PROGRESS.
-            if !existing.is_lost() && !existing.is_expired(now_ms()) {
+            // QR B1: an attempt with no live slot (lost, committed, or fully
+            // rotated away) is terminal, never a live occupant — a fresh QR
+            // replaces it instead of answering LINK_IN_PROGRESS.
+            if existing.has_live_slot() && !existing.is_expired(now_ms()) {
                 return Err(ServiceError::Api(ApiError::new(
                     "LINK_IN_PROGRESS",
                     "a link session is already active",
@@ -2598,10 +2615,19 @@ impl ConnectorService {
             }
             self.link = None;
         }
-        let session = ActiveLinkSession::new(device_name, device_link_uri, LINK_SESSION_TTL);
+        let session = ActiveLinkSession::with_engine_attempt(
+            device_name,
+            device_link_uri,
+            LINK_SESSION_TTL,
+            engine_attempt_id,
+        );
+        let device_link_uri = session.qr_payload().to_string();
         let response = json!({
             "linkSessionId": session.session_id,
-            "qrPayload": session.qr_payload(),
+            "linkAttemptId": session.attempt_id,
+            "qrPayload": device_link_uri,
+            "deviceLinkUri": device_link_uri,
+            "slots": [{ "deviceLinkUri": device_link_uri, "slot": 0 }],
             "expiresAt": session.expires_at_ms,
         });
         self.link = Some(session);
@@ -2610,9 +2636,10 @@ impl ConnectorService {
 
     pub fn ensure_link_available(&mut self) -> Result<(), ServiceError> {
         if let Some(existing) = self.link.as_ref() {
-            // QR B1: a lost session does not block a fresh start; begin_link
-            // replaces it once the engine hands over the new QR.
-            if existing.is_lost() {
+            // QR B1: an attempt with no live slot (lost or committed) does
+            // not block a fresh start; begin_link replaces it once the engine
+            // hands over the new QR.
+            if !existing.has_live_slot() {
                 return Ok(());
             }
             if !existing.is_expired(now_ms()) {
@@ -2641,10 +2668,11 @@ impl ConnectorService {
         link_session_id: &str,
     ) -> Result<(String, String), ServiceError> {
         let session = self.require_active_link(link_session_id)?;
-        Ok((
-            session.device_name.clone(),
-            session.qr_payload().to_string(),
-        ))
+        let device_link_uri = session
+            .slot_uri(link_session_id)
+            .unwrap_or_default()
+            .to_string();
+        Ok((session.device_name.clone(), device_link_uri))
     }
 
     /// Pin the link session for an in-flight finish: the finish budget
@@ -2697,14 +2725,17 @@ impl ConnectorService {
         // Link commit replay (contract 1.276, §4.260): a finish whose result
         // was lost after the upstream commit must answer the same account
         // instead of LINK_NOT_FOUND / a second device. Check before consuming
-        // or requiring the in-memory session.
-        if let Some((account_id, _)) = self.store.link_commit(link_session_id)? {
-            return self
-                .store
-                .account_summary(&account_id)?
-                .ok_or(ServiceError::Store(StoreError::AccountNotFound));
+        // or requiring the in-memory session. Rotation (contract 1.286,
+        // §4.272) widens the journal surface: the commit is journaled under
+        // every slot id of the attempt, and a committed attempt itself answers
+        // the account from any of its codes.
+        if let Some(summary) = self.replay_link_commit(link_session_id)? {
+            return Ok(summary);
         }
-        let _ = self.require_active_link(link_session_id)?;
+        // The commit accepts any slot of the attempt that still exists: a
+        // rotation that retired this very code while finishLink was in flight
+        // must not lose the engine's committed result.
+        let (slot_state, slot_number) = self.require_link_slot_for_commit(link_session_id)?;
         // [KT 适配] Relink gate (§9.10 item 7): an unfinished local-data delete
         // for this number keeps the old account row in place. Committing a
         // relink here would upsert that row back to `ready` while the delete
@@ -2715,7 +2746,7 @@ impl ConnectorService {
         // official app has no multi-account delete face, hence no upstream
         // anchor for this gate.
         if let Some(state) = self.store.unfinished_account_delete_state(number)? {
-            let _ = self.take_link_session(link_session_id);
+            let _ = self.take_link_attempt(link_session_id);
             return Err(unfinished_delete_relink_error(&state));
         }
         // Per-engine account ceiling (optimization-plan §6.4 M3.3): refuse a
@@ -2725,7 +2756,20 @@ impl ConnectorService {
         if self.link_would_exceed_ceiling(number, proxy_group)? {
             return Err(account_limit_error(proxy_group));
         }
-        let _ = self.take_link_session(link_session_id)?;
+        // Attempt-scoped single flight: the whole attempt leaves the table
+        // here, so no second code of the same attempt can run a second commit
+        // (contract 1.286, §4.272). The attempt is put back below, committed.
+        let mut attempt = self.take_link_attempt(link_session_id)?;
+        if slot_state == LinkSlotState::Retired {
+            // The rotation dropped this code while `finishLink` was in flight;
+            // the engine still linked the device, so this commit owns that
+            // result and journals the account under every slot id (contract
+            // 1.286, §4.272) — the retired code replays it from here on.
+            tracing::info!(
+                slot = slot_number,
+                "link commit accepted a code a rotation retired while the finish was in flight"
+            );
+        }
         // The binding is fixed here, at link.finish success, and immutable for
         // the life of the account (ADR 0001 R3).
         let summary = self.store.upsert_account_from_signal_with_id(
@@ -2751,17 +2795,26 @@ impl ConnectorService {
         if let Some(aci) = canonical.as_deref() {
             self.store.set_account_aci(&summary.id, Some(aci))?;
         }
-        if let Err(error) =
-            self.store
-                .record_link_commit(link_session_id, &summary.id, canonical.as_deref())
-        {
-            // The upstream commit is already real; a journal write failure
-            // must not turn it into a failed finish. The desktop's lost-finish
-            // adoption remains the fallback.
-            tracing::warn!(
-                error_class = error.class(),
-                "link commit journal write failed after a successful finish"
-            );
+        // The attempt's single commit is now real: every remaining slot is
+        // retired (its code can never be used again) and the attempt stays
+        // addressable so a lost finish result replays from any of its codes.
+        attempt.mark_committed(summary.id.clone());
+        let slot_ids = attempt.session_ids();
+        self.link = Some(attempt);
+        for slot_id in slot_ids {
+            if let Err(error) =
+                self.store
+                    .record_link_commit(&slot_id, &summary.id, canonical.as_deref())
+            {
+                // The upstream commit is already real; a journal write failure
+                // must not turn it into a failed finish. The desktop's lost-finish
+                // adoption remains the fallback.
+                tracing::warn!(
+                    error_class = error.class(),
+                    "link commit journal write failed after a successful finish"
+                );
+                break;
+            }
         }
         Ok(self.store.account_summary(&summary.id)?.unwrap_or(summary))
     }
@@ -2792,33 +2845,143 @@ impl ConnectorService {
     }
 
     pub fn cancel_link(&mut self, link_session_id: &str) -> Result<Value, ServiceError> {
-        let _ = self.take_link_session(link_session_id)?;
+        // A committed attempt has nothing left to cancel: the link is real,
+        // and dropping the attempt would take the lost-finish replay away
+        // (contract 1.286, §4.272).
+        if self.link.as_ref().is_some_and(|session| {
+            session.has_slot(link_session_id) && session.committed_account().is_some()
+        }) {
+            return Ok(json!({}));
+        }
+        // Cancel is a dispatch face, not a commit: a code the rotation retired
+        // (or the engine reported dead) has nothing to cancel and keeps its
+        // definite LINK_LOST, so a stale code can never take down the live
+        // codes of the attempt it belongs to.
+        self.require_active_link(link_session_id)?;
+        let _ = self.take_link_attempt(link_session_id)?;
         Ok(json!({}))
     }
 
-    /// True while a non-expired, still-pending link session exists.
-    /// Restarting signal-cli would invalidate its deviceLinkUri, so the
-    /// watchdog must not restart meanwhile. A lost session is dead — the
-    /// watchdog must not stay suppressed by it (QR B1).
+    /// True while a non-expired live slot exists. Restarting signal-cli would
+    /// invalidate its deviceLinkUri, so the watchdog must not restart
+    /// meanwhile. An attempt with no live slot is dead — the watchdog must not
+    /// stay suppressed by it (QR B1, contract 1.286 §4.272).
     pub fn has_pending_link(&self) -> bool {
-        self.link.as_ref().is_some_and(|session| {
-            session.state == LinkSessionState::Pending && !session.is_expired(now_ms())
+        self.link
+            .as_ref()
+            .is_some_and(|session| session.has_live_slot() && !session.is_expired(now_ms()))
+    }
+
+    /// Mark one slot lost (QR B1). The attempt stays in the table so the
+    /// router can still attribute any of its ids and finish/cancel answer the
+    /// definite LINK_LOST instead of LINK_NOT_FOUND; has_pending_link turns
+    /// false once the last live slot is gone, and the next begin_link replaces
+    /// the attempt. Returns false when no attempt owns that slot.
+    pub fn mark_link_lost(&mut self, link_session_id: &str) -> bool {
+        match self.link.as_mut() {
+            Some(session) => session.mark_slot_lost(link_session_id, now_ms()),
+            None => false,
+        }
+    }
+
+    /// Pre-dispatch gate for `link.rotate` (contract 1.286, §4.272): the
+    /// attempt must be open, unexpired, and minted by an engine that handed
+    /// over its rotate key. `None` is the capability answer — the engine
+    /// predates the rotate face, so the caller answers NOT_SUPPORTED and the
+    /// single slot keeps working untouched.
+    pub fn begin_rotate(&mut self, link_attempt_id: &str) -> Result<Option<String>, ServiceError> {
+        let Some(session) = self.link.as_ref() else {
+            return Err(link_attempt_not_found_error());
+        };
+        if session.attempt_id != link_attempt_id {
+            return Err(link_attempt_not_found_error());
+        }
+        if session.committed_account().is_some() {
+            return Err(link_attempt_committed_error());
+        }
+        if session.is_expired(now_ms()) {
+            self.link = None;
+            return Err(ServiceError::Api(ApiError::new(
+                "LINK_EXPIRED",
+                "link session has expired",
+                false,
+            )));
+        }
+        Ok(session.engine_attempt_id.clone())
+    }
+
+    /// Record the slot a `rotateLink` answer just minted. The attempt keeps at
+    /// most [`crate::link::MAX_LIVE_LINK_SLOTS`] live codes: a third one
+    /// retires the oldest live slot, whose code can never commit again.
+    pub fn attach_rotated_slot(
+        &mut self,
+        link_attempt_id: &str,
+        device_link_uri: String,
+        at_ms: u64,
+    ) -> Result<LinkRotate, ServiceError> {
+        let Some(session) = self.link.as_mut() else {
+            return Err(link_attempt_not_found_error());
+        };
+        if session.attempt_id != link_attempt_id {
+            return Err(link_attempt_not_found_error());
+        }
+        if session.committed_account().is_some() {
+            return Err(link_attempt_committed_error());
+        }
+        if session.is_expired(at_ms) {
+            self.link = None;
+            return Err(ServiceError::Api(ApiError::new(
+                "LINK_EXPIRED",
+                "link session has expired",
+                false,
+            )));
+        }
+        let added = session.add_slot(device_link_uri, at_ms);
+        let device_link_uri = session
+            .slot_uri(&added.link_session_id)
+            .unwrap_or_default()
+            .to_string();
+        let slots = live_link_slots(session);
+        Ok(LinkRotate {
+            link_attempt_id: session.attempt_id.clone(),
+            link_session_id: added.link_session_id,
+            device_link_uri,
+            slot: added.slot,
+            retired: added.retired,
+            slots,
+            expires_at_ms: session.expires_at_ms,
         })
     }
 
-    /// Mark the named session lost (QR B1). The session stays in the table so
-    /// the router can still attribute its id and finish/cancel answer the
-    /// definite LINK_LOST instead of LINK_NOT_FOUND; has_pending_link turns
-    /// false and the next begin_link replaces it. Returns false when no
-    /// session with this id is current.
-    pub fn mark_link_lost(&mut self, link_session_id: &str) -> bool {
-        match self.link.as_mut() {
-            Some(session) if session.session_id == link_session_id => {
-                session.mark_lost(now_ms());
-                true
-            }
-            _ => false,
+    /// The lost-finish replay (contract 1.276 §4.260 widened by 1.286 §4.272):
+    /// a finish whose result was lost answers the account the attempt already
+    /// committed — from the journal, or from the committed attempt itself —
+    /// instead of LINK_NOT_FOUND, a second device, or a second commit.
+    pub fn replay_link_commit(
+        &mut self,
+        link_session_id: &str,
+    ) -> Result<Option<AccountSummary>, ServiceError> {
+        if let Some((account_id, _)) = self.store.link_commit(link_session_id)? {
+            let summary = self
+                .store
+                .account_summary(&account_id)?
+                .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
+            return Ok(Some(summary));
         }
+        let Some(session) = self.link.as_ref() else {
+            return Ok(None);
+        };
+        if !session.has_slot(link_session_id) {
+            return Ok(None);
+        }
+        let Some(account_id) = session.committed_account().map(str::to_string) else {
+            return Ok(None);
+        };
+        let summary = self
+            .store
+            .account_summary(&account_id)?
+            .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
+        Ok(Some(summary))
     }
 
     /// Runtime state authority: a 401 observed while a link/re-key owns the
@@ -2844,20 +3007,79 @@ impl ConnectorService {
     /// Whether this group's service owns the link session, expired or lost:
     /// routing a finish/cancel to its owning group must preserve the distinct
     /// LINK_EXPIRED / LINK_LOST answers those states produce at dispatch time.
+    /// Every slot id of the attempt answers true — a rotation mints an id the
+    /// router has never seen, and a committed attempt keeps replaying from any
+    /// of its codes (contract 1.286, §4.272).
     pub fn has_link_session(&self, link_session_id: &str) -> bool {
         self.link
             .as_ref()
-            .is_some_and(|session| session.session_id == link_session_id)
+            .is_some_and(|session| session.has_slot(link_session_id))
     }
 
-    /// Test-only: the session's current deadline, so the finish pin's
+    /// Whether this group's service owns the link attempt (the `link.rotate`
+    /// routing face).
+    pub fn has_link_attempt(&self, link_attempt_id: &str) -> bool {
+        self.link
+            .as_ref()
+            .is_some_and(|session| session.attempt_id == link_attempt_id)
+    }
+
+    /// Test-only: the attempt's current deadline, so the finish pin's
     /// arithmetic is observable without waiting out a real budget.
     #[cfg(test)]
     pub(crate) fn link_session_deadline_for_test(&self, link_session_id: &str) -> Option<u64> {
         self.link
             .as_ref()
-            .filter(|session| session.session_id == link_session_id)
+            .filter(|session| session.has_slot(link_session_id))
             .map(|session| session.expires_at_ms)
+    }
+
+    /// Test-only: plant an attempt with an engine rotate key, so the registry
+    /// and supervisor rotate faces are exercisable without a live engine.
+    #[cfg(test)]
+    pub(crate) fn plant_link_attempt_for_test(
+        &mut self,
+        device_name: &str,
+        engine_attempt_id: Option<&str>,
+        ttl: Duration,
+    ) -> (String, String) {
+        let session = ActiveLinkSession::with_engine_attempt(
+            device_name.to_string(),
+            "sgnl://link?test".into(),
+            ttl,
+            engine_attempt_id.map(str::to_string),
+        );
+        let ids = (session.attempt_id.clone(), session.session_id.clone());
+        self.link = Some(session);
+        ids
+    }
+
+    /// Test-only: the attempt's live slot codes, oldest first.
+    #[cfg(test)]
+    pub(crate) fn live_slots_uri_for_test(&self) -> Vec<String> {
+        self.link
+            .as_ref()
+            .map(|session| {
+                session
+                    .live_slots()
+                    .map(|slot| slot.uri().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Test-only: the attempt's live slot ids, oldest first.
+    #[cfg(test)]
+    pub(crate) fn live_link_slots_for_test(&self) -> Vec<(u32, String)> {
+        self.link
+            .as_ref()
+            .map(|session| {
+                session
+                    .live_slots()
+                    .map(|slot| (slot.slot, slot.link_session_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Test-only: plant a link session with an explicit TTL so registry and
@@ -16365,51 +16587,172 @@ fn early_control_entry(
     })
 }
 
+/// Which answer a slot's commit-time state earns.
+enum LinkSlotVerdict {
+    Live,
+    Lost,
+    Expired,
+    Unknown,
+}
+
+impl LinkSlotVerdict {
+    fn of(session: &ActiveLinkSession, link_session_id: &str, at_ms: u64) -> Self {
+        let Some(slot) = session.slot(link_session_id) else {
+            return Self::Unknown;
+        };
+        match slot.state {
+            // QR B1: a lost slot is addressable (so finish/cancel answer the
+            // definite LINK_LOST) but can never commit. A retired slot — the
+            // rotation dropped it — can never commit either.
+            LinkSlotState::Lost | LinkSlotState::Retired => Self::Lost,
+            LinkSlotState::Pending if session.is_expired(at_ms) => Self::Expired,
+            LinkSlotState::Pending => Self::Live,
+        }
+    }
+}
+
 impl ConnectorService {
+    /// The dispatch-time gate shared by finish, cancel, and the finish pin:
+    /// only a live slot proceeds; every other state answers its own definite
+    /// code. Expiry is consumed here exactly like before QR B1 (the next
+    /// link.start simply mints a fresh attempt).
     fn require_active_link(
         &mut self,
         link_session_id: &str,
     ) -> Result<&ActiveLinkSession, ServiceError> {
-        match self.link.as_ref() {
-            Some(session) if session.session_id == link_session_id => {
-                // QR B1: a lost session is addressable (so finish/cancel can
-                // answer the definite LINK_LOST) but can never commit. Unlike
-                // expiry it is not consumed here — the next begin_link takes
-                // it over.
-                if session.is_lost() {
-                    return Err(ServiceError::Api(ApiError::new(
-                        "LINK_LOST",
-                        "link session was lost; start a new link",
-                        true,
-                    )));
-                }
-                if session.is_expired(now_ms()) {
-                    self.link = None;
-                    return Err(ServiceError::Api(ApiError::new(
-                        "LINK_EXPIRED",
-                        "link session has expired",
-                        false,
-                    )));
-                }
+        let verdict = match self.link.as_ref() {
+            Some(session) => LinkSlotVerdict::of(session, link_session_id, now_ms()),
+            None => LinkSlotVerdict::Unknown,
+        };
+        match verdict {
+            LinkSlotVerdict::Live => Ok(self.link.as_ref().expect("link slot present")),
+            LinkSlotVerdict::Lost => Err(link_lost_error()),
+            LinkSlotVerdict::Expired => {
+                self.link = None;
+                Err(link_expired_error())
             }
-            Some(_) | None => {
-                return Err(ServiceError::Api(ApiError::new(
-                    "LINK_NOT_FOUND",
-                    "link session was not found",
-                    false,
-                )));
-            }
+            LinkSlotVerdict::Unknown => Err(link_not_found_error()),
         }
-        Ok(self.link.as_ref().expect("link session present"))
     }
 
-    fn take_link_session(
+    /// The commit's own gate. Every slot that still exists may commit — a
+    /// rotation that retired this very code while `finishLink` was in flight
+    /// must not lose the engine's committed result (contract 1.286, §4.272) —
+    /// while a slot the engine reported dead still answers LINK_LOST and an
+    /// expired attempt LINK_EXPIRED.
+    ///
+    /// Retired is not lost. Only `Lost` is the engine saying that provisioning
+    /// channel died before an approval; a `Retired` code was dropped by this
+    /// connector's own rotation while the engine was still completing the
+    /// finish, so the commit accepts it and journals the account under every
+    /// slot id of the attempt (the retired code then replays it).
+    ///
+    /// Returns the accepting slot so the commit can journal the retired-code
+    /// acceptance at the point the commit is actually taken — this gate runs
+    /// twice per commit (once before the commit-time refusals, once inside
+    /// `take_link_attempt`), so it must not log on its own.
+    fn require_link_slot_for_commit(
+        &mut self,
+        link_session_id: &str,
+    ) -> Result<(LinkSlotState, u32), ServiceError> {
+        let (state, slot_number, expired) = match self.link.as_ref() {
+            Some(session) => match session.slot(link_session_id) {
+                Some(slot) => (slot.state, slot.slot, session.is_expired(now_ms())),
+                None => return Err(link_not_found_error()),
+            },
+            None => return Err(link_not_found_error()),
+        };
+        if state == LinkSlotState::Lost {
+            return Err(link_lost_error());
+        }
+        if expired {
+            self.link = None;
+            return Err(link_expired_error());
+        }
+        Ok((state, slot_number))
+    }
+
+    /// Take the attempt out of the table for its single commit (or for a
+    /// commit-time refusal that spends it). It re-runs the **commit** gate,
+    /// never the dispatch gate: `require_active_link` folds Retired into Lost
+    /// and would therefore throw away an engine result the commit gate just
+    /// accepted — the in-flight finish whose code a rotation retired
+    /// (contract 1.286, §4.272). Lost still answers LINK_LOST here.
+    fn take_link_attempt(
         &mut self,
         link_session_id: &str,
     ) -> Result<ActiveLinkSession, ServiceError> {
-        let _ = self.require_active_link(link_session_id)?;
-        Ok(self.link.take().expect("link session present"))
+        self.require_link_slot_for_commit(link_session_id)?;
+        Ok(self.link.take().expect("link attempt present"))
     }
+}
+
+/// Error faces the link gates share, so their wire codes cannot drift between
+/// the dispatch-time gate and the commit-time gate.
+fn link_lost_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "LINK_LOST",
+        "link session was lost; start a new link",
+        true,
+    ))
+}
+
+fn link_expired_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "LINK_EXPIRED",
+        "link session has expired",
+        false,
+    ))
+}
+
+fn link_not_found_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "LINK_NOT_FOUND",
+        "link session was not found",
+        false,
+    ))
+}
+
+/// `link.rotate` for an attempt this connector does not hold (contract 1.286,
+/// §4.272): a wrong id, a replaced attempt, or one already consumed.
+fn link_attempt_not_found_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "LINK_ATTEMPT_NOT_FOUND",
+        "link attempt was not found",
+        false,
+    ))
+}
+
+fn link_attempt_committed_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "INVALID_REQUEST",
+        "this link attempt is already committed; start a new link instead",
+        false,
+    ))
+}
+
+/// The live slots of one attempt, oldest first, on the `link.rotate` wire
+/// shape (`[{deviceLinkUri, slot}]`). Retired and lost slots are omitted: the
+/// host renders codes, and a dead code is never rendered.
+pub fn live_link_slots(session: &ActiveLinkSession) -> Vec<Value> {
+    session
+        .live_slots()
+        .map(|slot| json!({ "deviceLinkUri": slot.uri(), "slot": slot.slot }))
+        .collect()
+}
+
+/// One `link.rotate` outcome: the new slot plus the attempt's live codes.
+#[derive(Debug)]
+pub struct LinkRotate {
+    pub link_attempt_id: String,
+    pub link_session_id: String,
+    pub device_link_uri: String,
+    pub slot: u32,
+    /// The slot number this rotation retired (the attempt's oldest live code),
+    /// when the third code pushed it out.
+    pub retired: Option<u32>,
+    pub slots: Vec<Value>,
+    pub expires_at_ms: u64,
 }
 
 #[derive(Debug)]
@@ -17222,6 +17565,16 @@ pub struct LinkStartParams {
 #[serde(rename_all = "camelCase")]
 pub struct LinkSessionParams {
     pub link_session_id: String,
+}
+
+/// `link.rotate` params (contract 1.286, §4.272): the attempt to rotate, by
+/// the `linkAttemptId` `link.start` answered. Slots are addressed afterwards
+/// by their own `linkSessionId` (the rotate answer carries it), exactly like
+/// the pre-rotate single slot.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkRotateParams {
+    pub link_attempt_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -22478,6 +22831,288 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 1);
+    }
+
+    /// Contract 1.286 (§4.272): `link.start` keeps the pre-rotate wire
+    /// (linkSessionId = slot 0's id, qrPayload = its code) and adds the
+    /// attempt face. A pre-rotate host that only reads linkSessionId/qrPayload
+    /// keeps working unchanged.
+    #[test]
+    fn begin_link_answers_the_attempt_face_beside_the_single_slot() {
+        let (_temp, mut service) = service();
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?uuid=slot0".into())
+            .unwrap();
+        let link_session_id = started["linkSessionId"].as_str().unwrap();
+        assert!(!link_session_id.is_empty());
+        assert!(
+            started["linkAttemptId"]
+                .as_str()
+                .is_some_and(|attempt| !attempt.is_empty()),
+            "the attempt id always rides the answer: {started}"
+        );
+        assert_ne!(started["linkAttemptId"].as_str(), Some(link_session_id));
+        assert_eq!(started["qrPayload"], "sgnl://link?uuid=slot0");
+        assert_eq!(started["deviceLinkUri"], "sgnl://link?uuid=slot0");
+        assert_eq!(
+            started["slots"],
+            serde_json::json!([{ "deviceLinkUri": "sgnl://link?uuid=slot0", "slot": 0 }])
+        );
+        assert!(
+            service.has_link_session(link_session_id),
+            "slot 0 is addressable by the historical id"
+        );
+    }
+
+    /// Contract 1.286 (§4.272): two rotations fill both live slots; the third
+    /// retires the oldest code, which stays addressable but is no longer
+    /// scannable.
+    #[test]
+    fn a_third_rotation_retires_the_oldest_live_slot() {
+        let (_temp, mut service) = service();
+        let (attempt, first) = service.plant_link_attempt_for_test(
+            "KT",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let second = service
+            .attach_rotated_slot(&attempt, "sgnl://link?second".into(), now_ms())
+            .unwrap();
+        assert_eq!(second.slot, 1);
+        assert_eq!(second.retired, None);
+        assert_eq!(second.slots.len(), 2);
+        let second_session = second.link_session_id.clone();
+
+        let third = service
+            .attach_rotated_slot(&attempt, "sgnl://link?third".into(), now_ms())
+            .unwrap();
+        assert_eq!(third.slot, 2);
+        assert_eq!(third.retired, Some(0), "slot 0 is the oldest live code");
+        assert_eq!(third.slots.len(), 2, "never more than two live codes");
+        let live = service.live_link_slots_for_test();
+        assert_eq!(
+            live.iter().map(|(slot, _)| *slot).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(live[0].1, second_session);
+        assert!(
+            service.has_link_session(&first),
+            "a retired slot keeps routing (the finish answers LINK_LOST, not              LINK_NOT_FOUND)"
+        );
+        assert_eq!(
+            service.live_slots_uri_for_test(),
+            vec![
+                "sgnl://link?second".to_string(),
+                "sgnl://link?third".to_string()
+            ]
+        );
+    }
+
+    /// Contract 1.286 (§4.272): any live slot finishes the attempt and the
+    /// commit happens exactly once; the other codes then replay the same
+    /// account instead of minting a second binding.
+    #[test]
+    fn any_slot_finishes_and_the_attempt_commits_once() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let (attempt, first) = service.plant_link_attempt_for_test(
+            "KT",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let second = service
+            .attach_rotated_slot(&attempt, "sgnl://link?second".into(), now_ms())
+            .unwrap();
+
+        let committed = service
+            .complete_link_session_with_id(
+                &second.link_session_id,
+                "+15555550100",
+                group,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 1);
+
+        // The attempt stays addressable: every code replays the commit.
+        let replay = service
+            .complete_link_session_with_id(&first, "+15555550100", group, None, None)
+            .unwrap();
+        assert_eq!(replay.id, committed.id);
+        let replay_from_rotated = service
+            .complete_link_session_with_id(
+                &second.link_session_id,
+                "+15555550100",
+                group,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(replay_from_rotated.id, committed.id);
+        assert_eq!(
+            service.list_accounts_in_group(group).unwrap().len(),
+            1,
+            "the attempt committed once"
+        );
+        // Every code was retired by the commit.
+        assert!(service.live_link_slots_for_test().is_empty());
+        // A committed attempt has nothing left to rotate.
+        let refused = service
+            .begin_rotate(&attempt)
+            .expect_err("a committed attempt cannot rotate");
+        assert!(
+            matches!(refused, ServiceError::Api(ref error) if error.code == "INVALID_REQUEST"),
+            "got {refused:?}"
+        );
+        // Cancelling a committed attempt is a no-op that keeps the replay.
+        service.cancel_link(&first).unwrap();
+        assert_eq!(
+            service
+                .replay_link_commit(&first)
+                .unwrap()
+                .map(|row| row.id),
+            Some(committed.id)
+        );
+    }
+
+    /// Contract 1.286 (§4.272): rotation degrades to the single slot on an
+    /// engine that never stated a rotate key, and answers the attempt-not-found
+    /// code for an attempt this connector does not hold.
+    #[test]
+    fn rotate_is_gated_by_the_engine_key_and_the_attempt_id() {
+        let (_temp, mut service) = service();
+        let (attempt, _slot) =
+            service.plant_link_attempt_for_test("KT", None, crate::link::LINK_SESSION_TTL);
+        assert_eq!(
+            service.begin_rotate(&attempt).unwrap(),
+            None,
+            "no engine rotate key: the caller answers NOT_SUPPORTED and the single slot stays"
+        );
+
+        let missing = service
+            .begin_rotate("no-such-attempt")
+            .expect_err("an unknown attempt answers LINK_ATTEMPT_NOT_FOUND");
+        assert!(
+            matches!(missing, ServiceError::Api(ref error) if error.code == "LINK_ATTEMPT_NOT_FOUND"),
+            "got {missing:?}"
+        );
+
+        // An attempt minted by a rotate-capable engine hands its key through.
+        let (rotatable, _slot) = service.plant_link_attempt_for_test(
+            "KT-2",
+            Some("engine-attempt-9"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        assert_eq!(
+            service.begin_rotate(&rotatable).unwrap().as_deref(),
+            Some("engine-attempt-9")
+        );
+    }
+
+    /// Contract 1.286 (§4.272): a slot the engine reported lost keeps routing
+    /// so finish answers the definite LINK_LOST, while the attempt's other live
+    /// slot can still commit.
+    #[test]
+    fn a_lost_slot_keeps_routing_and_the_other_slot_still_commits() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let (attempt, first) = service.plant_link_attempt_for_test(
+            "KT",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let second = service
+            .attach_rotated_slot(&attempt, "sgnl://link?second".into(), now_ms())
+            .unwrap();
+        assert!(service.mark_link_lost(&first));
+
+        let lost = service
+            .peek_link_for_finish(&first)
+            .expect_err("a lost slot answers LINK_LOST");
+        assert!(
+            matches!(lost, ServiceError::Api(ref error) if error.code == "LINK_LOST" && error.retryable),
+            "got {lost:?}"
+        );
+        assert!(service.has_link_session(&first), "still routable");
+        assert!(service.has_pending_link(), "the second slot is still live");
+
+        let committed = service
+            .complete_link_session_with_id(
+                &second.link_session_id,
+                "+15555550100",
+                group,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(committed.state, "ready");
+    }
+
+    /// Review must-fix (contract 1.286, §4.272): the commit face and the
+    /// dispatch face answer differently for a Retired code. A slot the
+    /// engine reported dead refuses the commit (LINK_LOST, no account row),
+    /// while a slot this connector's own rotation retired still commits — the
+    /// engine's success outlives the code — and the attempt then replays that
+    /// account from every one of its codes, the retired one included.
+    #[test]
+    fn the_commit_face_refuses_a_lost_slot_and_accepts_a_retired_one() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let (attempt, first) = service.plant_link_attempt_for_test(
+            "KT",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let second = service
+            .attach_rotated_slot(&attempt, "sgnl://link?second".into(), now_ms())
+            .unwrap();
+        let third = service
+            .attach_rotated_slot(&attempt, "sgnl://link?third".into(), now_ms())
+            .unwrap();
+        assert_eq!(third.retired, Some(0), "the rotation retired slot 0");
+        // The engine reported the attempt's other early code dead.
+        assert!(service.mark_link_lost(&second.link_session_id));
+
+        let lost = service
+            .complete_link_session_with_id(
+                &second.link_session_id,
+                "+15555550100",
+                group,
+                None,
+                None,
+            )
+            .expect_err("a lost slot never commits");
+        assert!(
+            matches!(lost, ServiceError::Api(ref error) if error.code == "LINK_LOST" && error.retryable),
+            "got {lost:?}"
+        );
+        assert!(
+            service.list_accounts_in_group(group).unwrap().is_empty(),
+            "the refused commit writes no account row"
+        );
+
+        // The retired slot 0 commits: a rotation dropped the code while the
+        // engine was still completing the finish, so the result must not be
+        // thrown away by the dispatch gate.
+        let committed = service
+            .complete_link_session_with_id(&first, "+15555550100", group, None, None)
+            .expect("a retired slot still commits the engine's result");
+        assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 1);
+
+        // The retired code itself replays the commit (journaled per slot id),
+        // and so does the attempt's remaining code.
+        for link_session_id in [&first, &third.link_session_id] {
+            let replay = service
+                .complete_link_session_with_id(link_session_id, "+15555550100", group, None, None)
+                .unwrap();
+            assert_eq!(replay.id, committed.id, "replay from {link_session_id}");
+        }
+        assert_eq!(
+            service.list_accounts_in_group(group).unwrap().len(),
+            1,
+            "the attempt committed once"
+        );
     }
 
     /// [KT 适配] §9.10 item 7: a relink of the number whose local-data delete

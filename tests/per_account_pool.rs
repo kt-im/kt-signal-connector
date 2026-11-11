@@ -1020,3 +1020,65 @@ async fn opted_in_window_demotes_an_idle_resident() {
     );
     runtime.shutdown().await.unwrap();
 }
+
+/// Contract 1.286 (§4.272): a pooled link attempt rotates on its own engine
+/// slot — rotation provisions no second account directory and no second
+/// engine — and the rotated code finishes through the pool's routing face
+/// (the new slot's session id was minted after the pool registered the
+/// attempt, so routing cannot rely on the session map alone).
+#[tokio::test]
+async fn a_pooled_link_attempt_rotates_on_its_own_slot_and_commits_once() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    let runtime = open_pool(
+        &temp,
+        pool_options(5, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    runtime.start().await.expect("an empty pool starts");
+    assert_eq!(runtime.status().await.engines.len(), 0);
+
+    let link = runtime
+        .start_link("pool-rotate".to_string(), Some("default".into()))
+        .await
+        .expect("link.start provisions a slot");
+    let attempt = link["linkAttemptId"]
+        .as_str()
+        .expect("a rotate-capable fixture states the attempt")
+        .to_string();
+    let session0 = link["linkSessionId"].as_str().unwrap().to_string();
+    let provisioned = runtime.status().await.engines.len();
+    assert_eq!(provisioned, 1);
+
+    let rotated = runtime
+        .rotate_link(attempt.clone())
+        .await
+        .expect("the pooled attempt rotates on its own engine");
+    assert_eq!(rotated["slot"], 1, "{rotated}");
+    let session1 = rotated["linkSessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the rotate answer names the new slot: {rotated}"))
+        .to_string();
+    assert_eq!(
+        runtime.status().await.engines.len(),
+        provisioned,
+        "rotation reuses the attempt's own engine slot"
+    );
+
+    // The rotated code finishes through the pool routing face.
+    let summary = runtime
+        .finish_link(session1)
+        .await
+        .expect("the rotated slot commits");
+    assert_eq!(summary.state, "ready");
+
+    // The attempt committed once: the other code replays the same account.
+    let replay = runtime
+        .finish_link(session0)
+        .await
+        .expect("the committed attempt replays from its first code");
+    assert_eq!(replay.id, summary.id);
+    assert_eq!(runtime.status().await.engines.len(), provisioned);
+
+    runtime.shutdown().await.unwrap();
+}

@@ -65,11 +65,11 @@ pub const ENGINE_CONTRACT_MIN_REVISION: &str = "1.200";
 /// Newest engine contract revision this connector speaks - its own current
 /// contract revision. The release-service declaration pins the engine side to
 /// min == max; the connector side is this interval.
-pub const ENGINE_CONTRACT_MAX_REVISION: &str = "1.285";
+pub const ENGINE_CONTRACT_MAX_REVISION: &str = "1.286";
 
 /// The interval as the launcher-facing fatal line renders it
 /// ('supported=<range>').
-pub const SUPPORTED_ENGINE_CONTRACT_RANGE: &str = "1.200-1.285";
+pub const SUPPORTED_ENGINE_CONTRACT_RANGE: &str = "1.200-1.286";
 
 /// The engine answers 'version' with an identity and states a revision inside
 /// the supported interval.
@@ -386,7 +386,7 @@ mod tests {
         let min = parse_revision(ENGINE_CONTRACT_MIN_REVISION).expect("floor parses");
         let max = parse_revision(ENGINE_CONTRACT_MAX_REVISION).expect("ceiling parses");
         assert!(min <= max, "the supported interval must be ordered");
-        assert_eq!(SUPPORTED_ENGINE_CONTRACT_RANGE, "1.200-1.285");
+        assert_eq!(SUPPORTED_ENGINE_CONTRACT_RANGE, "1.200-1.286");
     }
 
     #[test]
@@ -424,14 +424,14 @@ mod tests {
         assert_eq!(fault.reason, MismatchReason::RevisionOutOfRange);
         assert_eq!(
             fault.fatal_line(),
-            "KT_FATAL code=ENGINE_CONTRACT_MISMATCH retryable=false engine=0.1.0-dev.29 supported=1.200-1.285"
+            "KT_FATAL code=ENGINE_CONTRACT_MISMATCH retryable=false engine=0.1.0-dev.29 supported=1.200-1.286"
         );
         assert_eq!(
             fault.report_data(),
             json!({
                 "retryable": false,
                 "engine": "0.1.0-dev.29",
-                "supported": "1.200-1.285",
+                "supported": "1.200-1.286",
                 "reason": "revision_out_of_range",
             })
         );
@@ -490,7 +490,7 @@ mod tests {
         assert_eq!(fault.reason, MismatchReason::VersionMissing);
         assert_eq!(
             fault.fatal_line(),
-            "KT_FATAL code=ENGINE_CONTRACT_MISMATCH retryable=false engine=unknown supported=1.200-1.285"
+            "KT_FATAL code=ENGINE_CONTRACT_MISMATCH retryable=false engine=unknown supported=1.200-1.286"
         );
     }
 

@@ -42,6 +42,12 @@ pub const METHODS: &[MethodRow] = &[
     // bounded per-group wait lane (ADR 0001 R3) before the table's lane
     // would apply, so its Control entry only documents the fallback shape.
     ("link.finish", Lane::Control, false, "link"),
+    // Rotating link attempt (contract 1.286, §4.272): one bounded engine call
+    // on the attempt's own engine, no local persistence beyond the in-memory
+    // slot table. The pre-dispatch gate answers LINK_ATTEMPT_NOT_FOUND /
+    // INVALID_REQUEST / LINK_EXPIRED without touching the engine, and an
+    // engine without the rotate face answers NOT_SUPPORTED.
+    ("link.rotate", Lane::Control, false, "link"),
     ("link.cancel", Lane::Control, false, "link"),
     ("conversations.list", Lane::Read, false, "read"),
     // Blocked-conversations read (contract 1.46, §4.45): a bounded

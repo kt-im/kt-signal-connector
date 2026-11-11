@@ -45,6 +45,17 @@
   调度：busy 两臂保留既有 backoff 曲线（认领前经泛化 upstream 面即走该曲线），
   timeout/budget 明确 `None`（timeout 可能已写出、budget 同批可能永远超预算）。
   桌面 error copy 需为四个新码补文案（connector 不拥有桌面 UI）。
+- Contract revision: 1.286 (2026-11-11; §4.272 双槽 link attempt：`link.start`
+  的结果在旧形状（`linkSessionId` / `qrPayload` / `expiresAt` / `proxyGroup`）之外
+  新增 `linkAttemptId`（connector 铸的 opaque id）、`deviceLinkUri`（第 0 槽的码，
+  与 `qrPayload` 同值）与 `slots:[{deviceLinkUri,slot}]`（只列 live 码）；新增方法
+  `link.rotate {linkAttemptId}` 为同一 attempt 铸新 provisioning 槽，返回
+  `{linkAttemptId, linkSessionId, deviceLinkUri, slot, slots, expiresAt, proxyGroup}`，
+  同一 attempt 最多 2 个 live 槽、第三个淘汰最旧槽（abort 其 flow、码 zeroize、
+  之后 finish 答 `LINK_LOST`）；`link.finish` 仍按 `linkSessionId`，接受该 attempt
+  内任一槽，提交 attempt 级单飞（成功后 retire 其余槽，任一码 replay 同一账号）。
+  wire 增 `NOT_SUPPORTED`（引擎无 rotate 面）与 `LINK_ATTEMPT_NOT_FOUND`。没有
+  rotate 时行为与单槽旧端逐字节相同；旧宿主忽略三个新成员即可。)
 - Contract revision: 1.283 (2026-11-10; §4.267 thin event ledger: the
   `event_log` table loses its `payload` column and becomes a five-column
   change ledger (seq/epoch/account_id/type/created_at) in schema v50 — a row
@@ -20905,3 +20916,86 @@ deadline）→ ⑥ 派发 `finishLink`。
 `LINK_IN_PROGRESS`）；`a_lost_session_finish_answers_link_lost_without_a_running_engine`
 （无引擎的 slot 上 lost 会话连测两次均答 `LINK_LOST`/`retryable=true`，第二次证明
 lane 已清）。
+
+## §4.272 双槽 link attempt：link.rotate 与 attempt 级提交（契约 1.286 · wire 增方法 + 两个错误码）
+
+**背景**：单槽链路里一张 QR 只能活 300 s，码过期就只能整条链路重来——旧的
+`link.start` 会作废上一个 attempt，桌面因此丢掉已经进行到一半的 provisioning。
+engine 侧并行实现 `rotateLink`（同一 attempt 铸新 provisioning 会话），connector
+这一侧把「attempt = 一次链接流程，slot = 一张可扫的码」落进状态机，并保证提交仍然
+只发生一次。
+
+**契约（connector 半边）**：
+- `link.start` 结果：旧键逐字保留（`linkSessionId` 是第 0 槽的 id，
+  `qrPayload` 是它的码），新增 `linkAttemptId`、`deviceLinkUri`、`slots`。
+- `link.rotate {linkAttemptId}` → `{linkAttemptId, linkSessionId, deviceLinkUri,
+  slot, slots, expiresAt, proxyGroup}`。`linkSessionId` 是新槽自己的 id
+  （`link.finish`/`link.cancel` 按它寻址）；`slots` 只列 live 码，旧→新。
+- `link.finish` 仍是 `{linkSessionId}`：接受该 attempt 内任一槽；提交只发生一次，
+  成功后 retire 其余槽；任何槽的重复 finish 都 replay 同一个账号。
+- 错误：attempt 不存在/已被替换 → `LINK_ATTEMPT_NOT_FOUND`（retryable=false）；
+  已提交的 attempt 再 rotate → `INVALID_REQUEST`；过期 → `LINK_EXPIRED`；
+  引擎没有 rotate 面 → `NOT_SUPPORTED`（retryable=false，补救是重新 `link.start`）。
+
+**实现**：
+- `src/link.rs`：`ActiveLinkSession` 增 `attempt_id`（宿主可见，connector 铸）、
+  `engine_attempt_id`（引擎的 rotate key，**不上宿主 wire**）、`slots:
+  Vec<LinkSlot{slot, link_session_id, created_at, state}>`（码私有，retire/lost 即
+  zeroize）与 attempt 级 `committed`。`MAX_LIVE_LINK_SLOTS = 2`；`add_slot` 单调编号，
+  超限时 retire 最低编号的 live 槽并回报槽号。
+- `src/service.rs`：`begin_link_with_engine_attempt`（旧 `begin_link` 委托给它）、
+  `begin_rotate`（未提交/未过期 + 是否有引擎 key）、`attach_rotated_slot`（入槽、
+  淘汰最旧、返回 `LinkRotate`）、`replay_link_commit`（先查 §4.260 日志，再查
+  committed attempt）；`require_active_link`（派发门：Lost/Retired 答 `LINK_LOST`）与
+  `require_link_slot_for_commit`（提交门：Retired 仍可提交，Lost 答 `LINK_LOST`）
+  分开，正是「rotate 不让在飞 finish 丢结果」的那条缝。提交成功后
+  `mark_committed` + 对每个槽 id 写 commit 日志，attempt 留在表里供 replay。
+- **审定必须项：提交路径不复用派发门。** 两个门必须各走各的，提交路径里任何一次
+  「复检」只要落到派发门就会把在飞 finish 的引擎成功结果丢成 `LINK_LOST`（实测路径：
+  start 槽 0 → rotate 槽 1 → finish(槽 0) 在飞 → rotate 槽 2 淘汰槽 0 → 引擎
+  `finishLink` 成功 → 提交时 `take_link_attempt` 复检 `require_active_link`（把
+  `Retired` 折成 `Lost`）→ 答 `LINK_LOST`，引擎已链接的设备丢失）。因此
+  `take_link_attempt` 只跑提交门 `require_link_slot_for_commit`：`Lost` 答
+  `LINK_LOST`，`Retired` 放行（并记一条
+  `link commit accepted a code a rotation retired while the finish was in flight`
+  日志），提交后照旧 `mark_committed` + 每槽 id 写 commit 日志。`link.cancel` 是
+  派发面：取 attempt 之前显式走 `require_active_link`，死码仍答 `LINK_LOST`，
+  永远不能把同一 attempt 的活码掀掉。
+- `src/supervisor.rs`：`start_link` 读引擎 `linkAttemptId`（缺省即无 rotate 能力）；
+  `rotate_link` 先做会话判定，再按引擎 key 派发 `rotateLink`；`finish_link` 在取
+  finish lane 之后、任何引擎动作之前先做 replay（replay 也释放 lane）。
+  `engine_method_missing` 认领 JSON-RPC `-32601` 与 `(MethodNotFound)` 锚词 →
+  `NOT_SUPPORTED`。`rotate_link` 全程不碰 `active_link_finish`。
+- `src/registry.rs`：`rotate_link` 按 attempt 归属路由（group 槽 + pool 槽扫描）；
+  pool 模式下 rotated 槽的 session id 是 attempt 建立后才铸的，session map 里没有，
+  `link_owner` 因此补一层有界池槽扫描（否则 finish 会退化成 `LINK_NOT_FOUND`）。
+- `src/methods.rs` / `src/host.rs` / schema：`link.rotate` 进方法表（Control lane，
+  自动进 handshake capabilities）、派发臂、`linkRotateParams` 与两个新错误码。
+- 契约版本：`ENGINE_CONTRACT_MAX_REVISION` 1.285 → 1.286（旧引擎 1.200–1.285 仍在
+  区间内；引擎带 rotate 面时声明 1.286 也不会被拒）。
+
+**降级（无 rotate 能力的旧引擎）**：`startLink` 不答 `linkAttemptId` → connector
+直接答 `NOT_SUPPORTED`，**不派发**引擎调用，attempt 保持单槽；引擎答了 key 但方法
+不存在（-32601 / MethodNotFound）同样折叠成 `NOT_SUPPORTED`。两种情况下单槽链路
+（start → 扫码 → finish）逐字节不变。
+
+**测试**：`src/link.rs` 槽模型（两槽、第三槽 retire 最旧并 zeroize、committed 保留
+账号）；`src/service.rs`（start 结果三新键、`a_third_rotation_retires_the_oldest_live_slot`、
+`any_slot_finishes_and_the_attempt_commits_once`、`rotate_is_gated_by_the_engine_key_and_the_attempt_id`、
+`a_lost_slot_keeps_routing_and_the_other_slot_still_commits`、
+`the_commit_face_refuses_a_lost_slot_and_accepts_a_retired_one`：提交面拒 `Lost`
+（`LINK_LOST` 且不写账号行）而放行 `Retired`，提交后任一码 replay 同一账号）；
+`src/supervisor.rs`（无 key → `NOT_SUPPORTED` 且槽不变、有 key 无引擎 →
+`RUNTIME_NOT_RUNNING`、`-32601` 分类、committed attempt 从任一槽 replay 且释放
+lane）；集成
+`tests/link_rotate.rs`（rotate 两次两槽、第三槽淘汰最旧、retired 槽的**派发面**（新发起
+的 finish）答 `LINK_LOST` 而非 `LINK_NOT_FOUND`、任一槽提交且 accounts 只有一行、
+旧引擎 `KT_FAKE_LINK_ROTATE=0` 与 `method_not_found` 两种降级、在飞 finish 期间
+rotate 后重复 finish 仍 `LINK_IN_PROGRESS` 且 cancel 仍能回收、
+`a_rotation_that_retires_the_finish_code_keeps_the_engine_success`：伪引擎
+`[deferred-link-test]` 挂起 `finishLink`，测试在淘汰槽 0 的 rotate 作答后写
+`.fixture-release-finish` 标记放行，断言引擎成功被提交、accounts 一行、attempt 已
+committed（`link.rotate` 答 `INVALID_REQUEST`）、槽 0/1/2 三码都 replay 同一账号）；
+`tests/per_account_pool.rs`
+（池化 attempt 在原引擎槽上 rotate，不新增 account/engine，rotated 槽经池路由完成提交）。
+

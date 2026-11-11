@@ -50,25 +50,26 @@ use crate::service::{
     GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
     GroupsUpdateParams, HistoryAttachmentDownloadParams, HistoryImportCancelParams,
     HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams,
-    IdentitiesVerifyParams, LinkSessionParams, LinkStartParams, MessageGetByClientRequestIdParams,
-    MessageGetReceiptsParams, MessageGetTextParams, MessageRequestParams,
-    MessagesAdjacentMediaParams, MessagesAroundParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams,
-    MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams, MessagesEditParams,
-    MessagesListAttachmentDimensionsParams, MessagesListParams, MessagesMarkReadParams,
-    MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams, MessagesRemoteDeleteParams,
-    MessagesReportSpamParams, MessagesRetryTextParams, MessagesSearchParams,
-    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendContactParams,
-    MessagesSendPinMessageParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
-    MessagesSendPollVoteParams, MessagesSendReactionParams, MessagesSendStickerParams,
-    MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
-    MessagesSendViewOnceOpenParams, MessagesSetAttachmentDimensionsParams, MessagesSyncReadParams,
-    MessagesSyncViewedParams, NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
-    PhoneLookupParams, PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams,
-    StickerPackImageParams, StickerPackManifestParams, StickerPackSetSyncParams,
-    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams,
-    StoriesDeleteForEveryoneParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
-    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListsListParams,
+    IdentitiesVerifyParams, LinkRotateParams, LinkSessionParams, LinkStartParams,
+    MessageGetByClientRequestIdParams, MessageGetReceiptsParams, MessageGetTextParams,
+    MessageRequestParams, MessagesAdjacentMediaParams, MessagesAroundParams,
+    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    MessagesAttachmentsReadChunkParams, MessagesDeleteForMeMessagesParams,
+    MessagesDeleteForMeParams, MessagesEditParams, MessagesListAttachmentDimensionsParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
+    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
+    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
+    MessagesSendAttachmentParams, MessagesSendContactParams, MessagesSendPinMessageParams,
+    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
+    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendStoryParams,
+    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    MessagesSetAttachmentDimensionsParams, MessagesSyncReadParams, MessagesSyncViewedParams,
+    NotificationProfilesListParams, NotificationProfilesSetRecordsParams, PhoneLookupParams,
+    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
+    StickerPackManifestParams, StickerPackSetSyncParams, StorageGetCallLinksParams,
+    StorageIngestParams, StorageSetCallLinkParams, StoriesDeleteForEveryoneParams,
+    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
+    StoriesSetDisabledParams, StoryDistributionListsListParams,
     StoryDistributionListsSetRecordsParams, UsernameLookupParams,
 };
 use crate::store::{MAX_ADJACENT_MEDIA_LIMIT, MAX_PAGE_LIMIT};
@@ -1860,6 +1861,23 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
             Err(_) => HostResponse::failure(
                 request_id,
                 reject_probe("link.finish", "params", "invalid link.finish params"),
+            ),
+        },
+        // Rotating link attempt (contract 1.286, §4.272): the engine mints a
+        // fresh provisioning session for the same attempt on its own
+        // `rotateLink` face. The connector records the new code as a new slot
+        // (at most two live; a third retires the oldest) and keeps the commit
+        // attempt-scoped. An engine without the face answers NOT_SUPPORTED and
+        // the single slot keeps working — never an upstream protocol error
+        // leaking to the host.
+        "link.rotate" => match serde_json::from_value::<LinkRotateParams>(request.params) {
+            Ok(params) => match runtime.rotate_link(params.link_attempt_id).await {
+                Ok(result) => HostResponse::success(request_id, result),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                reject_probe("link.rotate", "params", "invalid link.rotate params"),
             ),
         },
         "link.cancel" => match serde_json::from_value::<LinkSessionParams>(request.params) {

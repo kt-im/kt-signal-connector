@@ -1316,6 +1316,41 @@ impl ProxyGroupRuntime {
         }
     }
 
+    /// Which slot owns a link attempt (the `link.rotate` routing face). The
+    /// attempt lives in exactly one supervisor's service table; the same
+    /// bounded scan the finish face uses is the authority.
+    async fn link_attempt_owner(&self, link_attempt_id: &str) -> Result<LinkOwner, ServiceError> {
+        for slot in &self.groups {
+            if slot
+                .supervisor
+                .service()
+                .lock()
+                .await
+                .has_link_attempt(link_attempt_id)
+            {
+                return Ok(LinkOwner::Group(Arc::clone(slot)));
+            }
+        }
+        if let Some(pool) = &self.pool {
+            for slot in pool.slots() {
+                if slot
+                    .supervisor()
+                    .service()
+                    .lock()
+                    .await
+                    .has_link_attempt(link_attempt_id)
+                {
+                    return Ok(LinkOwner::Account(slot));
+                }
+            }
+        }
+        Err(ServiceError::Api(ApiError::new(
+            "LINK_ATTEMPT_NOT_FOUND",
+            "link attempt was not found",
+            false,
+        )))
+    }
+
     async fn link_owner(&self, link_session_id: &str) -> Result<LinkOwner, ServiceError> {
         for slot in &self.groups {
             if slot
@@ -1328,23 +1363,39 @@ impl ProxyGroupRuntime {
                 return Ok(LinkOwner::Group(Arc::clone(slot)));
             }
         }
-        if let Some(pool) = &self.pool
-            && let Some(account_id) = pool.session_owner(link_session_id)
-            && let Some(slot) = pool.get(&account_id)
-            // QR B1: pooled routing follows the same rule as the legacy
-            // group scan above — the owning service's session table is the
-            // authority, and it keeps lost sessions addressable so their
-            // finish answers LINK_LOST instead of LINK_NOT_FOUND. A stale
-            // pool map entry (the slot no longer owns that id) does not
-            // route.
-            && slot
-                .supervisor()
-                .service()
-                .lock()
-                .await
-                .has_link_session(link_session_id)
-        {
-            return Ok(LinkOwner::Account(slot));
+        if let Some(pool) = &self.pool {
+            if let Some(account_id) = pool.session_owner(link_session_id)
+                && let Some(slot) = pool.get(&account_id)
+                // QR B1: pooled routing follows the same rule as the legacy
+                // group scan above — the owning service's session table is the
+                // authority, and it keeps lost sessions addressable so their
+                // finish answers LINK_LOST instead of LINK_NOT_FOUND. A stale
+                // pool map entry (the slot no longer owns that id) does not
+                // route.
+                && slot
+                    .supervisor()
+                    .service()
+                    .lock()
+                    .await
+                    .has_link_session(link_session_id)
+            {
+                return Ok(LinkOwner::Account(slot));
+            }
+            // Contract 1.286 (§4.272): a rotated slot's session id was minted
+            // after the pool registered the attempt, so the session map never
+            // saw it. The bounded slot scan is the same authority rule, and a
+            // pool holds at most the engine ceiling of slots.
+            for slot in pool.slots() {
+                if slot
+                    .supervisor()
+                    .service()
+                    .lock()
+                    .await
+                    .has_link_session(link_session_id)
+                {
+                    return Ok(LinkOwner::Account(slot));
+                }
+            }
         }
         Err(ServiceError::Api(ApiError::new(
             "LINK_NOT_FOUND",
@@ -1398,6 +1449,24 @@ impl ProxyGroupRuntime {
                         Err(error)
                     }
                 }
+            }
+        }
+    }
+
+    /// `link.rotate` (contract 1.286, §4.272): route the attempt to the slot
+    /// that minted it. The attempt lives in exactly one supervisor's service
+    /// table, so the same bounded scan the finish face uses is the authority;
+    /// a rotation never provisions a second pool slot (the attempt keeps its
+    /// engine, its data directory, and its binding).
+    pub async fn rotate_link(&self, link_attempt_id: String) -> Result<Value, ServiceError> {
+        match self.link_attempt_owner(&link_attempt_id).await? {
+            LinkOwner::Group(slot) => slot.supervisor.rotate_link(link_attempt_id).await,
+            LinkOwner::Account(slot) => {
+                let result = slot.supervisor().rotate_link(link_attempt_id).await;
+                if let Some(pool) = &self.pool {
+                    pool.note_activity(&slot);
+                }
+                result
             }
         }
     }

@@ -543,6 +543,22 @@ async fn refuse_started_engine(engine: &EngineHandle, error: &EngineError) {
     );
 }
 
+/// The engine's method-not-found class (contract 1.286, §4.272): JSON-RPC
+/// `-32601`, or the pinned engine's embedded `MethodNotFound` cause literal.
+/// `link.rotate` folds it into the host's NOT_SUPPORTED instead of leaking an
+/// upstream protocol error for a capability the engine simply does not carry.
+fn engine_method_missing(error: &EngineError) -> bool {
+    match error {
+        EngineError::Upstream {
+            code: Some(-32601), ..
+        } => true,
+        EngineError::Upstream {
+            cause: Some(cause), ..
+        } => matches!(cause.as_str(), "(MethodNotFound)" | "(MethodNotFoundError)"),
+        _ => false,
+    }
+}
+
 /// The one in-flight `link.finish` wait of this group (per-group wait lane,
 /// implementation-plan §6.1). The watch channel is the cancellation signal:
 /// `link.cancel` flips it and the finish call stops waiting at once without
@@ -2980,11 +2996,21 @@ impl RuntimeSupervisor {
                 ))
             })?
             .to_string();
-        let mut result = self
-            .service
-            .lock()
-            .await
-            .begin_link(device_name, device_link_uri)?;
+        // Contract 1.286 (§4.272): an engine that minted a rotate key states
+        // it on the startLink answer. Its absence is the capability verdict —
+        // `link.rotate` then answers NOT_SUPPORTED and this single slot is
+        // the whole attempt, exactly like the pre-rotate wire.
+        let engine_attempt_id = result
+            .get("linkAttemptId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|attempt| !attempt.is_empty())
+            .map(str::to_string);
+        let mut result = self.service.lock().await.begin_link_with_engine_attempt(
+            device_name,
+            device_link_uri,
+            engine_attempt_id,
+        )?;
         // The wire result echoes the selected group (implementation-plan §4.4);
         // this supervisor IS the selected group.
         result["proxyGroup"] = json!(self.group_id);
@@ -2994,6 +3020,107 @@ impl RuntimeSupervisor {
             "link session started"
         );
         Ok(result)
+    }
+
+    /// `link.rotate` (contract 1.286, §4.272): mint a fresh provisioning
+    /// session — a new slot — for the same link attempt on the engine's own
+    /// rotate face. The attempt's oldest live slot is retired when a third code
+    /// would go live, so at most two codes are ever scannable at once.
+    ///
+    /// Degradation is explicit rather than incidental. An engine that predates
+    /// the rotate face never states a rotate key on its `startLink` answer, so
+    /// the attempt has none and the connector answers NOT_SUPPORTED without
+    /// touching the engine — the single slot keeps working exactly like the
+    /// pre-rotate wire. An engine that *does* state a key but answers the
+    /// method as unknown (JSON-RPC -32601 / the `MethodNotFound` cause class)
+    /// folds into the same NOT_SUPPORTED answer.
+    pub async fn rotate_link(&self, link_attempt_id: String) -> Result<Value, ServiceError> {
+        // Session judgment first: an unknown, committed, or expired attempt is
+        // a definite answer that does not depend on engine liveness.
+        let engine_attempt_id = self.service.lock().await.begin_rotate(&link_attempt_id)?;
+        let Some(engine_attempt_id) = engine_attempt_id else {
+            tracing::info!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                "link rotate refused: the engine states no rotate key"
+            );
+            return Err(Self::link_rotate_not_supported_error());
+        };
+        let engine = self.running_engine().await?;
+        let upstream = engine
+            .call(
+                "rotateLink",
+                json!({ "linkAttemptId": engine_attempt_id }),
+                CallClass::ReadOnly,
+            )
+            .await;
+        let payload = match upstream {
+            Ok(payload) => payload,
+            Err(error) if engine_method_missing(&error) => {
+                tracing::info!(
+                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                    group_id = %self.group_id,
+                    "link rotate refused: the engine does not carry the method"
+                );
+                return Err(Self::link_rotate_not_supported_error());
+            }
+            Err(error) => return Err(ServiceError::Engine(error)),
+        };
+        let device_link_uri = payload
+            .get("deviceLinkUri")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty())
+            .ok_or_else(|| {
+                ServiceError::Api(ApiError::new(
+                    "UPSTREAM_PROTOCOL_ERROR",
+                    "rotateLink response missing deviceLinkUri",
+                    true,
+                ))
+            })?
+            .to_string();
+        let outcome = self.service.lock().await.attach_rotated_slot(
+            &link_attempt_id,
+            device_link_uri,
+            now_ms(),
+        )?;
+        if let Some(retired) = outcome.retired {
+            tracing::info!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                retired_slot = retired,
+                "link slot retired by rotation"
+            );
+        }
+        tracing::info!(
+            account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+            group_id = %self.group_id,
+            slot = outcome.slot,
+            "link slot rotated"
+        );
+        // The new slot's own session id rides the answer beside the contract's
+        // {deviceLinkUri, slot, slots}: link.finish/link.cancel address a slot
+        // by its linkSessionId, and the contract's slots entries carry only the
+        // code and the number.
+        Ok(json!({
+            "linkAttemptId": outcome.link_attempt_id,
+            "linkSessionId": outcome.link_session_id,
+            "deviceLinkUri": outcome.device_link_uri,
+            "slot": outcome.slot,
+            "slots": outcome.slots,
+            "expiresAt": outcome.expires_at_ms,
+            "proxyGroup": self.group_id,
+        }))
+    }
+
+    /// The rotate degradation answer: this engine cannot mint a second code
+    /// for an attempt. Not retryable — the remedy is a fresh `link.start`.
+    fn link_rotate_not_supported_error() -> ServiceError {
+        ServiceError::Api(ApiError::new(
+            "NOT_SUPPORTED",
+            "the engine does not support link rotation; start a new link instead",
+            false,
+        ))
     }
 
     /// The answer a budget-expired `finishLink` gets: the link-class unknown
@@ -3030,6 +3157,32 @@ impl RuntimeSupervisor {
             });
             cancel_rx
         };
+        // Lost-finish replay (contract 1.276 §4.260, widened by 1.286 §4.272):
+        // an attempt that already committed answers the same account from any
+        // of its codes instead of asking the phone again or minting a second
+        // binding. Rotation never commits, so this arm also covers a rotate
+        // that retired the code the host is retrying with. The lane taken
+        // above is released before the answer leaves.
+        match self
+            .service
+            .lock()
+            .await
+            .replay_link_commit(&link_session_id)
+        {
+            Ok(Some(account)) => {
+                self.clear_link_finish(&link_session_id).await;
+                tracing::info!(
+                    account_id = %account.id,
+                    "link finish replayed the committed attempt"
+                );
+                return Ok(account);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.clear_link_finish(&link_session_id).await;
+                return Err(error);
+            }
+        }
         // Session state is judged before the engine is resolved (QR B1): a
         // lost/expired/unknown session is a definite answer that does not
         // depend on engine liveness, so a terminal or missing engine must not
@@ -12926,6 +13079,165 @@ mod tests {
         assert!(
             !supervisor.link_flow_active().await,
             "each refusal clears the lane it took"
+        );
+    }
+
+    fn link_supervisor(temp: &TempDir) -> Arc<RuntimeSupervisor> {
+        Arc::new(RuntimeSupervisor::new(
+            EngineConfig::new(
+                temp.path().join("unused-engine"),
+                temp.path().join("unused-signal-data"),
+            ),
+            Arc::new(test_store(temp.path())),
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ))
+    }
+
+    /// Contract 1.286 (§4.272): an engine that states no rotate key is the
+    /// capability degradation — rotation answers NOT_SUPPORTED without
+    /// touching the engine (this slot holds none at all) and the single slot
+    /// stays live and finishable.
+    #[tokio::test]
+    async fn rotate_without_an_engine_key_answers_not_supported_and_keeps_the_slot() {
+        let temp = TempDir::new().unwrap();
+        let supervisor = link_supervisor(&temp);
+        let (attempt, slot) = supervisor.service.lock().await.plant_link_attempt_for_test(
+            "KT-Rotate",
+            None,
+            crate::link::LINK_SESSION_TTL,
+        );
+
+        let refused = supervisor
+            .rotate_link(attempt.clone())
+            .await
+            .expect_err("a pre-rotate engine cannot rotate");
+        let api = match refused {
+            crate::service::ServiceError::Api(error) => error,
+            other => panic!("rotation degradation must answer the host api face, got {other:?}"),
+        };
+        assert_eq!(api.code, "NOT_SUPPORTED");
+        assert!(!api.retryable, "the remedy is a fresh link.start");
+
+        // The single slot is untouched: still live, still addressable.
+        assert!(supervisor.has_pending_link().await);
+        let service = supervisor.service.lock().await;
+        assert!(service.has_link_session(&slot));
+        assert!(service.has_link_attempt(&attempt));
+
+        // An unknown attempt is its own definite answer, still engine-free.
+        drop(service);
+        let missing = supervisor
+            .rotate_link("no-such-attempt".into())
+            .await
+            .expect_err("an unknown attempt answers LINK_ATTEMPT_NOT_FOUND");
+        let api = match missing {
+            crate::service::ServiceError::Api(error) => error,
+            other => panic!("expected the host api face, got {other:?}"),
+        };
+        assert_eq!(api.code, "LINK_ATTEMPT_NOT_FOUND");
+        assert!(!api.retryable);
+    }
+
+    /// Contract 1.286 (§4.272): a rotate key with no running engine reports
+    /// the runtime, not the capability — the engine may carry the method once
+    /// it lands, so NOT_SUPPORTED would be a lie.
+    #[tokio::test]
+    async fn rotate_with_a_key_but_no_engine_reports_the_runtime() {
+        let temp = TempDir::new().unwrap();
+        let supervisor = link_supervisor(&temp);
+        let (attempt, _slot) = supervisor.service.lock().await.plant_link_attempt_for_test(
+            "KT-Rotate",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let error = supervisor
+            .rotate_link(attempt)
+            .await
+            .expect_err("no engine is running");
+        let api = error.into_api();
+        assert_eq!(api.code, "RUNTIME_NOT_RUNNING");
+        assert_ne!(api.code, "NOT_SUPPORTED");
+    }
+
+    /// Contract 1.286 (§4.272): the engine's method-not-found class folds to
+    /// NOT_SUPPORTED; every other upstream face keeps its own answer.
+    #[test]
+    fn engine_method_not_found_classifies_structurally() {
+        let upstream = |cause: Option<&str>, code: Option<i64>| EngineError::Upstream {
+            cause: cause.map(str::to_string),
+            code,
+        };
+        assert!(super::engine_method_missing(&upstream(None, Some(-32601))));
+        assert!(super::engine_method_missing(&upstream(
+            Some("(MethodNotFound)"),
+            Some(-1)
+        )));
+        assert!(super::engine_method_missing(&upstream(
+            Some("(MethodNotFoundError)"),
+            Some(-32603)
+        )));
+        assert!(!super::engine_method_missing(&upstream(
+            Some("(EngineBusy)"),
+            Some(-32000)
+        )));
+        assert!(!super::engine_method_missing(&upstream(None, Some(-32603))));
+        assert!(!super::engine_method_missing(&EngineError::Protocol));
+    }
+
+    /// Contract 1.286 (§4.272): a finish on any code of a committed attempt
+    /// replays the same account — no second engine call, no second commit —
+    /// and always releases the finish lane it took.
+    #[tokio::test]
+    async fn finishing_a_committed_attempt_replays_from_any_slot() {
+        let temp = TempDir::new().unwrap();
+        let supervisor = link_supervisor(&temp);
+        let (attempt, first) = supervisor.service.lock().await.plant_link_attempt_for_test(
+            "KT-Committed",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let second = supervisor
+            .service
+            .lock()
+            .await
+            .attach_rotated_slot(&attempt, "sgnl://link?second".into(), super::now_ms())
+            .expect("the attempt rotates");
+        let committed = supervisor
+            .service
+            .lock()
+            .await
+            .complete_link_session_with_id(
+                &second.link_session_id,
+                "+15555550100",
+                DEFAULT_PROXY_GROUP_ID,
+                None,
+                None,
+            )
+            .expect("the rotated slot commits");
+
+        let replay = supervisor
+            .finish_link(first)
+            .await
+            .expect("a committed attempt replay answers the account");
+        assert_eq!(replay.id, committed.id);
+        assert!(!supervisor.link_flow_active().await, "the lane is released");
+
+        let again = supervisor
+            .finish_link(second.link_session_id.clone())
+            .await
+            .expect("the committed slot replays too");
+        assert_eq!(again.id, committed.id);
+        assert_eq!(
+            supervisor
+                .service
+                .lock()
+                .await
+                .list_accounts_in_group(DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .len(),
+            1,
+            "the attempt committed exactly once"
         );
     }
 

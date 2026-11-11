@@ -35,6 +35,29 @@ ENGINE_VERSION = os.environ.get("KT_FAKE_ENGINE_VERSION") or "0.1.0-fixture"
 
 LINKED_ACCOUNT = "+15555550100"
 ACTIVE_LINK_URI = "sgnl://link?uuid=fixture&pub_key=fixture"
+# Rotating link attempt fixture (connector contract 1.286, §4.272). A
+# rotate-capable engine states its rotate key on the startLink answer, and the
+# connector keys rotateLink by it. Modes:
+#   (unset) / "1"       rotate-capable: startLink mints an attempt id and
+#                       rotateLink answers a fresh code for the same attempt
+#   "0" / "off"         a pre-rotate engine: startLink states no attempt and
+#                       rotateLink is not implemented
+#   "method_not_found"  startLink states the key but rotateLink answers the
+#                       JSON-RPC method-not-found class (-32601)
+LINK_ROTATE_MODE = (os.environ.get("KT_FAKE_LINK_ROTATE") or "").strip().lower()
+# attempt id -> how many slots it has minted
+LINK_ATTEMPTS = {}
+# every code this fixture minted (finishLink accepts any of them, so the
+# dual-slot flow can finish through a rotated slot)
+LINK_URIS = {ACTIVE_LINK_URI}
+# Connector contract 1.286 (§4.272) commit-face fixture: the engine approves a
+# device while a rotation retires the very code the finish was dispatched with.
+# A finishLink naming this device parks its answer; the test releases it by
+# dropping DEFERRED_FINISH_MARKER in the data dir *after* the retiring rotation
+# answered, so the engine's success provably lands with that code already
+# Retired. The commit must accept it (not answer LINK_LOST) and journal it.
+DEFERRED_FINISH_DEVICE = "[deferred-link-test]"
+PENDING_FINISH_IDS = []
 WRITE_LOCK = threading.Lock()
 # §4.68 snapshot-import fixture: the archive identity the background import
 # task projects into the §4.38 NDJSON (one contact recipient + one chat + two
@@ -393,6 +416,10 @@ LINKED_ACCOUNT = (
     else "+15555550100"
 )
 DELETED_MARKER = SIGNAL_DATA_DIR / ".fixture-account-deleted"
+# Commit-face release marker (contract 1.286 §4.272, DEFERRED_FINISH_DEVICE):
+# the test drops it after the retiring rotation answered, and the watcher below
+# emits the parked finishLink success.
+DEFERRED_FINISH_MARKER = SIGNAL_DATA_DIR / ".fixture-release-finish"
 # §4.179 unknown-outcome reconciliation probe markers: the answer-shape marker
 # (.fixture-lookup-dispatch.json, a verbatim lookupOutgoingDispatch result
 # object) and the error marker (.fixture-lookup-error, -32603 face).
@@ -809,6 +836,32 @@ def emit_json_after(value, delay_seconds):
     emit_json(value)
 
 
+# Commit-face fixture (contract 1.286 §4.272): a finishLink parked by
+# DEFERRED_FINISH_DEVICE is released by the test through DEFERRED_FINISH_MARKER
+# once the rotation that retired the code has answered. Emitting from this
+# watcher, rather than inline, keeps rotateLink served while the finish is in
+# flight and makes the engine-success-after-retirement order deterministic.
+def watch_deferred_finish_marker():
+    while True:
+        time.sleep(0.05)
+        if not DEFERRED_FINISH_MARKER.exists():
+            continue
+        try:
+            DEFERRED_FINISH_MARKER.unlink()
+        except OSError:
+            continue
+        while PENDING_FINISH_IDS:
+            pending_id = PENDING_FINISH_IDS.pop(0)
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": pending_id,
+                "result": account_entry(LINKED_ACCOUNT),
+            })
+
+
+threading.Thread(target=watch_deferred_finish_marker, daemon=True).start()
+
+
 def log_method_line(name):
     logs_dir = SIGNAL_DATA_DIR / "logs"
     try:
@@ -946,8 +999,42 @@ for line in sys.stdin:
         result = {"method": method}
     elif method == "startLink":
         result = {"deviceLinkUri": ACTIVE_LINK_URI}
+        if LINK_ROTATE_MODE not in ("0", "off"):
+            attempt = "lk-fixture-%d" % (len(LINK_ATTEMPTS) + 1)
+            LINK_ATTEMPTS[attempt] = 1
+            result["linkAttemptId"] = attempt
+            result["slots"] = [{"deviceLinkUri": ACTIVE_LINK_URI, "slot": 0}]
+    elif method == "rotateLink":
+        # Contract 1.286 (§4.272): mint a fresh provisioning session for the
+        # same attempt. Each rotation answers a new code and its slot number;
+        # the connector owns the two-live-slot bound and the commit.
+        if LINK_ROTATE_MODE == "method_not_found":
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": "Method not found: rotateLink"},
+            })
+            continue
+        attempt = params.get("linkAttemptId")
+        if LINK_ROTATE_MODE in ("0", "off") or attempt not in LINK_ATTEMPTS:
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "LINK_ATTEMPT_NOT_FOUND"},
+            })
+            continue
+        slot = LINK_ATTEMPTS[attempt]
+        LINK_ATTEMPTS[attempt] = slot + 1
+        uri = ACTIVE_LINK_URI + "&slot=%d" % slot
+        LINK_URIS.add(uri)
+        result = {
+            "deviceLinkUri": uri,
+            "linkAttemptId": attempt,
+            "slot": slot,
+            "slots": [{"deviceLinkUri": uri, "slot": slot}],
+        }
     elif method == "finishLink":
-        if params.get("deviceLinkUri") != ACTIVE_LINK_URI:
+        if params.get("deviceLinkUri") not in LINK_URIS:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -983,6 +1070,13 @@ for line in sys.stdin:
                 "id": request_id,
                 "error": {"code": -1, "message": "LINK_LOST"},
             })
+            continue
+        if params.get("deviceName") == DEFERRED_FINISH_DEVICE:
+            # Park the approval until the test releases it (contract 1.286
+            # §4.272): the answer is emitted by the marker watcher, never
+            # inline, so rotateLink keeps being served while this finish is in
+            # flight and the success lands after the retiring rotation.
+            PENDING_FINISH_IDS.append(request_id)
             continue
         if params.get("deviceName") == "[slow-link-test]":
             continue
