@@ -62,6 +62,26 @@ fn disarm_rejected(temp: &TempDir) {
     std::fs::remove_file(temp.path().join("signal-data/.fixture-send-rejected")).unwrap();
 }
 
+/// Arm the fixture's one-shot dispatch-timeout send answer in THIS test's own
+/// data dir (test-local marker, never a process-global env): the engine's real
+/// `-32000` (EngineTimeoutException) face with its promised data.
+fn arm_engine_timeout(temp: &TempDir) {
+    std::fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    // Re-armable one-shot: a prior send's done marker must not swallow the
+    // next arm (the text and attachment legs each arm their own answer).
+    std::fs::remove_file(
+        temp.path()
+            .join("signal-data/.fixture-send-engine-timeout-done"),
+    )
+    .ok();
+    std::fs::write(
+        temp.path()
+            .join("signal-data/.fixture-send-engine-timeout-armed"),
+        b"",
+    )
+    .unwrap();
+}
+
 /// The row's status through the public read face; None when no such row.
 fn status_of(store: &Store, account_id: &str, request: &str) -> Option<String> {
     store
@@ -234,6 +254,95 @@ async fn duplicate_send_text_answers_the_persisted_row_without_engine_traffic() 
         .list_messages(&account_id, &conversation_id, 10, None)
         .unwrap();
     assert_eq!(rows.items.len(), 1, "no second row for the duplicate");
+}
+
+/// Contract 1.285 (§4.269): a cancelled MUTATING dispatch may already have
+/// been written, so the engine's -32000 (EngineTimeoutException) answer folds
+/// to the existing unknown outcome. Text and attachment sends ride the same
+/// engine `send` method: the row settles `unknown` (never `failed`), the
+/// answer is SEND_OUTCOME_UNKNOWN retryable=false, and no automatic retry is
+/// ever armed (the AGENTS.md red line).
+#[tokio::test]
+async fn engine_dispatch_timeout_settles_send_rows_unknown_and_arms_no_retry() {
+    let temp = TempDir::new().unwrap();
+    let store = test_store(temp.path());
+    let (account_id, conversation_id) = seed_account_and_conversation(&store);
+
+    let supervisor = Arc::new(RuntimeSupervisor::new(
+        config_for(&temp),
+        Arc::clone(&store),
+        DEFAULT_PROXY_GROUP_ID.to_string(),
+        None,
+    ));
+    supervisor.start().await.unwrap();
+
+    arm_engine_timeout(&temp);
+    let text = supervisor
+        .send_text(
+            account_id.clone(),
+            SendTarget::Conversation(conversation_id.clone()),
+            "timeout window".into(),
+            "req-engine-timeout-text".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    let error = text
+        .expect_err("the armed timeout must fail the text send")
+        .into_api();
+    assert_eq!(error.code, "SEND_OUTCOME_UNKNOWN");
+    assert!(!error.retryable, "{error:?}");
+    assert_eq!(
+        status_of(&store, &account_id, "req-engine-timeout-text").as_deref(),
+        Some("unknown"),
+        "a cancelled mutating send may have been written: unknown, never failed"
+    );
+    assert_eq!(
+        store.next_retry_due_at().unwrap(),
+        None,
+        "the unknown red line never arms an automatic retry"
+    );
+
+    // The attachment leg is the same engine `send` call and must fold the
+    // same way.
+    arm_engine_timeout(&temp);
+    let attachment = supervisor
+        .send_attachment(
+            account_id.clone(),
+            SendTarget::Conversation(conversation_id.clone()),
+            "req-engine-timeout-attachment".into(),
+            "aGVsbG8=".into(),
+            5,
+            Some("hi.txt".into()),
+            Some("text/plain".into()),
+            None,
+            None,
+            false,
+            false,
+            None,
+            false,
+        )
+        .await;
+    let error = attachment
+        .expect_err("the armed timeout must fail the attachment send")
+        .into_api();
+    assert_eq!(error.code, "SEND_OUTCOME_UNKNOWN");
+    assert!(!error.retryable, "{error:?}");
+    assert_eq!(
+        status_of(&store, &account_id, "req-engine-timeout-attachment").as_deref(),
+        Some("unknown"),
+        "the attachment row settles unknown too"
+    );
+    assert_eq!(store.next_retry_due_at().unwrap(), None);
+    assert_eq!(
+        send_log(&temp).len(),
+        2,
+        "exactly one engine call per send, never a retry"
+    );
 }
 
 /// Audit question (c): a typing success settles nothing — no message row,

@@ -99,6 +99,13 @@ pub const METHODS: &[MethodRow] = &[
     // send-lane, upstream traffic — the same class as the original send.
     ("messages.retryText", Lane::Send, true, "send"),
     ("messages.attachments.send", Lane::Send, true, "send"),
+    // In-place attachment retry (contract 1.278, §4.262; dataBase64/sizeBytes
+    // optional = 1.279, §4.263; plural payload rebuild = 1.280, §4.264):
+    // mutating, send-lane upstream traffic — the same class as the original
+    // send, because the retry really re-uploads the bytes (caller-supplied for a
+    // singular row, or the persisted payload group) and settles the SAME row in
+    // the shape the original used.
+    ("messages.attachments.retry", Lane::Send, true, "send"),
     // Sticker send (contract 1.35): mutating, send-lane upstream traffic —
     // the §4.12 attachment class verbatim, same-account mutex and delete
     // barrier included; advertised through `send-sticker`.
@@ -512,12 +519,14 @@ pub const METHODS: &[MethodRow] = &[
     // precedent). Direct conversations only (the official group report
     // resolves the added-by sender first — no data plane, honest refusal).
     ("conversations.reportSpam", Lane::Send, true, "send"),
-    // Safety-number read (contract revision 1.68, §4.61): the pinned
-    // upstream's native `listIdentities` JSON-RPC read (0.14.8
-    // jsonrpc.rs:121-126; ListIdentitiesCommand.java:23 — a
+    // Safety-number read (contract revision 1.68, §4.61; peer arm 1.281,
+    // §4.265): the pinned upstream's native `listIdentities` JSON-RPC read
+    // (0.14.8 jsonrpc.rs:121-126; ListIdentitiesCommand.java:23 — a
     // JsonRpcLocalCommand, so the JSON-RPC projection is native) — one
-    // bounded read keyed by the resolved peer reference, no mutation, no
-    // local persistence; advertised through `safety-number`.
+    // bounded read keyed by the addressed peer reference (a 1:1 conversation
+    // id, or the peer's own ACI UUID / E.164 with no conversation row
+    // needed), no mutation, no local persistence; advertised through
+    // `safety-number`.
     ("identities.get", Lane::Read, false, "read"),
     // Safety-number verify write (contract revision 1.68, §4.61): the
     // pinned upstream's native `trust` JSON-RPC face (0.14.8
@@ -527,8 +536,11 @@ pub const METHODS: &[MethodRow] = &[
     // upstream traffic — the reaction class verbatim, same-account mutex
     // and delete barrier included; the testing-only trustAllKnownKeys mode
     // is never sent. The official toggle's clear-verification half has no
-    // pinned JSON-RPC projection and stays out of the contract. Zero local
-    // writes: trust level converges through the next `identities.get`.
+    // pinned JSON-RPC projection and stays out of the contract. One local
+    // write on success (1.260, §4.244): the addressed peer's trust stamp —
+    // by conversation row on the `conversationId` arm, by peer key on the
+    // `peerKey` arm (1.281, §4.265, where no conversation row is required at
+    // all) — so the read face converges without a second round trip.
     ("identities.verify", Lane::Send, true, "send"),
     // Stories faces (contract revision 1.76, §4.67): `messages.sendStory` is
     // mutating send-lane upstream traffic — the reaction class verbatim,
@@ -705,6 +717,13 @@ pub const METHODS: &[MethodRow] = &[
     // Control lane like runtime.status; never
     // mutating; the implementation is entirely in `doctor`.
     ("runtime.doctor", Lane::Control, false, "control"),
+    // Durable change-ledger read face (contract revision 1.283, §4.267): one
+    // bounded, token-stamped page of thin events plus the reset verdict. Read
+    // lane — the page reads on the store's read pool, never the writer, and
+    // the reset is a decision, not a mutation. Added to the table so the
+    // handshake advertises it: a host that cannot see the capability would
+    // fall back to polling every list face.
+    ("events.list", Lane::Read, false, "read"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -1074,6 +1093,7 @@ mod tests {
             "username.lookup",
             "phone.lookup",
             "identities.get",
+            "events.list",
             "stories.getDisabled",
             "stories.openAttachment",
             "calls.linkPresentation",
@@ -1101,6 +1121,7 @@ mod tests {
             "accounts.unlinkDevice",
             "messages.retryText",
             "messages.attachments.send",
+            "messages.attachments.retry",
             "messages.sendSticker",
             "messages.sendContact",
             "messages.sendPollCreate",
@@ -1175,6 +1196,7 @@ mod tests {
             "accounts.updateConfiguration",
             "messages.retryText",
             "messages.attachments.send",
+            "messages.attachments.retry",
             "messages.sendSticker",
             "messages.sendContact",
             "messages.sendPollCreate",

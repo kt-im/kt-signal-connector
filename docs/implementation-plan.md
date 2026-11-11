@@ -17,6 +17,145 @@
   document for the official anchor and the event mapping.
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.284 (2026-11-10; §4.268 新库版本分类：`Store::open` 发现
+  `meta.schema_version > SCHEMA_VERSION` 时不再退化成 `Unavailable`，而返回结构化
+  `StoreError::SchemaNewer { current, supported }`（类 `store_schema_newer`），判定在
+  完整性闸/快照/任何 DDL 之前，什么都不碰。启动失败在 stderr 打固定形状
+  `KT_FATAL code=STORE_SCHEMA_NEWER retryable=false current=<n> supported=<n>`——
+  `retryable=false` 是类自身的断言（同一份库下次启动仍拒绝，绝不降级）。拒绝启动的
+  进程不可能服务 doctor，所以状态目录留 `schema-newer.json`（两个版本号 + 时刻，无
+  路径、无存储内容）；`runtime.doctor` 的 `store` 面新增可选
+  `schemaNewer{current,supported,at}`，后续诊断仍能说清上一次启动被什么挡住。
+  桌面零改动。)
+- Contract revision: 1.285 (2026-11-10; §4.269 engine 资源错误锚词认领：引擎
+  M4/M5 稳定性批新增四个固定锚词——分派层 `(EngineBusyException)`（-32000，
+  在飞上限拒绝，请求未执行）与 `(EngineTimeoutException)`（-32000，预算超时
+  取消 dispatch，mutating 结局可能未知），附件上行闸 `(AttachmentBusyException)`
+  （-32603，上行槽等待超时，确定未投递）与 `(AttachmentBudgetException)`
+  （-32603，320MiB 全局解码字节预算不足，decode/上行均未发生）。connector 在
+  engine 响应分类器认领四锚词，映射为独立宿主码 `ENGINE_BUSY` /
+  `ENGINE_TIMEOUT` / `ATTACHMENT_BUSY` / `ATTACHMENT_BUDGET`：
+  busy=true（请求未执行）、附件 busy=true（确定未投递）/ budget=false
+  （不自动重试）；`EngineTimeoutException` 按调用类分流——只读保留
+  `ENGINE_TIMEOUT` retryable=false，mutating（send/附件发送链）折叠到既有
+  unknown outcome（`SEND_OUTCOME_UNKNOWN`，行保持 unknown、禁止自动重试）。
+  引擎的 `error.data`
+  对象（busy 的 `{reason,retryable,inFlightLimit}`、timeout 的
+  `{reason,retryable,timeoutMs}`）逐字透传，附件两臂当前无 data。自动重试
+  调度：busy 两臂保留既有 backoff 曲线（认领前经泛化 upstream 面即走该曲线），
+  timeout/budget 明确 `None`（timeout 可能已写出、budget 同批可能永远超预算）。
+  桌面 error copy 需为四个新码补文案（connector 不拥有桌面 UI）。
+- Contract revision: 1.283 (2026-11-10; §4.267 thin event ledger: the
+  `event_log` table loses its `payload` column and becomes a five-column
+  change ledger (seq/epoch/account_id/type/created_at) in schema v50 — a row
+  now means "something changed for this account", and the subscriber re-reads
+  the entity instead of reconstructing a frame from the log. The old rows keep
+  their seq/type/timestamps (payload dropped) and the upgrade clears the
+  account-scoped orphans left by pre-1.283 deletions. The ledger gains a head
+  retention window (7 days / 20 000 rows / 64 MiB, whichever binds first) whose
+  floor and deletion commit in one transaction, driven by a 30 s single-flight
+  sweeper. `events.list` becomes an object-shaped cursor face —
+  `{afterSeq?, token?, limit?}` → `{token, reset, resetReason,
+  trimmedThroughSeq, events, nextAfterSeq, truncated}` — with four independent
+  reset criteria (token mismatch, cold start, cursor below the floor, cursor
+  ahead of the ledger); a reset carries no events and points the caller at the
+  floor. Account deletion removes that account's ledger rows and rotates the
+  token in the same transaction (`event_log` joins the §4.197 receipt's table
+  list), the page reads on the read pool under a 4 MiB response budget, and
+  `runtime.doctor`/metrics gain the ledger's own face. Contract 1.283 has no
+  consumer yet — the desktop needs zero changes.)
+- Contract revision: 1.282 (2026-11-10; §4.266 store upgrade safety: every
+  schema migration — the shape an encryption-library (`bundled-sqlcipher`)
+  upgrade arrives in — is now gated by `PRAGMA integrity_check` and preceded by
+  one consistent `VACUUM INTO` snapshot under the store's own key. The gate
+  fails closed before any DDL and classifies its own two failure shapes
+  (`corrupt` = the check could not read the store, `integrity` = the check ran
+  and reported damage); a ladder that fails afterwards restores the snapshot,
+  keeps it on disk with a content-free diagnostic marker, and answers the
+  distinct `schema_migration_failed` class with its rollback outcome instead of
+  whatever `Unavailable` the failing statement produced. Snapshots are bounded
+  by count (newest three) and by bytes (256 MiB), and the file just written is
+  never a prune candidate. `runtime.doctor` gains a top-level `store` face
+  (schemaVersion/schemaTarget/integrity/dbBytes/walBytes/snapshots/
+  lastMigrationFailure) and the periodic metrics line gains the `store_*`
+  series, so an upgrade that rolled back is visible instead of looking like an
+  unavailable store.)
+- Contract revision: 1.281 (2026-11-10; §4.265 peer-addressed safety-number
+  faces: identities.get / identities.verify accept exactly one of
+  conversationId or peerKey. peerKey is the peer's own protocol address — an
+  ACI UUID (8-4-4-4-12 hex) or an E.164 number (+ and 7..15 digits), bounded
+  at 64 wire characters — read and written directly against the account's
+  identity store, so a peer with no direct conversation row (or no row at all)
+  is addressable: identities.get answers the honest identity: null when the
+  store holds no identity for that peer (never CONVERSATION_NOT_FOUND) and
+  never materializes a conversation, while identities.verify forwards the same
+  trust frame (verifiedSafetyNumber or state="default") with the peer
+  reference as recipient and writes the local trust stamp through by peer key
+  (verified → TRUSTED_VERIFIED, state → TRUSTED_UNVERIFIED; no direct row means
+  no local projection to stamp, the engine write is unaffected). Both
+  addressing forms at once or neither answers INVALID_REQUEST fail-closed, and
+  the peerKey grammar refuses group master keys, PNI:/u: username spellings and
+  bare digit runs.)
+- Contract revision: 1.280 (2026-11-09; §4.264 multi-attachment payload group:
+  schema v49 widens outgoing_attachment_payloads to the composite primary key
+  (account_id, client_request_id, attachment_index) and rebuilds the table in
+  place inside one transaction (BEGIN/COMMIT, ROLLBACK on failure) — v48
+  single-key rows migrate to index 0, the v49-intermediate
+  (client_request_id, attachment_index) rows keep their index, and a rebuild
+  interrupted mid-way is resumed from its outgoing_attachment_payloads_v49
+  remnant instead of being skipped; fields and timestamps are preserved and no
+  half-rebuilt table survives a failure. clientRequestId is idempotent per
+  account, so two accounts may share one key and each keeps its own byte group.
+  The singular send writes index 0, the plural send writes 0..n-1 in one
+  transaction (all-or-nothing), a successful settlement deletes the whole group
+  while failure/unknown keep it, and every explicit delete path (account,
+  conversation, message, merge, retention, remoteDelete, view-once erasure)
+  cascades only the owning account's indexes. messages.attachments.retry reads
+  the group by ascending index and re-dispatches the SAME row in the original
+  shape (singular or plural) after a refresh/restart; caller-supplied bytes
+  remain supported for a singular row and are refused on a plural one; the
+  status guards run before the content face, so a failed row that lost its
+  descriptors answers the no-descriptor wording instead of the text-send one.)
+- Contract revision: 1.279 (2026-11-09; §4.263 outbound attachment payload
+  persistence: schema v48 adds outgoing_attachment_payloads
+  (client_request_id PRIMARY KEY, account_id, conversation_id, data_uri,
+  created_at, updated_at). messages.attachments.send upserts the original
+  data URI before the first dispatch; messages.attachments.retry makes
+  dataBase64/sizeBytes optional and, when omitted, rebuilds the payload and
+  size from that row (descriptor faces come from the message row's own
+  descriptor), so a failed attachment is retryable after a desktop refresh or
+  connector restart. Successful settlement deletes
+  the row; failure and unknown keep it; message/conversation/account deletions
+  and retention prune it. The payload is a resend source only — §4.183's
+  evictable local stash stays a rendering cache.)
+- Contract revision: 1.278 (2026-11-09; §4.262 in-place attachment retry:
+  messages.attachments.retry re-arms the ORIGINAL failed attachment row
+  (failed -> pending) and re-dispatches it under the same row id and
+  clientRequestId, so the history keeps exactly one row per logical message.
+  The guards follow §4.172: MESSAGE_NOT_FOUND / INVALID_REQUEST /
+  RETRY_OUTCOME_UNKNOWN / RETRY_IN_FLIGHT / RETRY_NOT_ALLOWED. Contract 1.279
+  (§4.263) makes its payload optional by persisting the original data URI.)
+- Contract revision: 1.277 (2026-11-02; §4.261 per-account state
+  revision: schema v45 adds `accounts.state_revision` (default 0); AccountSummary
+  exposes `stateRevision` additively. Inventory reads do not bump it; terminal
+  unlink/ready transitions and non-ready→ready upserts do. The desktop
+  coordinator includes it in its revision signature.)
+- Contract revision: 1.276 (2026-11-02; §4.260 link.finish idempotent
+  commit journal: schema v44 adds `link_commits(link_session_id PRIMARY KEY,
+  account_id, aci, committed_at)`; a repeated finish with the same
+  `linkSessionId` replays the committed account before checking the in-memory
+  link session, so a lost finish result cannot become a second device or a
+  misleading LINK_NOT_FOUND. The journal is written after the upstream commit;
+  a journal write failure is logged and never turns a real finish into failure.)
+- Contract revision: 1.275 (2026-11-02; §4.259 account runtime state
+  authority: the accounts row now persists `state_origin`/`state_observed_at`
+  (schema v43); `AccountSummary` additively exposes `stateEvidence`,
+  `stateObservedAt` and `stale`; engine-unavailable list fallback projects
+  `stale=true` + terminal `device_unlinked` as `unknown`; inventory upserts
+  no longer clear a terminal unlink (only finish/whoami may), and a successful
+  link finish explicitly marks the row ready. This closes the "engine down →
+  phone still linked → KT shows unlinked" false banner without inventing a new
+  health state.)
 - Contract revision: 1.274 (2026-10-27; §4.258 the per-recipient delete
   settlement and content-erasure completion: remoteDelete results are expanded
   into `deletedForEveryoneSendStatus` (success=true / failure=false), persisted
@@ -16547,9 +16686,12 @@ identity drops nothing and forwards unenriched).
 
 ### 4.183 The outbound-attachment local-retention stash: `dispatch_send` stashes the sent bytes, `attachments.download` serves the local hit first (contract revision 1.183, 2026-10-19)
 
-The S-4 decision made outgoing attachment bytes upload-only transit: the
-connector handed the data URI to the engine and kept nothing, so an
-outgoing row carried no byte source of its own — the desktop's own bubble
+The S-4 decision made outgoing attachment bytes upload-only transit (the
+retry-source half of that decision is superseded by contract 1.279, §4.263 —
+a durable payload row now backs failed sends; the evictable stash described
+here is still a rendering cache, never a resend source): the connector handed
+the data URI to the engine and kept nothing, so an outgoing row carried no
+byte source of its own — the desktop's own bubble
 could only "download" its own send, and the download arm answered the
 honest no-pointer `INVALID_REQUEST` (`attachment_locator_for_index`'s
 all-empty face) because an outgoing row has no transit pointer by
@@ -19071,7 +19213,26 @@ trust 语义）：
 | safetyNumber: String | verifiedSafetyNumber（比对闸） | 标记为已验证 |
 | state: "default" | (None, Some("default")) 信任重置 | sendAnyway（无比对） |
 
-**测试**：两臂各自路由正确；双臂/双缺 INVALID_REQUEST。
+**wire 形状**：`identitiesVerifyParams` 的 `required` 只留
+accountId/conversationId，两臂用 `oneOf: [{required:[safetyNumber]},
+{required:[state]}]` 表达"恰一"（同置与双缺都过不了 oneOf），`state`
+是 `enum: ["default"]`——`"unverified"` 不是官方对话框提供的动作，进了
+词表外就 fail-closed。参数结构体保留 `rename_all = "camelCase" +
+deny_unknown_fields`（§4.223 落地批丢过一次这两个属性，实测所有 camelCase
+请求折成 INVALID_REQUEST，已按原样恢复）。
+
+**写穿**（契约 1.260 §4.244）：成功后的本地投影戳 = verified 臂
+TRUSTED_VERIFIED / state 臂 TRUSTED_UNVERIFIED（官方
+`#_setVerified(DEFAULT)` 同位，只写 DEFAULT 不写 VERIFIED），戳体只有
+`trustLevel` 一个键——引擎 sidecar 的 `pending` 挂起位随之消失，权威位
+仍以引擎为准。
+
+**测试**：解码与写穿词的单点纯函数（`identities_verify_intent` /
+`identity_verify_stamp_word`）枚举两臂 + 双臂/双缺/词表外 state 四类
+fail-closed；`prepare_identities_verify` 的 TrustDefault 上游 shape
+（recipient + state，无数字键）；store 侧写穿戳逐字
+`{"trustLevel":"TRUSTED_UNVERIFIED"}`；server_integration 的 wire 全链
+（state=default 往返 + 同置/词表外 state INVALID_REQUEST）。
 
 ---
 
@@ -20203,3 +20364,477 @@ remoteDelete 只改 status，正文仍留在库里。
 **测试**：service completion 覆盖逐人 map、正文/附件/富文本擦除、摘要清空、
 幂等；supervisor 部分成功/失败结果解析；全量 connector 测试通过。
 桌面本地持久化 store 覆盖 pending/success/failure 与重载回填。
+
+## §4.259 账号运行时状态权威（契约 1.275）
+
+**问题**：engine 不在时，`list_accounts()` 回退 store 行；行里可能仍是旧的
+`state='device_unlinked'`，桌面直接把它渲染成“手机端已解绑”。另一个
+反向问题是 `upsert_account_from_signal_with_id` 在每次 inventory 同步时
+无条件把终态改回 `ready`，造成“解绑 → 列表复位 → 401 再解绑”的抖动。
+
+**实现**：
+- accounts 表新增 `state_origin` / `state_observed_at`（schema v43，additive
+  nullable；旧行 NULL = cache，不自动回填）。
+- `AccountSummary` 新增可选 `stateEvidence` / `stateObservedAt`，以及
+  `stale`（false 不上 wire）。
+- engine 不可用 / store-only 投影：全部标 `stale=true`、`stateEvidence='cache'`；
+  `device_unlinked` 投影为 `unknown`，直到本次进程收到 live 证据。
+- inventory upsert 不覆盖 `device_unlinked`；finish 成功调用
+  `mark_account_ready_by_id(..., "engine")` 显式清终态；upstream 401 写
+  `state_origin='upstream'`。
+- live inventory 只信任 `state_origin` 为 upstream/engine 的终态；legacy 无
+  origin 的终态降级为 cache/unknown。
+- store 打不开时 connector 在退出前向 stderr 写
+  `KT_FATAL code=STORE_KEY_REJECTED retryable=false`（或
+  `STORE_KEY_REQUIRED`）；桌面从有界 stderr 尾部识别并落 `key_missing`，
+  停止自动重启预算，不再把 key 不匹配显示成可重试的 `START_FAILED`。
+
+**测试**：inventory 不得复位终态；显式 ready 才能清；fallback 终态降级；
+live 只信权威 origin；schema additive 序列化。全量 lib 892 绿（含 §4.261）。
+
+## §4.260 link.finish 幂等提交日志（契约 1.276）
+
+**问题**：finishLink 是 mutating 上游调用；结果丢失后，桌面只能靠 lost-finish
+收养唯一新账号。进程在“上游成功、响应丢失、桌面未绑定”的窗口死掉时，重试
+会看到 LINK_NOT_FOUND，或再次向手机发起一次链接。
+
+**实现**：
+- schema v44 新增 `link_commits` 表：`link_session_id` 主键、`account_id`、
+  `aci`、`committed_at`。
+- `complete_link_session_with_id` 在 `require_active_link` 之前查 journal：
+  命中就直接返回同一 account summary，不再消费 session、不再打上游。
+- 成功提交后写 journal；写失败只 warn，不把已经真实成功的 finish 变成失败。
+- 不自动删除任何账号/绑定；journal 只做 replay 证据。
+
+**测试**：同 `linkSessionId` 连续两次 finish 返回同一 account id，账号行仍为 1；
+全量 lib 891 绿。
+
+## §4.261 逐账号 stateRevision（契约 1.277）
+
+**问题**：全局 snapshot revision 只能说明“某个地方变了”，无法判断单个账号
+是否发生了状态迁移；账号行被 inventory 反复读取时也不应制造 revision 抖动。
+
+**实现**：
+- schema v45 新增 `accounts.state_revision INTEGER NOT NULL DEFAULT 0`。
+- `AccountSummary` 新增 `stateRevision`（additive，恒在）。
+- inventory upsert 只在 `非 ready → ready` 时 +1；已经是 ready 的重复读取不动。
+- `device_unlinked` / `mark_account_ready_by_id` 的真实状态迁移 +1；重复同态不抖。
+- 桌面 Coordinator 的 revision 签名纳入 `stateRevision`。
+
+**测试**：insert=1；ready 重复 inventory 仍 1；unlink→2；terminal 期间 inventory
+仍 2；显式 ready→3。全量 lib 892 绿。
+
+## §4.263 出站附件原始 payload 持久化（契约 1.279）
+
+**问题**：失败附件的重试依赖桌面内存里的 payload。刷新/重启后 payload 不在，
+messages.attachments.retry 要求调用方再次提供 dataBase64/sizeBytes，桌面却
+已拿不出原始字节——失败气泡只能一直失败。官方把消息附件持久化在本地，失败
+重发不依赖 UI 内存。
+
+**实现**：
+- schema v48 新增 outgoing_attachment_payloads：client_request_id 主键、
+  account_id、conversation_id、data_uri、created_at、updated_at；表由
+  CREATE TABLE IF NOT EXISTS 建立，启动时清理过期行与（超过宽限的）孤儿行。
+- prepare_send_attachment 在首次 dispatch 前 upsert 构建好的 data URI；
+  同一 clientRequestId 已有行时保留原 payload（幂等重放不覆盖成新请求）。
+  写失败即不发送，避免修复静默退化。
+- prepare_retry_attachment 的 dataBase64/sizeBytes 改为可选：缺省从 payload
+  表读 data_uri，还原 base64 与 size；filename/contentType/voice/gif 以消息行
+  自己的 descriptor 为准（URI 的 mime 只是构建默认值），然后重发；表里没有
+  记录 → RETRY_NOT_ALLOWED（明确提示可带 bytes 重试），失败行保持原样。
+  调用方带 bytes 时以调用方为准，并用本次 data URI 覆盖 payload 行，后续刷新
+  仍可重试。
+- 结算：成功删除 payload；unknown 与 failed 保留。对账确认已发送同样删除。
+- 级联：账号删除（计入 §4.197 回执）、会话/消息删除、合并、过期清扫、
+  remoteDelete 内容擦除与保留清扫都会删除对应 payload。
+- host/schema/registry/methods 同步 optional；schema 用 allOf 约束
+  dataBase64/sizeBytes 必须成对出现。messages.attachments.retry 的错误码与既有
+  守卫不变。（契约 1.280，§4.264 把这张表升级为复合主键、放开多附件的 ids-only
+  重试，见下一节。）
+
+**测试**：首发失败后 store 有 payload；retry 不带 bytes 成功且同 row id；
+成功后 payload 删除；无 payload 的 retry 拒绝且行仍可带 bytes 重试；新 store
+实例（重开）仍能读到 payload；级联删除覆盖。
+
+## §4.264 多附件 payload 组（契约 1.280）
+
+**问题**：§4.263 的 payload 表以 client_request_id 单键存储，只够一条消息一份字节。
+多附件消息失败后，桌面刷新即丢 payload，重试面又只会重发一份附件——失败的多附件
+气泡只能一直失败，或者被迫拆成几条消息，破坏「一条逻辑消息 = 一条历史行」。
+
+**实现**：
+- schema v49：outgoing_attachment_payloads 的主键升级为
+  (account_id, client_request_id, attachment_index)。clientRequestId 只在**一个
+  账号内**幂等——两个账号可以用同一个 id，各自必须能写、也必须读回自己的字节，
+  所以账号落在主键第一段。SQLite 改不了主键，所以重建表（create-copy-drop-rename
+  + 重建 account/conversation 索引）；v48 的旧行按 index=0 原样搬过来（那一代
+  只可能是单附件），v49 中间形态 (client_request_id, attachment_index) 的行按原
+  index 搬，account_id / conversation_id / data_uri / created_at / updated_at 全部
+  保留。
+- 迁移形状驱动、不看版本号，而且必须能从半途中断里收尾：版本号已经写成 49 的库
+  可能还是中间形态；旧实现逐条 DDL、没有事务，崩在 COPY 与 DROP 之间会留下残表
+  outgoing_attachment_payloads_v49（已经搬过去的行在残表里，没搬到的还在现表
+  里）。残表不是「跳过」的信号而是搬运要继续的目标：先把现表按主键写进重建表
+  （INSERT OR IGNORE 去重），再合并残表里现表缺的行；崩在 DROP 之后的库（现表
+  由 SCHEMA_DDL 重建成空表）同样把残表里的整组行 rename 回来。整条重建跑在一个
+  BEGIN IMMEDIATE / COMMIT 里，任何一步失败 ROLLBACK——不会留下「旧表已 drop、
+  新表还没 rename」的库，残表行也一起回滚，下次开库重来。
+- store API 按账号 + index 工作：remember / read / update / delete 都以
+  (account_id, client_request_id, attachment_index) 定位，list 按 index 升序返回
+  这个账号这一组的整组行；批量版本（remember/update_outgoing_attachment_payloads）
+  跑在一个事务里，要么全落、要么全不落——ids-only 重试要求这组行是完整的一代。
+  delete_outgoing_attachment_payloads 删整组（成功结算与显式删除级联），账号限定
+  是查询与冲突目标的共同前缀，跨账号的同一个 clientRequestId 互不覆盖、互不可见。
+- 首发：单附件面写 index 0；多附件面在 dispatch 前把每个条目的 data URI 按 0..n-1
+  落库（写失败即不发送）。
+- 结算：成功删除整组 payload；failed / unknown 保留；对账确认已发送同样删除整组。
+  账号删除、会话/消息删除、合并、remoteDelete、过期清扫与孤儿清理按
+  (account_id, client_request_id) 整组删除（复合键不改变这些路径的语义）。view-once
+  擦除同样只删本账号这一组——它的定位子查询带 account_id 限定，另一个账号用同一个
+  clientRequestId 存的字节不会被连带删掉。
+- prepare_retry_attachment：ids-only 时按 index 升序读整组 payload，逐条解析回
+  base64/size，描述面（filename/contentType/voice/gif/blurHash）取自消息行自己的
+  descriptor，重建 dataURI 数组与 descriptors，并按原形态 dispatch（单条目 1 个、
+  多条目 n 个），行 id 复用原失败行。守卫顺序是先 status、后内容面：已完成的
+  replay、unknown、pending（RETRY_IN_FLIGHT）、其它非 failed 状态都在描述符判定
+  之前答复，所以一条已经没有 descriptor 的 failed 行得到的是「没有描述符可重建」
+  （RETRY_NOT_ALLOWED），不会被误答成「这是文本消息，请用 retryText」——它本来就是
+  附件行，retryText 也会以同样理由拒绝它。组不完整（缺 index、数量与 descriptor
+  不一致）→ RETRY_NOT_ALLOWED，失败行保持原样。调用方带 bytes 时仅兼容单附件行
+  （校验语料同首发，覆盖 index 0 的 payload 行）；多附件行带 bytes →
+  RETRY_NOT_ALLOWED（一次调用无法重述每个条目的字节），该行仍可 ids-only 重试。
+
+**测试**：多附件首发失败后 store 有 index 0/1 两行；重开 store 后 ids-only retry
+重建两条 dataURI（含 gif 标记与 filename）、同 row id、descriptors id 与首次一致、
+结算成功后整组清空；多附件行带 bytes 拒绝且行仍 failed；缺 index 1 时 ids-only
+拒绝、补回后重试成功；显式删除会话级联删除所有 index；schema v49 迁移旧单键行到
+index 0 且字段/时间戳保留、复合键可写 index 1、索引重建。结构面另有三组：
+迁移中断恢复（残表里已搬过的行不重复、现表里没搬到的行补上、崩在 DROP 之后的库
+从残表整组救回、残表被消费掉，畸形残表让整条重建 ROLLBACK 且现表原样）、跨账号
+同 clientRequestId 各自可写可读可删（写入不被对方吞掉、覆盖与整组删除只动本账号）、
+view-once 擦除只删本账号那一组、以及无描述符 failed 行的文案不是 text send。
+
+
+## §4.265 peer 寻址的安全码面（契约 1.281）
+
+**问题**：identities.get / identities.verify 只能按 conversationId 寻址——先解析本地
+direct 会话行，再用它的 peer_key 做上游引用。可安全码与信任是 peer 的属性，不是会话
+的属性：宿主在还没聊过的人身上（搜索结果、资料页、群成员卡）同样要读安全码、要把
+[sendAnyway] 的信任重置写下去。旧面在这种场景只有两个坏选择：先伪造一条会话行（把
+读路径变成写路径），或者得到 CONVERSATION_NOT_FOUND——一个跟身份无关的错误。
+
+**实现**：
+- 入参：identitiesGetParams / identitiesVerifyParams 增加 peerKey，与
+  conversationId 恰一（双缺 / 同置 → INVALID_REQUEST，fail-closed）。
+  `identities_addressing` 是 supervisor 路由、service 装配与单测共用的单点解码，
+  避免「schema 写恰一、代码只认一半」的漂移。
+- peerKey 词形：ACI UUID（8-4-4-4-12 hex，大小写不敏感）或 E.164（`+` 加 7..15
+  位数字），wire bound 64 字符（IDENTITY_PEER_KEY_MAX_CHARS）。组 master key、
+  `PNI:`/`u:` 用户名拼写与裸数字都不上这条面——peerKey 是协议身份，不是任意
+  recipient 拼写。
+- identities.get：peer 面不解析、不要求、不创建会话行——prepared `listIdentities`
+  帧把 peerKey 原样放进 `number`，账号的 identity store 是唯一读权威。store 里没有
+  该 peer 的身份时如实答 `identity: null`（与空列表面同义），不是
+  CONVERSATION_NOT_FOUND；账号仍先解析（未知账号照旧 ACCOUNT_NOT_FOUND）。
+- identities.verify：两条臂（verifiedSafetyNumber / state="default"）都以 peerKey 作
+  `recipient` 上 wire；成功后的本地写穿按 peer 键落
+  conversations.identity_verified_json（§4.244 的词不变：verified →
+  TRUSTED_VERIFIED，state → TRUSTED_UNVERIFIED）。没有对应 direct 行就没有可写穿的
+  投影（store 答 false，如实的 no-row），engine 侧的信任写入不受影响；conversationId
+  面的写穿保持按行 id，两条寻址各走各的 store 面。
+- schema：两张面 required 只留 accountId，寻址恰一写成 oneOf；verify 的两条独立
+  恰一轴（地址臂、数字/重置臂）用 allOf 组合（一个 schema 对象只能有一个 oneOf）；
+  peerKey 的 anyOf 正则锁 UUID / E.164 两种词形。方法名、能力标签与错误码不变
+  （无人需要新 tag：这是同一条 safety-number 面的寻址扩展）。
+
+**测试**：单测钉 peer 寻址面——无 direct 行时 prepared upstream 仍直读
+（`{account, number}`），uuid 与 E.164 两种词形逐字上 wire，双缺 / 同置 / 空串 /
+裸数字 / 组键 / PNI / 用户名 / 越界一律 INVALID_REQUEST，verify 两臂的 recipient
+与 state/verifiedSafetyNumber 形状，以及写穿：peer 面把 TRUSTED_UNVERIFIED /
+TRUSTED_VERIFIED 落到既有 direct 行的 verified 位、无行时答 false、conversationId
+面同位不回归。集成面（fake engine）钉端到端：peerKey 读无会话 peer 得
+`identity: null` 且不新增会话行，读已联系 peer 得记录，uuid 原样上 wire（不改写成
+号码），peerKey verify 的 verified 臂与 state 臂把投影从 false 翻到 true 再翻回
+false，寻址双缺 / 同置在宿主面答 INVALID_REQUEST。schema 面钉 required/oneOf/allOf
+结构与 peerKey 的两条词形正则，并给 peerKey 的 64 字符上界建了 bounds 对。
+
+## §4.266 store 升级安全：迁移前快照 + 完整性闸 + 失败回滚（契约 1.282 · wire 仅增 doctor.store）
+
+**问题**：schema 迁移与加密库（rusqlite `bundled-sqlcipher`）升级是同一个动作，但旧
+实现是在 `Store::open` 里裸跑 DDL 阶梯：`SCHEMA_DDL` → `migrate_schema` → 加列 →
+后置索引，全部 ALTER 既没有快照，也没有完整性检查，更没有回滚。一次失败的升级会留下
+"列改了一半、版本号还写着旧值"的文件，进程只能答 `Unavailable`：用户看到"连接器不可
+用"，运维手里既没有可回滚的副本，也没有任何诊断面（除 stderr 外只剩一个分类词）。
+
+**实现**：
+- **迁移前快照**：`state_dir/migration-snapshots/` 下用 `VACUUM INTO` 拍一份一致性
+  副本——SQLite 在自己的一次读事务里完成拷贝，产物是单文件、没有待重放的 WAL；
+  SQLCipher 用源连接的 key 重新加密目标，快照不会是明文。文件名
+  `pre-migration-v<from>-to-v<to>-<stamp>-<pid>.sqlite3`，时间戳补零，字典序即时间序。
+  保留最近 `SNAPSHOT_KEEP = 3` 份，且整目录受 `SNAPSHOT_BYTES_CAP = 256 MiB` 约束：
+  按"最新 N 份 + 累计字节不超上限"两条规则从旧到新淘汰，**刚写出的那一份永远不是淘汰
+  对象**（它单独超上限也保留——删掉唯一一份"正在升级"的快照，正是这套机制要防的事）。
+  快照失败 → `snapshot_failed` fail-closed，一步 ALTER 都不跑。
+- **迁移前完整性闸**：`PRAGMA integrity_check` 在**任何 DDL 之前**跑。判定分两档：
+  检查器自己读不动（页 HMAC 失败 / 读错误）→ `StoreCorrupt`（类 `corrupt`）；
+  检查器跑完并报了损伤 → `StoreIntegrity(n)`（类 `integrity`，只带条数，取检查器自己
+  的文本会连带页内容）。两档都 fail-closed，不继续 ALTER。只在"需要迁移"或"加密库
+  版本变了"时才付这份成本，普通重启不跑（`integrity: notChecked` 是如实的缺席，不是
+  健康结论）。
+- **升级触发**：除 `meta.schema_version < SCHEMA_VERSION` 外，`meta.store_cipher_version`
+  与本次 `PRAGMA cipher_version` 不同也算升级——schema 没变、加密库变了，同样是"新库
+  第一次打开这个文件"。任一侧缺失不触发，绝不凭空造闸。
+- **失败回滚**：阶梯任何一步失败（含 `SCHEMA_DDL` 与后置索引）→ 关闭写连接、删
+  sidecar（残留 `-wal` 会被重放进覆盖后的库，那是坏的恢复）、用快照覆盖回
+  `connector.sqlite3`、按 store key 重开校验旧版本号，结果写成
+  `SchemaMigrationFailed { from, to, rollback: "restored"|"failed" }`（类
+  `schema_migration_failed`）——不再只剩 `Unavailable`。快照不删；同目录留
+  `schema-migration-failure.json`（时刻、from/to、回滚结果、快照文件名，只有这几个
+  无内容字段），下一次成功迁移才清掉，所以失败进程死了以后仍然可诊断。
+- **可观测**：`Store::health()` 给出 `schemaVersion` / `schemaTarget` / `integrity` /
+  `dbBytes` / `walBytes` / `snapshots{count,bytes,lastResult,lastAt}` /
+  `lastMigrationFailure`；`runtime.doctor` 顶层新增 `store` 键，metrics 周期行新增
+  `store_*` 系列（含 `store_migration_failure`）。健康面不拿写锁——版本号是 open 落定
+  的字段、其余是文件尺寸与一个小标记文件，doctor 不会排在请求后面；`RuntimeSupervisor`
+  与 `ProxyGroupRuntime` 各持一份 store 句柄正是为此。
+
+**测试**：升级前快照存在且是旧版本（`schema_version` 读到 from、阶梯新增列缺席、头条
+不是明文 SQLite magic、同 key 可解）；`PRAGMA writable_schema` 造出的悬空 b-tree 让
+检查器报损伤 → 类 `integrity`、无快照、无 marker、库仍是旧版本且新列缺席；损坏页 →
+非法分类里只有 `corrupt`/`integrity` 两档、无快照、无 marker；迁移中途失败（旧形状
+payload 表 + 视图占住重建表名，让重建事务里的 `DROP TABLE IF EXISTS` 失败）→ 类
+`schema_migration_failed`、`rollback: restored`、快照保留、marker 与快照文件名一致、
+库回到旧版本号且阶梯已执行的列被撤回（这正是旧实现留下的"半迁移"陷阱）；成功迁移按
+条数清理旧快照（保留本次那份与最新两份旧的）；`prune_snapshots` 的字节上限与被保护
+文件；无迁移的启动既不拍快照也不跑闸；两个损伤类互不混淆；doctor 结构单测与 fake
+engine 端到端各钉一次 `store` 面（首次启动 `integrity: notChecked`、
+`snapshots.count: 0`、`lastMigrationFailure` 缺席）。
+
+## §4.267 thin 事件账本：去 payload、头部保留窗、游标代际（契约 1.283）
+
+**问题**：Signal Core B 的 `event_log` 一开始把整条消息投影当 payload 落库
+（`service` 里 `serde_json::to_string(project_message_for_host(...))`）。这有三个
+代价：写放大（一条消息在 messages 行之外再存一份正文量级的副本）、隐私面（删除
+只清消息行，事件行里还留着同一条正文）、以及没有保留窗——账本只增不减，重连
+回放会一路翻到几个月前。同时 `events.list` 根本没有游标代际：store 被重建、
+账号被删、账本被清过之后，旧游标只会安静地从"下一行"继续，那是丢事件而不是
+重置。
+
+**wire 形状**（请求对象 → 结果对象）：
+
+- 参数 `{afterSeq?: int>=0, token?: string(1..=128), limit?: int 1..=500}`，三个
+  键全可选（裸 `{}` 就是冷启动），未知键 fail-closed（`deny_unknown_fields`）。
+  默认 limit = 100；越界 / 负游标 / 超长 token 一律 `INVALID_REQUEST`，不再
+  "悄悄 clamp"。
+- 结果 `{token, reset, resetReason?, trimmedThroughSeq, events, nextAfterSeq,
+  truncated}`；`events` 的每行是 `{seq, epoch, accountId?, type, createdAt}`——
+  没有 payload。`resetReason` 只在 `reset: true` 时出现。
+
+**reset 四判据**（彼此独立，不是优先级链——带了正确 token 但游标掉到 floor 以下
+仍然 reset）：
+
+| 判据 | 触发 | 含义 |
+| --- | --- | --- |
+| `tokenMismatch` | 传入 token ≠ 当前 token | 代际轮换（新库 / 升级 / 删号） |
+| `coldStart` | token 与 afterSeq 都没传 | 首次挂载，必须先全量重载 |
+| `belowFloor` | afterSeq < floor | 它要的事件已经被裁掉 |
+| `aheadOfLog` | afterSeq > 账本最大 seq | 游标属于一个已经不存在的账本 |
+
+reset **不夹带事件**：游标已经失效，再给"从这个死游标之后的半页"正是 token 要
+防的静默空洞。reset 的 `nextAfterSeq` = `trimmedThroughSeq`（floor），调用方
+从这里重新开始。floor 本身是合法游标（不 reset、不跳事件）。
+
+**thin ledger**（schema v50）：`event_log` 只留
+`seq/epoch/account_id/type/created_at`。迁移是**形状驱动**的（只看 payload 列在
+不在，不看版本号）：一条 `BEGIN IMMEDIATE` 里的 create-copy-drop-rename，旧行的
+seq/type/时间戳原样保留——thin 语义下它们仍是合法的"变化指针"；孤儿行（账号行
+已经不存在、v46-v49 的删除不认账本留下的）在这一次升级里清掉；状态行播种新
+token + floor 0。`sqlite_sequence` 跟着重建表的最大 seq 走，被裁掉的 seq 不会
+被复用。删号路径从这一版起自己显式删事件行，所以孤儿只可能是历史遗留，不再
+每次开库扫一遍（那会把"事件先于账号行落地"当成脏数据）。
+
+**头部保留窗**：7 天 / 20000 行 / 64 MiB，**任一**触发就从头上裁。行成本用同一条
+SQL 表达式估算（`27 + LENGTH(type) + LENGTH(account_id) + 12`：三个整数列按
+9 字节 varint 上限 + 类型词 + 账号 + 行/页框），裁剪与 doctor 报的字节数共用它，
+两个面不会各说各话。floor 推进与 `DELETE` 在**同一个事务**里：既不会留下
+"floor 说裁了、行还在"，也不会留下"行没了、floor 没动"。sweeper 是每进程一个
+（账本是一张表），启动立刻跑一遍再按 30s 节奏，single-flight + blocking pool，
+失败只记日志等下一拍。
+
+**读面**：`events_page` 走 `read_conn`（read pool，`query_only`），不碰写连接、
+不排队等写锁；响应按序列化后的 JSON 帧计 4 MiB 预算，超预算就提前收页并如实
+`truncated: true`（第一行永远给，调用方不会因为预算比一行还小被卡死）。
+
+**删号**（契约 1.283 扩 §4.197）：`event_log` 进 `ACCOUNT_DELETE_TABLES`（计数
+进删除回执）、删除事务里显式 `DELETE FROM event_log WHERE account_id=?`，并在
+同一事务内轮换 token（generation +1）——订阅方第一次 `events.list` 就会拿到
+`tokenMismatch`，而不是继续读一段"人已经删了"的流。明文迁移备份的 scrub 循环
+共用 `ACCOUNT_DELETE_TABLES`，所以备份里的账本行一并清掉。
+
+**可观测**：`runtime.doctor` 顶层新增 `events` 面（`readable / tokenGeneration /
+trimmedThroughSeq / seqMax / rows / bytes / oldestCreatedAt / newestCreatedAt /
+retention{maxAgeMs,maxRows,maxBytes}`），metrics 周期行新增 `event_ledger_*` 系列。
+**token 原文不进任何诊断面**——doctor 输出会被贴进 bug report。账本状态单行
+`event_log_state(id=1, token, generation, floor, updated_at)` 是 token/floor 的
+唯一权威。
+
+**测试**：冷启动 → 续读（同 token 不 reset、limit 分页 + truncated、空闲轮询
+游标不动）；四判据各自独立（含"token 正确但 afterSeq 掉到 floor 下"仍 reset）；
+age / 行数 / 字节三条窗口各自触发、幂等、floor 不回退；用 `BEFORE DELETE` 触发器
+让裁剪失败 → floor 不动、行还在，去掉触发器后同一窗口正常裁掉；重启后同 token
+续读（generation 持久）；4 MiB（测试用极小预算）预算收页且第一行必给；删号
+级联 + token 轮换 + 回执计数 + 旧 token 一律 `tokenMismatch`；v20→v50 迁移
+（payload 列消失、孤儿清掉、seq/type/created_at 原样、状态行播种）；helper 面
+（doctor 单元 + fake engine 端到端、metrics 行）；schema 平价（`events.list` 进
+method enum 与 `PHASE2_CAPABILITIES`，token/limit/afterSeq 三个上界与 store 常量
+成对）与 wire 端到端（冷启动 / 续读 / 旧代际 / 越界 / 五类畸形参数的
+`INVALID_REQUEST`）。桌面零改动：这一版没有任何消费点。
+
+## §4.268 新库版本分类：SchemaNewer + 固定启动诊断（契约 1.284 · wire 仅增 doctor.store.schemaNewer）
+
+**问题**：桌面被降级（或用户把新版本的数据目录交给旧 connector）时，库里的
+`meta.schema_version` 高于本二进制的 `SCHEMA_VERSION`。旧实现只在 `migrate_schema`
+里 `return Err(StoreError::Unavailable(None))`：启动失败、stderr 只有一个分类词，
+桌面无法把"你的数据来自更新的版本，请升级"与"库坏了/打不开"区分开，只能按同一个
+spawn 重试策略再试五次。诊断面也拿不到任何可操作的事实。
+
+**实现**：
+- **结构化拒绝**：`StoreError::SchemaNewer { current, supported }`，类
+  `store_schema_newer`。判定提前到 keyed 连接刚打开、刚读出 `current` 之后——在
+  完整性闸、快照、任何 DDL **以及会改写文件的连接设置**（`PRAGMA journal_mode=WAL`
+  足以改掉一个非 WAL 库的头部）之前，所以拒绝本身什么都不碰；`migrate_schema` 的
+  旧守卫保留为纵深防御，返回同一个结构化变体（不再返回裸 `Unavailable`）。
+- **桌面契约（stderr）**：启动失败（`serve`，以及同一条 fatal 通道上的
+  `migrate-pool`）在 stderr 打一行固定形状：
+  `KT_FATAL code=STORE_SCHEMA_NEWER retryable=false current=<n> supported=<n>`。
+  `main` 不再只按 Display 子串匹配：`fatal_line_for(&dyn Error)` 向下转型拿回
+  `StoreError`，由类自己决定这一行（`STORE_KEY_REJECTED` / `STORE_KEY_REQUIRED`
+  的旧行保持不变），没有启动契约的类什么都不打。
+- **诊断标记**：拒绝启动时在 `state_dir` 留 `schema-newer.json`
+  （`{at, current, supported}`，temp-then-rename 原子写，读面 8 KiB 上限，
+  解析失败当缺席）。拒绝的进程会退出、永远服务不了 doctor，所以这个标记是后续
+  诊断的唯一通道；它记录"上一次拒绝"而不是"当前库坏了"，因此后续成功启动**不清除**
+  它，下一次拒绝覆盖它。
+- **可观测**：`Store::health()` 新增可选 `schemaNewer`，`runtime.doctor` 的
+  `store` 面随之暴露 `schemaNewer{current,supported,at}`；正常启动时该键**缺席**
+  （不是造一个 false 对象）。metrics 行不加新系列（store 行已有自己的口径）。
+- **不回归**：泛化的打开失败仍是 `Unavailable` / `unavailable`，也不会写
+  `schema-newer.json`；新分类只覆盖 `current > SCHEMA_VERSION` 这一种事实。
+
+**测试**：新库版本 > 当前 → `SchemaNewer{current,supported}`、类
+`store_schema_newer`、`fatal_line_for` 恰好是上面那行、重开仍拒绝（不降级）、
+拒绝发生在快照之前（无 `migration-snapshots/`）、标记两个版本号正确；标记写好后
+由一次成功打开的 `health()` 读回，序列化成 `schemaNewer.current/supported`，
+干净目录该键缺席；doctor 结构单测钉 `store.schemaNewer{current,supported,at}`；
+真实二进制启动（`serve` + 新版本库）→ 退出码 1、stderr 含精确固定行、标记落盘；
+普通不可读库仍 `Unavailable` + 无标记 + 无 fatal 行。
+
+## §4.269 engine 资源错误锚词认领：ENGINE_BUSY / ENGINE_TIMEOUT / ATTACHMENT_BUSY / ATTACHMENT_BUDGET（契约 1.285 · wire 增四个错误码）
+
+**背景**：引擎 M4/M5 稳定性批把背压、dispatch 预算与附件上行闸的错误面钉成四个
+固定锚词（kt-signal-engine docs/jsonrpc-compat.md §3/§5）。connector 认领前它们
+落泛化 `UPSTREAM_ERROR`，-32000 的两臂连结构化面都没有，桌面只能说"引擎报错"，
+分不清"根本没执行、可重试"与"可能已写出、别重试"。
+
+**实现**：
+- engine 响应分类器新增 `upstream_error_resource_class`（纯函数，按消息文本匹配
+  四个括注锚词，与 §4.80/§4.95 同一观察点、同一"只认 message、不认 code 槽"
+  纪律），落在 send-chain 分类之后、结构化 code 阶梯之前；四臂互斥，旧锚词面
+  零变化。
+- 四个 `EngineError` 变体：`EngineBusy` / `EngineRequestTimeout` /
+  `AttachmentBusy` / `AttachmentBudget`，都带 `data: Option<Value>`。
+  `error.data` 对象整份逐字透传（非对象按缺席处理；connector 不造 data、不删键）。
+  `EngineRequestTimeout` 只承载只读面；mutating 的取消在分类器折叠为既有
+  `EngineError::UnknownOutcome`（与 connector 自身 mutating 超时同一结局面），
+  `data` 随 unknown 面无内容纪律不带。
+- 宿主码与 retryable（契约钉定，`with_data` 的推导让位）：
+
+  | 锚词 | 引擎 code | 宿主 code | retryable | 语义 |
+  |---|---|---|---|---|
+  | (EngineBusyException) | -32000 | ENGINE_BUSY | true | 在飞上限拒绝，请求未执行 |
+  | (EngineTimeoutException) | -32000 | ENGINE_TIMEOUT | false | 只读：预算超时取消 dispatch，未写出 |
+  | (EngineTimeoutException) | -32000 | SEND_OUTCOME_UNKNOWN | false | mutating/send：可能已写出，落既有 unknown outcome，行保持 unknown、禁止自动重试 |
+  | (AttachmentBusyException) | -32603 | ATTACHMENT_BUSY | true | 上行槽等待超时，未开始上行，确定未投递 |
+  | (AttachmentBudgetException) | -32603 | ATTACHMENT_BUDGET | false | 解码字节预算不足，decode/上行均未发生，不自动重试 |
+
+- 自动重试调度（§4.123 三臂之外）：`EngineBusy` / `AttachmentBusy` 走既有
+  backoff 曲线（认领前作为泛化 upstream 面已在曲线上，行为不回退）；
+  `EngineRequestTimeout` / `AttachmentBudget` 明确 `None`（mutating 取消折叠
+  unknown 后同样 `None`）。没有新事件：资源
+  拒绝不碰账号状态，§4.17 解绑链的 match set 不动。
+- schema：error.code enum 增四码；error.data 描述补两臂的 data 形状。
+
+**测试**：四锚词纯分类（真实 wire 形状 + 裸锚词 + data 逐字透传，timeout 按
+只读/ mutating 两臂分别钉定）；边界（近失配、锚词只在 code 槽、旧 send-chain
+锚词仍归旧分类器、普通错误仍 None）；真实 line handler 端到端（只读 timeout →
+EngineRequestTimeout（宿主 ENGINE_TIMEOUT）、mutating timeout → unknown、data 到达
+pending 请求、零账号事件）；真实 engine 进程端到端（version 只读探测 → 结构化
+timeout、send mutating → UnknownOutcome）；
+service 映射（四码 + retryable + data 保留 + `UnknownOutcome` 仍
+`SEND_OUTCOME_UNKNOWN`/false + 旧 `UPSTREAM_ERROR` / `UPSTREAM_TIMEOUT`
+不回归）；fake-engine 端到端（文本 send 与附件 send 各收到一次
+EngineTimeoutException → 行 `unknown`（非 failed）、answer
+`SEND_OUTCOME_UNKNOWN`、`next_retry_due_at` 为空、上游恰两次调用）；
+自动重试调度两臂 backoff、两臂 None；§4.17 授权 red line 对新锚词不命中；schema
+平价测试（四码进 enum）。
+
+**桌面**：四个新 error code 需要桌面 error copy 与重试文案（busy 可重试、
+timeout/budget 不可自动重试），本仓不拥有桌面 UI，另报。
+
+## §4.269 修订 link.finish 预算、未知结局与 O1 无条件握手（契约 1.285 同版修订 · wire 无新增码）
+
+终审必须项落在这三处，都是 1.285 线内的行为修订，**不新增**错误码、不改
+apiVersion、不动 wire 形状。
+
+**1. `LINK_FINISH_TIMEOUT` 300s → 370s（三方预算链的最后一环）**
+
+手机上点确认的时间不由 connector 决定，三条预算必须按
+desktop（330s）< engine（360s）< connector（370s）排序：connector 一旦先超时，
+就把一条引擎可能已经提交的链路说成"确定失败"，而桌面重跑 `finishLink` 会占
+第二个 device slot。370s 让 connector 永远是最后一个放弃的。
+
+**2. finish 预算到期 = unknown outcome，不是 definite timeout**
+
+`finishLink` 是 mutating 且已派发，预算到期时手机可能已批准、引擎可能已提交。
+旧代码答 `UPSTREAM_TIMEOUT`（retryable=true，文案"retry after scanning"），
+桌面会当成确定失败去重试——那是错误的确定性。现在答既有
+`LINK_OUTCOME_UNKNOWN`（retryable=false），语义与引擎崩溃臂一致：
+
+| 触发 | 旧答 | 新答 |
+|---|---|---|
+| connector 370s 预算到期 | UPSTREAM_TIMEOUT / true | LINK_OUTCOME_UNKNOWN / false |
+| engine 360s 派发预算 `(EngineTimeoutException)` | —（经 §4.269 mutating 折叠） | LINK_OUTCOME_UNKNOWN / false |
+| 引擎在 finish 在飞期间死亡 | LINK_OUTCOME_UNKNOWN / false | 不变 |
+
+desktop 的补救是 adopt：`accounts.list` 的引擎清单同步（`sync_accounts_from_numbers`）
+会把引擎已列出的号码落成正式行，不需要重跑 finish。link session 不被
+unknown 臂消费（与崩溃臂一致），既防止盲目 re-finish，也让桌面能先看清现状。
+
+**3. finish 在飞期间 pin 住 link session**
+
+`LINK_SESSION_TTL` 仍是 300s（二维码广告的 `expiresAt` 不变），但 finish
+预算 370s 比它长：若不 pin，300s 后手机批准、引擎已链接，提交却会答
+`LINK_EXPIRED`，把一条真实链路丢掉。`finish_link` 在拿到凭据后调用
+`pin_link_for_finish(session, LINK_FINISH_TIMEOUT)`，只把内存里的
+`expires_at_ms` 推到 `now + 370s`（取 max，不回退）；过期/未知会话仍是
+`LINK_EXPIRED` / `LINK_NOT_FOUND`，pin 不是复活。
+
+**4. O1 握手取消环境直通闸**
+
+`KT_DISABLE_CONTRACT_PROBE` 删除：握手永远执行，错配永远 fatal（不因环境变量
+软化）。生产侧留一个能关掉唯一校验的开关，就是"某台机器上永远服务未验证引擎"
+的漂移缺口。测试/调试改走 fake engine 自己的参数
+（`KT_FAKE_ENGINE_CONTRACT_REVISION` / `NO_CAPABILITIES` / `VERSION_ERROR` /
+`VERSION_DELAY_MS`）。
+
+**测试**：370s 常量与三方预算序（`link_finish_budget_outranks_the_engine_and_desktop_deadlines`）；
+预算到期答 `LINK_OUTCOME_UNKNOWN`/false（`a_link_finish_timeout_answers_the_link_class_unknown_outcome`）；
+引擎 360s 超时经真实 line handler 折叠到同一 unknown
+（`link_finish_folds_the_engine_budget_timeout_to_the_unknown_outcome`，fake engine
+新增 `KT_FAKE_FINISH_ENGINE_TIMEOUT` 参数）；in-flight finish 把 session 推到 QR
+寿命之外且仍能提交（`an_in_flight_finish_pins_the_link_session_past_the_qr_lifetime`，
+含 `LINK_NOT_FOUND` / `LINK_EXPIRED` 两臂）；无 env 绕过（匹配引擎仍被探测并记录、
+错配仍 fatal，见 `tests/engine_contract.rs`）。
+
+**桌面**：`LINK_OUTCOME_UNKNOWN` 走 adopt（`accounts.list` 后对账），绝不自动重跑
+`finishLink`；文案不再说"重试扫描"。本仓不拥有桌面 UI，另报。

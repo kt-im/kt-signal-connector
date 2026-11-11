@@ -1404,25 +1404,59 @@ async fn receive_delivers_host_events_and_get_text_returns_the_full_body() {
         json!({ "linkSessionId": link["result"]["linkSessionId"] }),
     )
     .await;
+    /// The receive's conversation id, knowable only once the receive's
+    /// `message.upserted` frame has landed.
+    fn receive_conversation_id(upserted: Option<&Value>) -> Option<&str> {
+        upserted?.get("data")?.get("conversationId")?.as_str()
+    }
+
+    /// The summary for the receive's own conversation — never the first
+    /// `conversation.changed` on the stream, which may belong to a
+    /// conversation the link flow itself materialized.
+    fn conversation_changed_for<'a>(
+        changes: &'a [Value],
+        conversation_id: &str,
+    ) -> Option<&'a Value> {
+        changes
+            .iter()
+            .find(|frame| frame["data"]["id"] == conversation_id)
+    }
+
     let mut finished: Option<Value> = None;
     let mut upserted: Option<Value> = None;
-    let mut conversation_changed: Option<Value> = None;
     let mut account_changed: Option<Value> = None;
-    timeout(Duration::from_secs(5), async {
-        while finished.is_none()
-            || upserted.is_none()
-            || conversation_changed.is_none()
-            || account_changed.is_none()
-        {
-            let frame: Value =
-                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    // The link flow's own sync materializes other conversations (contacts, the
+    // self row), so a foreign conversation.changed can land before the
+    // receive's summary. Buffer every summary and, once the receive's
+    // conversationId is known, wait for the frame whose `data.id` matches it.
+    // Arrival order is not part of the contract asserted below.
+    let mut conversation_changes: Vec<Value> = Vec::new();
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            let matched_conversation =
+                receive_conversation_id(upserted.as_ref()).is_some_and(|conversation_id| {
+                    conversation_changed_for(&conversation_changes, conversation_id).is_some()
+                });
+            if finished.is_some()
+                && upserted.is_some()
+                && matched_conversation
+                && account_changed.is_some()
+            {
+                break;
+            }
+            let line = client.next().await.unwrap_or_else(|| {
+                panic!("host stream closed before the receive's events arrived")
+            });
+            let line = line.expect("host stream must carry text lines while receiving");
+            let frame: Value = serde_json::from_str(&line)
+                .expect("host stream must carry JSON frames while receiving");
             if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
                 finished = Some(frame);
                 continue;
             }
             match frame.get("event").and_then(Value::as_str) {
                 Some("message.upserted") => upserted = Some(frame),
-                Some("conversation.changed") => conversation_changed = Some(frame),
+                Some("conversation.changed") => conversation_changes.push(frame),
                 // The link flow itself also emits account.changed; keep the one
                 // that carries the receive's unread increment.
                 Some("account.changed") if frame["data"]["unreadCount"] == 1 => {
@@ -1432,8 +1466,33 @@ async fn receive_delivers_host_events_and_get_text_returns_the_full_body() {
             }
         }
     })
-    .await
-    .expect("receive must deliver message/conversation/account host events");
+    .await;
+    if received.is_err() {
+        let conversation_id = receive_conversation_id(upserted.as_ref())
+            .unwrap_or("<message.upserted never arrived>");
+        let seen: Vec<String> = conversation_changes
+            .iter()
+            .map(|frame| {
+                format!(
+                    "{} (unreadCount={})",
+                    frame["data"]["id"], frame["data"]["unreadCount"]
+                )
+            })
+            .collect();
+        panic!(
+            "the receive's host events must arrive within 5s; still missing: \
+             link.finish={}, message.upserted={}, \
+             conversation.changed[data.id={conversation_id}]={}, \
+             account.changed[unreadCount=1]={}; conversation.changed frames seen: {seen:?}\n{}",
+            finished.is_some(),
+            upserted.is_some(),
+            receive_conversation_id(upserted.as_ref()).is_some_and(|conversation_id| {
+                conversation_changed_for(&conversation_changes, conversation_id).is_some()
+            }),
+            account_changed.is_some(),
+            dump_connector_crash_scene()
+        );
+    }
     let account_id = finished.unwrap()["result"]["id"]
         .as_str()
         .unwrap()
@@ -1453,7 +1512,9 @@ async fn receive_delivers_host_events_and_get_text_returns_the_full_body() {
     let conversation_id = message["conversationId"].as_str().unwrap().to_string();
     let message_id = message["id"].as_str().unwrap().to_string();
 
-    let conversation_changed = conversation_changed.unwrap();
+    let conversation_changed = conversation_changed_for(&conversation_changes, &conversation_id)
+        .cloned()
+        .expect("the receive's own conversation.changed must be on the stream");
     assert_eq!(conversation_changed["data"]["id"], conversation_id);
     assert_eq!(conversation_changed["data"]["type"], "direct");
     assert_eq!(conversation_changed["data"]["unreadCount"], 1);
@@ -3089,6 +3150,63 @@ async fn link_finish_reports_a_non_retryable_unknown_outcome_when_the_engine_die
     // retryable timeout: re-running it could claim a second device slot.
     assert_eq!(finished["error"]["code"], "LINK_OUTCOME_UNKNOWN");
     assert_eq!(finished["error"]["retryable"], false);
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+/// The engine's own finish dispatch budget (360 s) is the deadline that fires
+/// first in production — the connector's 370 s is the outer backstop. Its
+/// `(EngineTimeoutException)` on the mutating `finishLink` must fold to the
+/// same link-class unknown outcome the connector's own budget expiry answers:
+/// a definite retryable timeout would invite a second device slot.
+#[tokio::test]
+async fn link_finish_folds_the_engine_budget_timeout_to_the_unknown_outcome() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [21_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_FINISH_ENGINE_TIMEOUT", "1")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Finish-Budget" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+
+    assert_eq!(finished["error"]["code"], "LINK_OUTCOME_UNKNOWN");
+    assert_eq!(finished["error"]["retryable"], false);
+    assert_ne!(finished["error"]["code"], "UPSTREAM_TIMEOUT");
+    assert_ne!(finished["error"]["code"], "LINK_EXPIRED");
+
+    // The unknown outcome is not an engine fault: the shared engine keeps
+    // serving (nothing was restarted behind the host's back).
+    let status = request(&mut client, "status", "runtime.status", json!({})).await;
+    assert_eq!(status["result"]["state"], "running");
 
     drop(client);
     assert_clean_exit(&mut connector).await;
@@ -11578,7 +11696,10 @@ async fn safety_number_faces_round_trip_and_gate_the_shape() {
         }),
     )
     .await;
-    assert_eq!(verified["result"]["status"], "verified");
+    assert_eq!(
+        verified["result"]["status"], "verified",
+        "the verified arm answers: {verified:?}"
+    );
     let trust_calls: Vec<Value> = send_log()
         .into_iter()
         .filter(|params| params.get("verifiedSafetyNumber").is_some())
@@ -11611,6 +11732,36 @@ async fn safety_number_faces_round_trip_and_gate_the_shape() {
         2,
         "a definite trust failure is never retried"
     );
+
+    // 契约 §4.223 信任重置臂（官方 sendAnyway）：state="default" 无比对闸，
+    // engine trust 帧只带 recipient + state——数字串一个键也不上 wire；成功
+    // 面与 verified 臂同形（{status:"verified"}），本地写穿 DEFAULT 投影
+    // （TRUSTED_UNVERIFIED，绝不冒充 verified）。
+    let trust_reset = request(
+        &mut client,
+        "identity-trust-reset",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "state": "default"
+        }),
+    )
+    .await;
+    assert_eq!(
+        trust_reset["result"]["status"], "verified",
+        "the trust-reset arm answers: {trust_reset:?}"
+    );
+    let reset_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("state").is_some())
+        .collect();
+    assert_eq!(reset_calls.len(), 1, "{reset_calls:?}");
+    assert_eq!(reset_calls[0]["account"], "+15555550100");
+    assert_eq!(reset_calls[0]["recipient"], "+15555550103");
+    assert_eq!(reset_calls[0]["state"], "default");
+    assert!(reset_calls[0].get("verifiedSafetyNumber").is_none());
+    assert!(reset_calls[0].get("trustAllKnownKeys").is_none());
 
     // The 1:1 gate: a group conversation fails closed before any upstream
     // call, on both faces.
@@ -11685,6 +11836,27 @@ async fn safety_number_faces_round_trip_and_gate_the_shape() {
                 "trustAllKnownKeys": true
             }),
         ),
+        // 契约 §4.223 两臂恰一：同置与词表外 state 是 fail-closed 面（双缺
+        // 已在 verify-missing-digits 覆盖）。
+        (
+            "verify-both-arms",
+            "identities.verify",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "safetyNumber": "12345 67890",
+                "state": "default"
+            }),
+        ),
+        (
+            "verify-unverified-word",
+            "identities.verify",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "state": "unverified"
+            }),
+        ),
     ] {
         let rejected = request(&mut client, request_id, method, params).await;
         assert_eq!(
@@ -11721,6 +11893,240 @@ async fn safety_number_faces_round_trip_and_gate_the_shape() {
         unknown_conversation["error"]["code"],
         "CONVERSATION_NOT_FOUND"
     );
+
+    // 契约 1.281（§4.265）：peerKey 面——没有 direct 会话的 peer 也能读/写。
+    let listed_before = request(
+        &mut client,
+        "identity-list-before-peer-read",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 100 }),
+    )
+    .await;
+    let count_before = listed_before["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("conversations.list items: {listed_before:?}"))
+        .len();
+
+    // +15555550199 既不在 contacts fixture 里、也没有任何会话行：读面答诚实
+    // 空身份（identity: null），不是 CONVERSATION_NOT_FOUND。
+    let peer_read = request(
+        &mut client,
+        "identity-peer-read-no-conversation",
+        "identities.get",
+        json!({ "accountId": account_id, "peerKey": "+15555550199" }),
+    )
+    .await;
+    assert_eq!(
+        peer_read["result"]["identity"],
+        Value::Null,
+        "a peer with no identity row answers the honest null face: {peer_read:?}"
+    );
+    assert!(peer_read.get("error").is_none(), "{peer_read:?}");
+    // 同一个 peer 引用直读：fixture 对已联系的号码答记录，与有没有
+    // conversationId 无关。
+    let peer_read = request(
+        &mut client,
+        "identity-peer-read",
+        "identities.get",
+        json!({ "accountId": account_id, "peerKey": "+15555550103" }),
+    )
+    .await;
+    assert_eq!(peer_read["result"]["identity"]["number"], "+15555550103");
+    assert_eq!(
+        peer_read["result"]["identity"]["trustLevel"],
+        "TRUSTED_UNVERIFIED"
+    );
+    // uuid 形态：形状闸放行，引用逐字上 wire。fixture 只按已联系号码答记录，
+    // 这里如实答空身份——正好证明 connector 没把 ACI 改写成号码。
+    let uuid_read = request(
+        &mut client,
+        "identity-peer-read-uuid",
+        "identities.get",
+        json!({
+            "accountId": account_id,
+            "peerKey": "99999999-9999-9999-9999-999999999999"
+        }),
+    )
+    .await;
+    assert_eq!(
+        uuid_read["result"]["identity"],
+        Value::Null,
+        "{uuid_read:?}"
+    );
+
+    // 读面绝不顺手建行：无会话 peer 的读之后列表长度不变。
+    let listed = request(
+        &mut client,
+        "identity-list-after-peer-read",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 100 }),
+    )
+    .await;
+    let items = listed["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("conversations.list items: {listed:?}"));
+    assert_eq!(
+        items.len(),
+        count_before,
+        "the peerKey read must never materialize a conversation: {listed:?}"
+    );
+    // 写穿投影读面：同一个 peer 的 direct 行，verified 位跟着写臂走。此刻
+    // 它还停在前一条会话面 reset 写的 TRUSTED_UNVERIFIED（false）。
+    let row = items
+        .iter()
+        .find(|row| row["id"] == conversation_id.as_str())
+        .unwrap_or_else(|| panic!("the safety peer's row must be listed: {listed:?}"));
+    assert_eq!(
+        row["verified"],
+        json!(false),
+        "the reset arm's TRUSTED_UNVERIFIED stamp reads false: {row:?}"
+    );
+
+    // verified 臂：peerKey 上 wire 的数字写穿成 TRUSTED_VERIFIED（投影 true）。
+    let peer_verified = request(
+        &mut client,
+        "identity-peer-verify-safety-number",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "peerKey": "+15555550103",
+            "safetyNumber": "12345 67890 12345 67890 12345 67890 12345 67890 12345 67890 12345 67890"
+        }),
+    )
+    .await;
+    assert_eq!(
+        peer_verified["result"]["status"], "verified",
+        "the peerKey verified arm answers: {peer_verified:?}"
+    );
+    let listed = request(
+        &mut client,
+        "identity-list-after-peer-verified",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 100 }),
+    )
+    .await;
+    let row = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == conversation_id.as_str())
+        .expect("the safety peer's row");
+    assert_eq!(
+        row["verified"],
+        json!(true),
+        "the peerKey verified arm writes TRUSTED_VERIFIED through: {row:?}"
+    );
+
+    // state 臂：sendAnyway 的信任重置按同一 peer 引用写穿 TRUSTED_UNVERIFIED
+    // （false）——绝不冒充 verified。
+    let peer_reset = request(
+        &mut client,
+        "identity-peer-verify-default",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "peerKey": "+15555550103",
+            "state": "default"
+        }),
+    )
+    .await;
+    assert_eq!(
+        peer_reset["result"]["status"], "verified",
+        "the peerKey trust-reset arm answers: {peer_reset:?}"
+    );
+    let listed = request(
+        &mut client,
+        "identity-list-after-peer-reset",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 100 }),
+    )
+    .await;
+    let row = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == conversation_id.as_str())
+        .expect("the safety peer's row");
+    assert_eq!(
+        row["verified"],
+        json!(false),
+        "the peerKey state arm writes TRUSTED_UNVERIFIED (false, never a verified \
+         flip) through: {row:?}"
+    );
+
+    // 写面的 wire 形状：peer 引用逐字上 wire（state 臂无数字；verified 臂带
+    // 数字，uuid 形态同样逐字——connector 不做地址换算）。
+    let before = send_log().len();
+    let uuid_verified = request(
+        &mut client,
+        "identity-peer-verify-uuid",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "peerKey": "99999999-9999-9999-9999-999999999999",
+            "safetyNumber": "12345 67890 12345 67890 12345 67890 12345 67890 12345 67890 12345 67890"
+        }),
+    )
+    .await;
+    assert_eq!(uuid_verified["result"]["status"], "verified");
+    let calls = send_log();
+    assert_eq!(calls.len(), before + 1, "one trust write per request");
+    let write = calls.last().unwrap();
+    assert_eq!(write["account"], "+15555550100");
+    assert_eq!(
+        write["recipient"], "99999999-9999-9999-9999-999999999999",
+        "the ACI rides verbatim, never rewritten into a number"
+    );
+    assert!(write.get("trustAllKnownKeys").is_none());
+
+    // 寻址恰一：双缺 / 同置都是 INVALID_REQUEST（两个面各一遍）。
+    for (request_id, method, params) in [
+        (
+            "peer-get-both-forms",
+            "identities.get",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "peerKey": "+15555550103"
+            }),
+        ),
+        (
+            "peer-get-neither-form",
+            "identities.get",
+            json!({ "accountId": account_id }),
+        ),
+        (
+            "peer-get-bare-digits",
+            "identities.get",
+            json!({ "accountId": account_id, "peerKey": "15555550103" }),
+        ),
+        (
+            "peer-get-group-key",
+            "identities.get",
+            json!({ "accountId": account_id, "peerKey": "ZmFrZS1ncm91cC0x" }),
+        ),
+        (
+            "peer-verify-both-forms",
+            "identities.verify",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "peerKey": "+15555550103",
+                "safetyNumber": "12345 67890"
+            }),
+        ),
+        (
+            "peer-verify-neither-form",
+            "identities.verify",
+            json!({ "accountId": account_id, "state": "default" }),
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, method, params).await;
+        assert_eq!(
+            rejected["error"]["code"], "INVALID_REQUEST",
+            "{request_id}: {rejected:?}"
+        );
+    }
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
@@ -12071,23 +12477,26 @@ async fn avatar_and_blocked_write_faces_round_trip() {
     // (the pin face's materialize-then-call discipline): each sentinel is
     // first materialized as a real local conversation by a send to that
     // peerKey, so the local ladder passes and the fixture sees the sentinel
-    // as the forwarded peer reference.
+    // as the forwarded peer reference. The sentinels are legal E.164 numbers
+    // (+155555509xx, the fixture's sentinel family) because the direct
+    // peerKey face only admits an ACI UUID or a phone number (§4.253 词形闸)
+    // — a bracketed token is refused before any upstream call.
     for (request_id, sentinel, expected_code, retryable) in [
         (
             "avatar-unavailable",
-            "[fixture-avatar-unavailable]",
+            "+15555550991",
             "AVATAR_UNAVAILABLE",
             false,
         ),
         (
             "avatar-fetch-failed",
-            "[fixture-avatar-failed]",
+            "+15555550992",
             "AVATAR_FETCH_FAILED",
             true,
         ),
         (
             "avatar-too-large",
-            "[fixture-avatar-large]",
+            "+15555550993",
             "AVATAR_TOO_LARGE",
             false,
         ),
@@ -12282,17 +12691,18 @@ async fn avatar_and_blocked_write_faces_round_trip() {
     // CONVERSATION_NOT_RESOLVED passes through verbatim (retryable=false)
     // and STORAGE_UNAVAILABLE verbatim (retryable=true): the sentinels ride
     // materialized conversations whose peer reference the fixture answers
-    // on, the pin face's discipline.
+    // on, the pin face's discipline — legal E.164 sentinels (+155555509xx),
+    // since the direct peerKey face refuses any other spelling (§4.253).
     for (request_id, sentinel, expected_code, retryable) in [
         (
             "blocked-unresolved",
-            "[fixture-blocked-unresolved]",
+            "+15555550995",
             "CONVERSATION_NOT_RESOLVED",
             false,
         ),
         (
             "blocked-storage",
-            "[fixture-blocked-unavailable]",
+            "+15555550994",
             "STORAGE_UNAVAILABLE",
             true,
         ),
@@ -12347,8 +12757,8 @@ async fn avatar_and_blocked_write_faces_round_trip() {
         json!({
             "accountId": account_id,
             "kind": "contact",
-            "peerKey": "[fixture-blocked-crash]",
-            "text": "[fixture-blocked-crash]",
+            "peerKey": "+15555550996",
+            "text": "+15555550996",
             "clientRequestId": "blocked-crash-0"
         }),
     )
@@ -12379,7 +12789,7 @@ async fn avatar_and_blocked_write_faces_round_trip() {
     // No-retry audit: exactly one crashing blocked call across the restart.
     let crash_calls: Vec<Value> = send_log()
         .into_iter()
-        .filter(|params| params["conversationId"] == "[fixture-blocked-crash]")
+        .filter(|params| params["conversationId"] == "+15555550996")
         .collect();
     assert_eq!(
         crash_calls.len(),
@@ -16424,5 +16834,95 @@ async fn group_receipt_finds_the_group_row_and_serves_the_ledger() {
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// 契约 1.283（§4.267）events.list 的 wire 面：冷启动 → reset、带 token 续读 →
+/// 不 reset、旧代际 → tokenMismatch、越界游标 → aheadOfLog，以及四类畸形参数
+/// 在宿主面 fail-closed（不是被静默忽略）。
+#[tokio::test]
+async fn events_list_answers_the_ledger_cursor_face_over_the_wire() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [41_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    // A bare request is a cold start: a reset that carries no events and names
+    // the token the caller must present from now on.
+    let cold = request(&mut client, "events-cold", "events.list", json!({})).await;
+    assert!(cold.get("error").is_none(), "{cold}");
+    let result = &cold["result"];
+    assert_eq!(result["reset"], json!(true));
+    assert_eq!(result["resetReason"], json!("coldStart"));
+    assert_eq!(result["trimmedThroughSeq"], json!(0));
+    assert_eq!(result["events"], json!([]));
+    assert_eq!(result["nextAfterSeq"], json!(0));
+    assert_eq!(result["truncated"], json!(false));
+    let token = result["token"].as_str().expect("token").to_string();
+    assert_eq!(token.len(), 32, "one 16-byte generation stamp");
+
+    // The same generation resumes: no reset, an empty page, and the cursor
+    // stays where it was.
+    let resumed = request(
+        &mut client,
+        "events-resume",
+        "events.list",
+        json!({ "afterSeq": 0, "token": token, "limit": 10 }),
+    )
+    .await;
+    assert_eq!(resumed["result"]["reset"], json!(false), "{resumed}");
+    assert!(resumed["result"].get("resetReason").is_none());
+    assert_eq!(resumed["result"]["events"], json!([]));
+    assert_eq!(resumed["result"]["nextAfterSeq"], json!(0));
+
+    // A token this ledger never minted means its generation rotated.
+    let stale = request(
+        &mut client,
+        "events-stale",
+        "events.list",
+        json!({ "afterSeq": 0, "token": "00000000000000000000000000000000" }),
+    )
+    .await;
+    assert_eq!(stale["result"]["reset"], json!(true));
+    assert_eq!(stale["result"]["resetReason"], json!("tokenMismatch"));
+    assert_eq!(stale["result"]["events"], json!([]));
+
+    // A cursor ahead of every assigned seq belongs to a ledger that is gone.
+    let ahead = request(
+        &mut client,
+        "events-ahead",
+        "events.list",
+        json!({ "afterSeq": 9, "token": token }),
+    )
+    .await;
+    assert_eq!(ahead["result"]["reset"], json!(true));
+    assert_eq!(ahead["result"]["resetReason"], json!("aheadOfLog"));
+
+    // Malformed cursors fail closed at the host face.
+    let oversized = "f".repeat(129);
+    for (id, params) in [
+        ("events-negative", json!({ "afterSeq": -1 })),
+        ("events-zero-limit", json!({ "limit": 0 })),
+        ("events-over-limit", json!({ "limit": 501 })),
+        ("events-long-token", json!({ "token": oversized })),
+        ("events-unknown-key", json!({ "since": 1 })),
+    ] {
+        let rejected = request(&mut client, id, "events.list", params).await;
+        assert_eq!(
+            rejected["error"]["code"],
+            json!("INVALID_REQUEST"),
+            "request {id} must fail closed: {rejected}"
+        );
+    }
+
+    drop(client);
     assert_clean_exit(&mut connector).await;
 }

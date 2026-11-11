@@ -289,7 +289,11 @@ fn init_tracing() {
 async fn main() {
     init_tracing();
     let cli = Cli::parse();
-    let result = match cli.command {
+    // The fatal handler needs the typed error, not just its message: the
+    // launcher's structured lines (KT_FATAL ...) are rendered from the error
+    // class itself (contract revision 1.284, §4.268), so the store error must
+    // survive the `?` chain instead of being flattened to a string here.
+    let result: Result<(), Box<dyn std::error::Error>> = match cli.command {
         CliCommand::Serve {
             endpoint,
             listen,
@@ -305,25 +309,26 @@ async fn main() {
             per_account_engines,
             signal_data_dir,
             state_dir,
-        } => serve_command(ServeOptions {
-            endpoint,
-            listen,
-            bootstrap_secret_file,
-            bootstrap_secret_stdin,
-            parent_pid,
-            engine_bin,
-            java_home,
-            socks_proxy,
-            proxy_group,
-            media_ingest,
-            expire_sweep_interval_ms,
-            per_account_engines,
-            signal_data_dir,
-            state_dir,
-        })
-        .await
-        .map_err(|error| error.to_string()),
-        CliCommand::Package { command } => package_command(command),
+        } => {
+            serve_command(ServeOptions {
+                endpoint,
+                listen,
+                bootstrap_secret_file,
+                bootstrap_secret_stdin,
+                parent_pid,
+                engine_bin,
+                java_home,
+                socks_proxy,
+                proxy_group,
+                media_ingest,
+                expire_sweep_interval_ms,
+                per_account_engines,
+                signal_data_dir,
+                state_dir,
+            })
+            .await
+        }
+        CliCommand::Package { command } => package_command(command).map_err(Into::into),
         CliCommand::MigratePool {
             signal_data_dir,
             state_dir,
@@ -337,17 +342,18 @@ async fn main() {
         ),
     };
     if let Err(error) = result {
-        // The final exit diagnostic: `error` is the classified message of the
-        // failing error type (Display is content-free across this crate).
-        tracing::error!(%error, "connector exiting with an error");
+        // The final exit diagnostic: the classified message of the failing
+        // error type (Display is content-free across this crate).
+        let message = error.to_string();
+        tracing::error!(error = %message, "connector exiting with an error");
         // Structured, machine-readable fatal cause for the launcher. This is
         // the only channel available when the store cannot open (the RPC
-        // socket never exists), so the desktop can map a rejected key to the
-        // repair surface instead of retrying the same spawn five times.
-        if error.contains("connector store key was rejected by the existing store") {
-            eprintln!("KT_FATAL code=STORE_KEY_REJECTED retryable=false");
-        } else if error.contains("connector store key is required") {
-            eprintln!("KT_FATAL code=STORE_KEY_REQUIRED retryable=false");
+        // socket never exists), so the desktop can map a rejected key — or a
+        // store written by a newer connector — to the repair surface instead
+        // of retrying the same spawn five times. The class owns its line; an
+        // error without a launcher contract prints nothing extra.
+        if let Some(line) = kt_signal_connector::store::fatal_line_for(error.as_ref()) {
+            eprintln!("{line}");
         }
         std::process::exit(1);
     }
@@ -615,10 +621,9 @@ fn migrate_pool_command(
     state_dir: &std::path::Path,
     dry_run: bool,
     bootstrap_secret_file: Option<&std::path::Path>,
-) -> Result<(), String> {
-    let _lock = datalock::DataDirLock::acquire("default", signal_data_dir)
-        .map_err(|error| error.to_string())?;
-    let key = match store_key_from_env().map_err(|error| error.to_string())? {
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _lock = datalock::DataDirLock::acquire("default", signal_data_dir)?;
+    let key = match store_key_from_env()? {
         Some(key) => Some(key),
         // Read line 2 without the launcher's read-and-destroy loader: the
         // desktop may still need that bootstrap file for its next launch.
@@ -627,11 +632,12 @@ fn migrate_pool_command(
             None => None,
         },
     };
-    let store = kt_signal_connector::store::Store::open(state_dir, key)
-        .map_err(|error| error.to_string())?;
-    let report = kt_signal_connector::migrate::run(&store, signal_data_dir, state_dir, dry_run)
-        .map_err(|error| error.to_string())?;
-    let rendered = serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?;
+    // The store error is deliberately not flattened: a newer-schema refusal is
+    // a launcher-visible class, and its fixed fatal line needs the numbers
+    // (contract revision 1.284, §4.268).
+    let store = kt_signal_connector::store::Store::open(state_dir, key)?;
+    let report = kt_signal_connector::migrate::run(&store, signal_data_dir, state_dir, dry_run)?;
+    let rendered = serde_json::to_string_pretty(&report)?;
     println!("{rendered}");
     Ok(())
 }

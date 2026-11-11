@@ -678,6 +678,18 @@ impl AccountPool {
         }
     }
 
+    /// O1: the first latched contract refusal across the pool's slots, if any.
+    /// Every slot spawns the same engine binary, so one refusal is the whole
+    /// pool's verdict.
+    pub async fn contract_fault(&self) -> Option<crate::engine_contract::EngineContractFault> {
+        for slot in self.slots() {
+            if let Some(fault) = slot.supervisor().latched_contract_fault().await {
+                return Some(fault);
+            }
+        }
+        None
+    }
+
     /// Stop every dynamic engine (runtime.stop), leaving the slots registered
     /// and cold so a later runtime.start can rebuild the resident window.
     pub async fn stop_all(&self) {

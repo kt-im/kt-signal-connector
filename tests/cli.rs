@@ -21,6 +21,80 @@ fn version_reports_package_version() {
     assert!(output.stderr.is_empty());
 }
 
+/// Contract revision 1.284 (§4.268): a store written by a newer connector
+/// fails the start with the fixed launcher line — `retryable=false` and both
+/// schema numbers — instead of collapsing into a generic "unavailable" that
+/// the desktop would retry.
+#[cfg(unix)]
+#[test]
+fn a_newer_store_schema_fails_the_start_with_the_fixed_fatal_line() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const KEY: [u8; 32] = [0x5A; 32];
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let state_dir = temp.path().join("state");
+    let signal_data = temp.path().join("signal-data");
+    let store = kt_signal_connector::store::Store::open(
+        &state_dir,
+        Some(kt_signal_connector::store::StoreKey::from_bytes(KEY)),
+    )
+    .expect("seed store");
+    let store_path = store.path().to_path_buf();
+    drop(store);
+
+    // A newer connector's migration would leave this stamp; write it through
+    // the same SQLCipher engine and raw-key form the store itself uses.
+    let current = kt_signal_connector::store::SCHEMA_VERSION + 1;
+    let key_spec = format!("x'{}'", "5a".repeat(32));
+    let conn = rusqlite::Connection::open(&store_path).unwrap();
+    conn.execute_batch(&format!("PRAGMA key = \"{key_spec}\";"))
+        .unwrap();
+    conn.execute(
+        "UPDATE meta SET value=?1 WHERE key='schema_version'",
+        [current.to_string()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let secret_file = temp.path().join("bootstrap.secret");
+    fs::write(
+        &secret_file,
+        format!("{}\n{}", "11".repeat(32), "5a".repeat(32)),
+    )
+    .unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"))
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(temp.path().join("connector.sock"))
+        .arg("--bootstrap-secret-file")
+        .arg(&secret_file)
+        .arg("--engine-bin")
+        .arg(temp.path().join("fake-engine"))
+        .arg("--signal-data-dir")
+        .arg(&signal_data)
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .env_remove("KT_SIGNAL_STORE_KEY")
+        .output()
+        .expect("connector binary runs");
+
+    assert_eq!(output.status.code(), Some(1), "the start fails closed");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    let expected = format!(
+        "KT_FATAL code=STORE_SCHEMA_NEWER retryable=false current={current} supported={}",
+        kt_signal_connector::store::SCHEMA_VERSION
+    );
+    assert!(
+        stderr.lines().any(|line| line == expected),
+        "the fixed fatal line must ride stderr, got: {stderr}"
+    );
+    // The refusal is recorded for the next run and the doctor; the store keeps
+    // its newer stamp — the start never attempts a downgrade.
+    assert!(state_dir.join("schema-newer.json").is_file());
+}
+
 #[test]
 fn missing_command_fails_closed() {
     let output = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"))

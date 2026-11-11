@@ -20,6 +20,19 @@ if os.environ.get("KT_FAKE_EXPECT_NO_JAVA") is not None:
         sys.exit(94)
 
 
+# O1 engine contract handshake fixture. The connector asks a freshly started
+# engine who it is (`version`) and which contract revision it implements
+# (`engine.protocolCapabilities.contractRevision`). Defaults reproduce the
+# pre-handshake engine: a real identity with no stated revision, which the
+# connector serves as `legacy`. Tests opt into the other rows:
+#   KT_FAKE_ENGINE_CONTRACT_REVISION=<rev>  stated revision (e.g. "1.284")
+#   KT_FAKE_ENGINE_NO_CAPABILITIES=1        capabilities answers the upstream
+#                                           error class (a pre-face engine)
+#   KT_FAKE_ENGINE_VERSION_ERROR=1          version answers an error
+#   KT_FAKE_ENGINE_VERSION_DELAY_MS=<n>     version answers after n ms
+#                                           (past the 5s probe budget)
+ENGINE_VERSION = os.environ.get("KT_FAKE_ENGINE_VERSION") or "0.1.0-fixture"
+
 LINKED_ACCOUNT = "+15555550100"
 ACTIVE_LINK_URI = "sgnl://link?uuid=fixture&pub_key=fixture"
 WRITE_LOCK = threading.Lock()
@@ -409,6 +422,19 @@ SEND_UNAVAILABLE_DONE = SIGNAL_DATA_DIR / ".fixture-send-unavailable-done"
 # normally.
 SEND_RATELIMIT_ARMED = SIGNAL_DATA_DIR / ".fixture-send-ratelimit-armed"
 SEND_RATELIMIT_DONE = SIGNAL_DATA_DIR / ".fixture-send-ratelimit-done"
+# Contract 1.285 (§4.269) test hook: one-shot dispatch-timeout send answer.
+# A test arms it by touching .fixture-send-engine-timeout-armed in this
+# engine's own data dir; the FIRST send then answers the engine's real
+# -32000 (EngineTimeoutException) face with its promised data, the done
+# marker records the one-shot, and every later send answers normally. The
+# connector must fold a mutating timeout to the existing unknown outcome.
+ENGINE_TIMEOUT_ARMED = SIGNAL_DATA_DIR / ".fixture-send-engine-timeout-armed"
+ENGINE_TIMEOUT_DONE = SIGNAL_DATA_DIR / ".fixture-send-engine-timeout-done"
+# Contract 1.285 (§4.269) read-only counterpart: the version probe answers
+# the same -32000 (EngineTimeoutException) face while this marker exists, so
+# a test can prove a READ-ONLY cancellation keeps the structured timeout face
+# (ENGINE_TIMEOUT) instead of folding to the unknown outcome.
+VERSION_TIMEOUT_MARKER = SIGNAL_DATA_DIR / ".fixture-version-engine-timeout"
 ACCOUNT_LINKED = not DELETED_MARKER.exists()
 
 # Multi-account mode (optimization-plan §6.4 M3.3 tests and the soak driver's
@@ -819,6 +845,94 @@ for line in sys.stdin:
         time.sleep(3600)
         continue
 
+    # O1 handshake faces. Both are read-only, account-free, zero-network,
+    # exactly like the engine's own registration (compat §3).
+    if method == "version":
+        if VERSION_TIMEOUT_MARKER.exists():
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                    "data": {
+                        "reason": "REQUEST_TIMEOUT",
+                        "retryable": False,
+                        "timeoutMs": 60000,
+                    },
+                },
+            })
+            continue
+        if os.environ.get("KT_FAKE_ENGINE_VERSION_ERROR"):
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "fixture: the engine does not carry the version face",
+                },
+            })
+            continue
+        response = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"name": "kt-signal-engine", "version": ENGINE_VERSION},
+        }
+        delay_ms = int(os.environ.get("KT_FAKE_ENGINE_VERSION_DELAY_MS", "0") or "0")
+        if delay_ms > 0:
+            threading.Thread(
+                target=emit_json_after,
+                args=(response, delay_ms / 1000),
+                daemon=True,
+            ).start()
+            continue
+        emit_json(response)
+        continue
+    if method == "engine.protocolCapabilities":
+        if os.environ.get("KT_FAKE_ENGINE_NO_CAPABILITIES"):
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "fixture: engine predates the self-certification face",
+                },
+            })
+            continue
+        payload = {
+            "deviceCapabilities": {
+                "storage": True,
+                "transfer": False,
+                "attachmentBackfill": True,
+                "spqr": True,
+                "profiles_v2": False,
+                "usernameChangeSyncMessage": True,
+                "versionedExpirationTimer": False,
+                "optionalPhoneNumber": False,
+            },
+            "deviceCapabilitiesUpload": {
+                "attachmentBackfill": True,
+                "spqr": True,
+                "usernameChangeSyncMessage": True,
+                "optionalPhoneNumber": False,
+            },
+            "linkCapabilities": {
+                "attachmentBackfill": False,
+                "spqr": False,
+                "usernameChangeSyncMessage": False,
+            },
+            "baseline": {
+                "presageRev": "fixture",
+                "libsignalVersion": "fixture",
+                "libsignalCommit": "fixture",
+            },
+        }
+        revision = os.environ.get("KT_FAKE_ENGINE_CONTRACT_REVISION")
+        if revision:
+            payload["contractRevision"] = revision
+        emit_json({"jsonrpc": "2.0", "id": request_id, "result": payload})
+        continue
+
     if method == "armDelayedReceive":
         # Regression fixture for the stdin writer task (A7): emit a receive
         # notification after a delay without reading anything else from stdin,
@@ -840,6 +954,26 @@ for line in sys.stdin:
                 "error": {"code": -1, "message": "Unknown device link uri."},
             }
             emit_json(response)
+            continue
+        # Link-finish budget fixture: the engine's own dispatch budget (360 s)
+        # is the deadline that fires first in production; the connector's 370 s
+        # is the outer backstop. Answer that face on demand so the suite can
+        # prove the fold to the link-class unknown outcome without waiting out
+        # a real budget.
+        if os.environ.get("KT_FAKE_FINISH_ENGINE_TIMEOUT") == "1":
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                    "data": {
+                        "reason": "REQUEST_TIMEOUT",
+                        "retryable": False,
+                        "timeoutMs": 360000,
+                    },
+                },
+            })
             continue
         if params.get("deviceName") == "[slow-link-test]":
             continue
@@ -1179,6 +1313,28 @@ for line in sys.stdin:
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        # Contract 1.285 §4.269 one-shot dispatch-timeout answer: the real
+        # engine's -32000 (EngineTimeoutException) face with its promised
+        # data. A mutating send that receives it may already have been
+        # written, so the connector must fold it to the existing unknown
+        # outcome — the row settles unknown, never failed, no auto retry.
+        if ENGINE_TIMEOUT_ARMED.exists() and not ENGINE_TIMEOUT_DONE.exists():
+            ENGINE_TIMEOUT_DONE.touch()
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                    "data": {
+                        "reason": "REQUEST_TIMEOUT",
+                        "retryable": False,
+                        "timeoutMs": 60000,
+                    },
+                },
             }
             emit_json(response)
             continue
@@ -2783,8 +2939,18 @@ for line in sys.stdin:
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
-        digits = (params.get("verifiedSafetyNumber") or "").replace(" ", "")
-        if digits != "123456789012345678901234567890123456789012345678901234567890":
+        # 契约 §4.223 两臂：verifiedSafetyNumber（比对闸）或 state="default"
+        # （sendAnyway 信任重置，引擎 (None, Some("default")) 臂，无比对）。
+        # 两臂恰一——同置/双缺/词表外 state 是引擎的 fail-closed 面，fixture
+        # 逐字回 -1。
+        state = params.get("state")
+        verified = params.get("verifiedSafetyNumber")
+        digits = (verified or "").replace(" ", "")
+        if state is not None:
+            ok = state == "default" and verified is None
+        else:
+            ok = digits == "123456789012345678901234567890123456789012345678901234567890"
+        if not ok:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2796,13 +2962,17 @@ for line in sys.stdin:
     elif method == "getAvatar":
         # Contract 1.48 §4.47 avatar download: read face, no SEND_LOG
         # dispatch recording (read-lane discipline, listContacts precedent).
-        # Sentinel conversationIds: "[fixture-avatar-unavailable]" answers
-        # AVATAR_UNAVAILABLE (the honest no-avatar), "[fixture-avatar-failed]"
-        # answers AVATAR_FETCH_FAILED, "[fixture-avatar-large]" answers
-        # AVATAR_TOO_LARGE — all three disjoint from every other face's
-        # magic.
+        # Sentinel conversationIds answer the structured avatar error faces:
+        # +15555550991 → AVATAR_UNAVAILABLE (the honest no-avatar),
+        # +15555550992 → AVATAR_FETCH_FAILED, +15555550993 →
+        # AVATAR_TOO_LARGE — the 509xx sentinel family, disjoint from every
+        # other face's magic. They stay legal wire shapes on purpose: the
+        # sentinel reaches this face as the conversation row's peer reference,
+        # and the direct peerKey face only admits an ACI UUID or an E.164
+        # number (§4.253 词形闸), so a bracketed token could never be
+        # materialized into a conversation in the first place.
         conversation_id = params.get("conversationId")
-        if conversation_id == "[fixture-avatar-unavailable]":
+        if conversation_id == "+15555550991":
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2810,7 +2980,7 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
-        if conversation_id == "[fixture-avatar-failed]":
+        if conversation_id == "+15555550992":
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2818,7 +2988,7 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
-        if conversation_id == "[fixture-avatar-large]":
+        if conversation_id == "+15555550993":
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2875,16 +3045,17 @@ for line in sys.stdin:
         # Contract 1.48 §4.47 blocked write: record the exact upstream params
         # (tests assert the resolved conversationId/kind/blocked contract),
         # apply the write to the fixture blocked state, answer the post-write
-        # full list. ConversationId sentinels: "[fixture-blocked-unavailable]"
-        # answers STORAGE_UNAVAILABLE, "[fixture-blocked-unresolved]" answers
-        # CONVERSATION_NOT_RESOLVED, "[fixture-blocked-crash]" crashes with
-        # the mutating call in flight (os._exit(32); disjoint from
-        # 25/29/30/31).
+        # full list. ConversationId sentinels (the 509xx E.164 family — the
+        # value arrives as the row's peer reference, and the direct peerKey
+        # face only admits an ACI UUID or a phone number, §4.253 词形闸):
+        # +15555550994 answers STORAGE_UNAVAILABLE, +15555550995 answers
+        # CONVERSATION_NOT_RESOLVED, +15555550996 crashes with the mutating
+        # call in flight (os._exit(32); disjoint from 25/29/30/31).
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
         conversation_id = params.get("conversationId")
-        if conversation_id == "[fixture-blocked-unavailable]":
+        if conversation_id == "+15555550994":
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2892,7 +3063,7 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
-        if conversation_id == "[fixture-blocked-unresolved]":
+        if conversation_id == "+15555550995":
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2900,7 +3071,7 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
-        if conversation_id == "[fixture-blocked-crash]":
+        if conversation_id == "+15555550996":
             os._exit(32)
         conversation_id = params.get("conversationId")
         kind = params.get("kind")

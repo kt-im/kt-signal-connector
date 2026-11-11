@@ -17,7 +17,10 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 47;
+/// The schema version this binary brings a store to. Public because the store
+/// health face (contract revision 1.282) reports both the version the store
+/// answered and this target, and callers must not re-derive one from the other.
+pub const SCHEMA_VERSION: i64 = 50;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -64,12 +67,73 @@ const PLAINTEXT_BACKUP_SUFFIX: &str = ".plaintext-backup";
 const MIGRATION_STAGING_SUFFIX: &str = ".encrypting";
 /// Phase 3 retention: how long the plaintext migration backup is kept.
 pub const PLAINTEXT_BACKUP_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// Contract revision 1.282 (§4.266, store upgrade safety): the directory the
+/// pre-migration snapshots live in, beside the store it copies.
+const SNAPSHOT_DIR: &str = "migration-snapshots";
+/// How many pre-migration snapshots are kept. Three is the window an operator
+/// can still bisect by hand after a bad upgrade; a retry loop that fails every
+/// start must not turn that window into a disk leak.
+const SNAPSHOT_KEEP: usize = 3;
+/// Hard byte ceiling for the whole snapshot directory. One copy of a
+/// desktop-sized store is tens of megabytes at worst; the ceiling is what keeps
+/// "keep the newest N" bounded by bytes as well as by count.
+const SNAPSHOT_BYTES_CAP: u64 = 256 * 1024 * 1024;
+/// Bound on one directory walk while assembling the health face. Retention
+/// already holds the directory to `SNAPSHOT_KEEP`, so this only caps a state
+/// directory some other tool has littered.
+const MAX_SNAPSHOT_SCAN: usize = 64;
+/// The diagnostic marker a failed migration leaves behind. The failing process
+/// dies with its error, so this file is the only thing the next run and the
+/// doctor can read: opaque schema numbers, the rollback outcome, and the
+/// snapshot's own file name — never a path, a number, an ACI, or a key.
+const MIGRATION_FAILURE_FILE: &str = "schema-migration-failure.json";
+/// `meta` key recording which SQLCipher build last opened the store, so an
+/// encryption-library upgrade that leaves the schema unchanged still takes its
+/// integrity check and snapshot before it touches anything.
+const CIPHER_VERSION_KEY: &str = "store_cipher_version";
+/// Bound on the failure marker read: the file this module writes is a few
+/// hundred bytes, and anything larger is not ours.
+const MAX_MIGRATION_FAILURE_BYTES: u64 = 8 * 1024;
+/// The diagnostic marker a refused open leaves behind when the store was
+/// written by a **newer** connector (contract revision 1.284, §4.268). The
+/// refusing process exits with its error, so this file is the only thing a
+/// later doctor run can read; it carries two schema numbers and a stamp, never
+/// a path, a number-keyed id, or key material.
+const SCHEMA_NEWER_FILE: &str = "schema-newer.json";
+/// Bound on the schema-newer marker read, same discipline as the migration
+/// failure marker: anything larger is not a file this module wrote.
+const MAX_SCHEMA_NEWER_BYTES: u64 = 8 * 1024;
 /// §4.119 stopgap: how far back the absent-mode receipt selection reaches.
 /// The upstream rejects receipt timestamps older than a few days, so resupply
 /// past this age is protocol-meaningless; seven days keeps the honest
 /// late-receipt margin (an offline stretch, a clock delivered late) while
 /// never replaying last week's rows.
 const RECEIPT_RECENCY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// 契约 1.283（§4.267）：事件账本的头部保留窗。三条上限任一触发就从头裁剪：
+/// 7 天、20000 行、64 MiB（按 EVENT_ROW_BYTES_SQL 的行成本估算）。7 天对齐
+/// 桌面「离线一周回来仍能靠事件补齐」的重连预期；20000 行是一条事件流的有界
+/// 长度；64 MiB 是账本文件的硬上限——三个数都是产品决定，不是实现细节。
+pub const EVENT_LOG_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+pub const EVENT_LOG_MAX_ROWS: i64 = 20_000;
+pub const EVENT_LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// 一次 events.list 的响应字节预算（序列化后的 JSON 帧）：4 MiB。事件行只有
+/// 几十字节，这个预算真正约束的是异常大的 type 词与超长 page——一页永远装得
+/// 下，但「装得下」由字节数证明，不由 limit 一厢情愿。
+pub const EVENT_PAGE_BYTE_BUDGET: u64 = 4 * 1024 * 1024;
+/// A page's default and hard limit. The reader also stops on the byte budget,
+/// so a caller asking for 500 rows still gets a bounded answer.
+pub const EVENT_PAGE_DEFAULT_LIMIT: u32 = 100;
+pub const EVENT_PAGE_MAX_LIMIT: u32 = 500;
+/// The ledger token's wire bound: one 32-char hex generation stamp, with room
+/// for a future encoding. Anything longer is not a token this connector
+/// minted, so the request fails closed instead of being compared.
+pub const EVENT_TOKEN_MAX_CHARS: usize = 128;
+/// 行成本估算（字节）：seq/epoch/created_at 三个整数（各按 9 字节 varint 上限
+/// 计）+ 类型词 + 账号 id + 12 字节的行/页框开销。**同一表达式**既算 64 MiB 的
+/// 保留窗，也算 doctor 报的账本字节数，所以两个面永远同一个口径。
+const EVENT_ROW_BYTES_SQL: &str = "(27 + LENGTH(type) + COALESCE(LENGTH(account_id), 0) + 12)";
 
 /// The absent-mode receipt selection's resupply boundary (§4.119, §4.163):
 /// which stamp already marks a row as receipted, so the selection never
@@ -316,6 +380,28 @@ CREATE INDEX IF NOT EXISTS messages_account_sent_at
   ON messages(account_id, sent_at);
 CREATE INDEX IF NOT EXISTS conversations_account_last_message
   ON conversations(account_id, last_message_at DESC, id DESC);
+-- 契约 1.279（§4.263）+ 1.280（§4.264）：出站附件的原始 data URI 持久化面。
+-- 失败重试不再依赖桌面内存里的 payload——首发时把构建好的 data URI 落一行，
+-- 失败/unknown 保留、成功删除，刷新/重启后仍可按原 clientRequestId 重试。
+-- 主键是 (account_id, client_request_id, attachment_index)：client_request_id 与
+-- messages 的幂等键同值，但它只在**一个账号内**幂等——两个账号可以用同一个
+-- clientRequestId，各自必须能写、也必须读回自己的字节，所以账号是主键的第一
+-- 段。attachment_index 是这条附件在消息 attachments 数组里的位置（单附件恒为
+-- 0，多附件 0..n-1），所以一条多附件消息的每个条目各有一行，ids-only 重试按
+-- index 排序即可重建整组字节。conversation_id 供级联清理与观测使用。
+CREATE TABLE IF NOT EXISTS outgoing_attachment_payloads (
+  account_id TEXT NOT NULL,
+  client_request_id TEXT NOT NULL,
+  attachment_index INTEGER NOT NULL,
+  conversation_id TEXT NOT NULL,
+  data_uri TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, client_request_id, attachment_index),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS outgoing_attachment_payloads_account
+  ON outgoing_attachment_payloads(account_id, conversation_id);
 CREATE TABLE IF NOT EXISTS account_delete_operations (
   operation_id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL,
@@ -504,15 +590,28 @@ CREATE TABLE IF NOT EXISTS inbound_skipped (
   skipped_at INTEGER NOT NULL,
   PRIMARY KEY(account_id, engine_epoch, seq)
 );
+-- 契约 1.283（§4.267）：thin ledger。事件表只留「变了什么」的指针
+-- （seq/epoch/account_id/type/created_at），payload 不再落库——回放消费方
+-- 看到一行就去 store 重读实体，事件本身不做投影。行宽从正文量级降到几十字节，
+-- 7 天/20000 行/64 MiB 的头部保留窗才有意义。
 CREATE TABLE IF NOT EXISTS event_log (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   epoch INTEGER NOT NULL,
   account_id TEXT,
   type TEXT NOT NULL,
-  payload TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS event_log_account ON event_log(account_id, seq);
+-- 契约 1.283（§4.267）：账本状态单行。token 是代际凭据（轮换 = 订阅方必须
+-- 重置并从 floor 重放），floor 是已裁剪水位（seq <= floor 的行不再存在），
+-- generation 只是给 doctor/metrics 的单调计数——token 原文不进诊断面。
+CREATE TABLE IF NOT EXISTS event_log_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  token TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  floor INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS event_cursor (
   subscriber TEXT PRIMARY KEY,
   cursor INTEGER NOT NULL,
@@ -555,6 +654,14 @@ const MAX_MESSAGES_PER_CONVERSATION: i64 = 2_000;
 const MAX_PLAINTEXT_REACTION_ROWS_PER_CONVERSATION: u64 = 250_000;
 /// Retention: age past which a message is no longer kept.
 const MESSAGE_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
+/// 契约 1.279（§4.263）：出站附件原始 payload 的保留期。payload 只服务失败重试，
+/// 不是渲染缓存；30 天后即便行还在也不再保证可重试（桌面仍可带 bytes 重试）。
+/// 成功结算会立即删除，账号/会话/消息级联也一并删除，这个期限只兜底孤儿行。
+const OUTGOING_ATTACHMENT_PAYLOAD_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+/// 孤儿 payload 的清理宽限：prepare 先写 payload、再写消息行，两步之间有一个
+/// 极短的窗口；只有超过这个宽限仍无消息行的 payload 才按孤儿删除，避免把正在
+/// 首发的请求误清。
+const OUTGOING_ATTACHMENT_PAYLOAD_ORPHAN_GRACE_MS: i64 = 60 * 60 * 1_000;
 /// Preview length ingest stores for a conversation's newest message.
 const PREVIEW_CHARS: i64 = 120;
 /// Marks a message cursor that carries its own sort key.
@@ -665,6 +772,36 @@ pub enum StoreError {
     /// classified message is log-safe; the cause stays in the source chain.
     #[error("plaintext store migration to encrypted storage failed")]
     MigrationFailed(#[source] Option<Box<dyn std::error::Error + Send + Sync + 'static>>),
+    /// The pre-migration snapshot could not be taken, so the migration never
+    /// started (contract revision 1.282, §4.266). Distinct from
+    /// `MigrationFailed`: nothing was written, the store is untouched.
+    #[error("pre-migration store snapshot failed; nothing was migrated")]
+    SnapshotFailed(#[source] Option<Box<dyn std::error::Error + Send + Sync + 'static>>),
+    /// The store was written by a **newer** connector: its schema is above the
+    /// highest version this binary migrates to (contract revision 1.284,
+    /// §4.268). Never a downgrade and never a generic `Unavailable` — the two
+    /// numbers ride the classified answer so the launcher can say which side
+    /// is old, and `startup` turns them into the fixed KT_FATAL line.
+    #[error(
+        "connector store schema is newer than this build supports (current: {current}, supported: {supported})"
+    )]
+    SchemaNewer { current: i64, supported: i64 },
+    /// The schema ladder failed *after* its snapshot was taken. The message is
+    /// log-safe and says what the rollback did; the snapshot stays on disk, so
+    /// the store is either back on its old schema or explicitly reported as
+    /// unrestorable — never just "unavailable".
+    #[error(transparent)]
+    SchemaMigrationFailed(#[from] SchemaMigrationFailure),
+    /// The integrity gate could not read the store at all (a damaged page —
+    /// SQLCipher's page HMAC is the usual way this shows up — or an
+    /// unreadable header). Nothing about the contents can be proven, so
+    /// nothing is written.
+    #[error("connector store is corrupt: the integrity check could not read it")]
+    StoreCorrupt(#[source] Option<rusqlite::Error>),
+    /// The integrity gate ran and reported damage. The count is the only thing
+    /// carried: the checker's own text can quote page content.
+    #[error("connector store failed its integrity check with {0} finding(s)")]
+    StoreIntegrity(u32),
     /// Engine-pool S1: the per-account layout is inconsistent (a migration or
     /// linking step did not land). Startup fails closed instead of serving a
     /// half-migrated pool; the message names opaque account ids and counts,
@@ -693,9 +830,188 @@ impl StoreError {
             StoreError::StoreKeyRequired => "store_key_required",
             StoreError::StoreKeyRejected => "store_key_rejected",
             StoreError::MigrationFailed(_) => "migration_failed",
+            StoreError::SnapshotFailed(_) => "snapshot_failed",
+            StoreError::SchemaNewer { .. } => "store_schema_newer",
+            StoreError::SchemaMigrationFailed(_) => "schema_migration_failed",
+            StoreError::StoreCorrupt(_) => "corrupt",
+            StoreError::StoreIntegrity(_) => "integrity",
             StoreError::EnginePoolInvalid(_) => "engine_pool_invalid",
         }
     }
+}
+
+/// The fixed launcher-facing fatal line for an error this module owns
+/// (contract revision 1.284, §4.268). The launcher matches the shape byte for
+/// byte: `KT_FATAL code=<CODE> retryable=false`, plus the numbers that make the
+/// class actionable (`current=<n> supported=<n>` for a newer store).
+///
+/// `None` means "this class owns no launcher contract": the ordinary classified
+/// error line stays the only diagnostic, and nothing is invented for it.
+pub fn fatal_line_for(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let error = error.downcast_ref::<StoreError>()?;
+    Some(match error {
+        StoreError::SchemaNewer { current, supported } => format!(
+            "KT_FATAL code=STORE_SCHEMA_NEWER retryable=false current={current} supported={supported}"
+        ),
+        // The key classes predate this helper and keep their exact lines.
+        StoreError::StoreKeyRejected => {
+            "KT_FATAL code=STORE_KEY_REJECTED retryable=false".to_string()
+        }
+        StoreError::StoreKeyRequired => {
+            "KT_FATAL code=STORE_KEY_REQUIRED retryable=false".to_string()
+        }
+        _ => return None,
+    })
+}
+
+/// Refuse an open whose store is newer than this binary and leave the
+/// diagnostic marker behind (contract revision 1.284, §4.268). Writing the
+/// marker is best-effort: a refusal must not become a different failure just
+/// because the state directory is full.
+fn refuse_newer_schema(state_dir: &Path, current: i64) -> StoreError {
+    write_schema_newer(state_dir, current, SCHEMA_VERSION);
+    StoreError::SchemaNewer {
+        current,
+        supported: SCHEMA_VERSION,
+    }
+}
+
+/// A schema-ladder failure that happened after its pre-migration snapshot was
+/// taken (contract revision 1.282, §4.266).
+///
+/// `rollback` is one fixed literal: `restored` (the snapshot came back and the
+/// store is serving its old schema again) or `failed` (the store stays as the
+/// failed ladder left it — the snapshot is still on disk, so the operator can
+/// finish the restore by hand). Either way the snapshot is never deleted here.
+#[derive(Debug, Error)]
+#[error("schema migration failed (rollback: {rollback}); the pre-migration snapshot is kept")]
+pub struct SchemaMigrationFailure {
+    pub from: i64,
+    pub to: i64,
+    pub rollback: &'static str,
+    #[source]
+    pub cause: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+}
+
+/// One pre-migration `PRAGMA integrity_check` verdict, folded into exactly one
+/// fixed literal (contract revision 1.282, §4.266).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreIntegrity {
+    /// The checker answered exactly one `ok` row.
+    Ok,
+    /// The store could not be read at all, so the check itself failed.
+    Corrupt,
+    /// The checker ran and reported damage.
+    Integrity,
+    /// No check ran in this process: no migration (and no encryption-library
+    /// upgrade) was due, so the gate was not paid for. That is an honest
+    /// absence, not a health claim.
+    NotChecked,
+}
+
+impl StoreIntegrity {
+    pub fn literal(self) -> &'static str {
+        match self {
+            StoreIntegrity::Ok => "ok",
+            StoreIntegrity::Corrupt => "corrupt",
+            StoreIntegrity::Integrity => "integrity",
+            StoreIntegrity::NotChecked => "notChecked",
+        }
+    }
+}
+
+/// What this process did about a pre-migration snapshot. `lastResult` is one
+/// fixed literal; `lastFile` is the snapshot's own file name (a timestamp and
+/// two schema numbers), never a path.
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotStamp {
+    pub last_result: &'static str,
+    pub last_file: Option<String>,
+    pub last_at: Option<u64>,
+}
+
+impl SnapshotStamp {
+    fn not_needed() -> Self {
+        Self {
+            last_result: "notNeeded",
+            last_file: None,
+            last_at: None,
+        }
+    }
+}
+
+/// The store's read-only health face (contract revision 1.282, §4.266): the
+/// `runtime.doctor` `store` key and the periodic metrics line. Numbers and
+/// fixed literals only — never a path, a number-keyed id, or key material.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreHealth {
+    /// The schema version the live store answers (the target once a migration
+    /// has landed).
+    pub schema_version: i64,
+    /// The version this binary migrates to (`SCHEMA_VERSION`).
+    pub schema_target: i64,
+    /// `ok` | `corrupt` | `integrity` | `notChecked` — the last gate verdict
+    /// of this process, never a guess.
+    pub integrity: &'static str,
+    pub db_bytes: u64,
+    pub wal_bytes: u64,
+    pub snapshots: SnapshotHealth,
+    /// The last failed migration this state directory recorded, if any. Read
+    /// from the marker file, so it survives the process that failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_migration_failure: Option<MigrationFailureFace>,
+    /// The last refused open this state directory recorded because the store
+    /// was newer than that build (contract revision 1.284, §4.268). Read from
+    /// the marker file, so a later doctor run can still say what blocked the
+    /// previous start: the refusing process exits and never serves a payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_newer: Option<SchemaNewerFace>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotHealth {
+    pub count: u32,
+    pub bytes: u64,
+    /// `created` | `notNeeded` | `failed` — this process's own outcome.
+    pub last_result: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_at: Option<u64>,
+}
+
+/// The marker a failed migration leaves in the state directory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationFailureFace {
+    /// Wall-clock milliseconds; a diagnostic stamp, never a data timestamp.
+    pub at: u64,
+    pub from: i64,
+    pub to: i64,
+    /// `restored` | `failed`.
+    pub rollback: String,
+    /// The snapshot's file name (basename only), when one was taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+}
+
+/// The marker a refused open leaves in the state directory when the store was
+/// written by a newer connector (contract revision 1.284, §4.268).
+///
+/// Two schema numbers and a stamp: enough for the doctor's store face and for
+/// a support engineer reading the directory by hand, and nothing that could
+/// quote stored content. The marker is **not** cleared by a later successful
+/// open — it is the record of the last refusal, not a claim about the current
+/// schema — and the next refusal overwrites it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaNewerFace {
+    /// Wall-clock milliseconds; a diagnostic stamp, never a data timestamp.
+    pub at: u64,
+    /// The version the store answers.
+    pub current: i64,
+    /// The highest version this binary migrates to (`SCHEMA_VERSION`).
+    pub supported: i64,
 }
 
 #[derive(Debug, Error)]
@@ -2893,7 +3209,7 @@ pub struct AccountDeleteReceipt {
 /// Rows one account deletion counts and removes. Every table carries
 /// `account_id`; `message_receipts` is counted through its message row
 /// because it is message-scoped rather than account-scoped.
-const ACCOUNT_DELETE_TABLES: [&str; 13] = [
+const ACCOUNT_DELETE_TABLES: [&str; 15] = [
     "messages",
     "conversations",
     "contacts",
@@ -2907,6 +3223,12 @@ const ACCOUNT_DELETE_TABLES: [&str; 13] = [
     "history_imports",
     "history_import_stage_recipients",
     "history_import_stage_chats",
+    // 契约 1.279（§4.263）：账号删除一并清掉该账号的出站附件 payload，
+    // 计数进入 §4.197 回执（表自带 account_id）。
+    "outgoing_attachment_payloads",
+    // 契约 1.283（§4.267）：thin ledger 里该账号的事件行同样在删除事务内
+    // 显式清掉（表没有指向 accounts 的外键，不能指望级联），计数进回执。
+    "event_log",
 ];
 
 /// One completed direct-identity fold (contract 1.259, §4.243): the
@@ -2976,6 +3298,14 @@ pub struct Store {
     path: PathBuf,
     conn: Mutex<Connection>,
     readers: ReadPool,
+    /// The schema version this open landed on (contract revision 1.282): the
+    /// ladder only ever runs inside `open`, so this cannot go stale and the
+    /// health face never has to re-read `meta` under the writer lock.
+    schema_version: i64,
+    /// The integrity gate's verdict for this process.
+    integrity: StoreIntegrity,
+    /// The pre-migration snapshot this process took, if it took one.
+    snapshot: SnapshotStamp,
 }
 
 /// Contract 1.170 (§4.170): the number-keyed memo shell's mergeable state,
@@ -3018,8 +3348,23 @@ impl Store {
             (Some(key), DbFileState::Absent) => (key, false),
         };
         let conn = open_encrypted(&path, &key, preexisting)?;
+        // A connection setting, not a file write: the busy budget is set before
+        // the version read so a momentary writer can never be misread as "no
+        // schema yet" (which would send a newer store into the gate below).
         conn.busy_timeout(Duration::from_millis(250))
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // Contract revision 1.284 (§4.268): a store written by a newer
+        // connector is never opened, never downgraded, and never collapsed
+        // into a generic `Unavailable`. The check runs before any connection
+        // setting that can touch the file (the WAL pragma below rewrites the
+        // header of a store using another journal mode) and before the
+        // integrity gate, the snapshot, and every DDL — a refusal changes
+        // nothing, and it names both versions so the launcher can say which
+        // side is old instead of retrying the same spawn.
+        let current = current_schema_version(&conn);
+        if current > SCHEMA_VERSION {
+            return Err(refuse_newer_schema(state_dir, current));
+        }
         // §4.197 SQLite hygiene: `secure_delete` zeroes deleted row content
         // inside its pages before the page returns to the freelist, so a
         // later read of freed pages (or a plaintext backup scrub) cannot
@@ -3033,21 +3378,78 @@ impl Store {
              PRAGMA cache_size=-{SQLITE_WRITER_CACHE_KIB};"
         ))
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        conn.execute_batch(SCHEMA_DDL)
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        migrate_schema(&conn)?;
-        // 2026-10-20 事故修复：**纯加列/改名无条件幂等执行**，不靠版本号门控。
-        // 事故复盘见 ensure_additive_columns 的文档注释——已发布的迁移内容被
-        // 改名后，跑过该版本的库永远补不上新列，读面 SELECT 因此整面报错
-        // （会话列表 INTERNAL_ERROR / UI「暂无聊天」）。这一层保证任何
-        // 加列都不会再被版本门控漏掉。
-        ensure_additive_columns(&conn)?;
-        // The held-since expression index (retention cost fix, prune_history)
-        // references stored_at, which stores older than schema 6 only gain
-        // inside migrate_schema; creating it after the migrations keeps the
-        // opening DDL valid against every schema version from v0 up.
-        conn.execute_batch(POST_MIGRATION_SCHEMA_DDL)
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // Contract revision 1.282 (§4.266): a store that already carries a
+        // schema is upgraded only behind an integrity gate and a consistent
+        // snapshot, and a failed ladder puts the snapshot back instead of
+        // leaving the process with nothing but `Unavailable` (and the desktop
+        // with a half-migrated file whose version stamp still says "old").
+        // A brand-new file has nothing to protect: no gate, no snapshot, the
+        // DDL creates everything from scratch.
+        let existing = store_has_schema(&conn)?;
+        // `current` was read straight off the keyed connection above: the
+        // refusal (contract revision 1.284, §4.268) is the only consumer that
+        // had to run before this point.
+        let cipher = cipher_version(&conn);
+        let recorded_cipher = meta_value(&conn, CIPHER_VERSION_KEY);
+        // An encryption-library upgrade with an unchanged schema is still a
+        // file the new build has never opened: same gate, same snapshot.
+        let library_upgrade = cipher_upgrade_pending(recorded_cipher.as_deref(), cipher.as_deref());
+        let gated = existing && (current < SCHEMA_VERSION || library_upgrade);
+        let integrity = if gated {
+            integrity_gate(&conn)?
+        } else {
+            StoreIntegrity::NotChecked
+        };
+        let snapshot = if gated {
+            take_pre_migration_snapshot(&conn, state_dir, current, SCHEMA_VERSION)?
+        } else {
+            SnapshotStamp::not_needed()
+        };
+        if let Err(error) = apply_schema(&conn) {
+            // A newer-schema refusal is never a failed migration: it must not
+            // restore a snapshot over the newer store or leave the migration
+            // marker. `apply_schema`'s own guard is defence in depth behind
+            // the check above, so this arm is unreachable in practice — and
+            // stays harmless if it ever is reached (contract revision 1.284,
+            // §4.268).
+            if matches!(error, StoreError::SchemaNewer { .. }) {
+                return Err(error);
+            }
+            if !gated {
+                return Err(error);
+            }
+            // Close the writer before the file is replaced: a copy underneath
+            // a live handle is a torn write, not a restore.
+            let snapshot_file = snapshot.last_file.clone();
+            drop(conn);
+            let rollback = restore_snapshot(&path, snapshot_file.as_deref(), &key, current);
+            write_migration_failure(
+                state_dir,
+                &MigrationFailureFace {
+                    at: now_ms(),
+                    from: current,
+                    to: SCHEMA_VERSION,
+                    rollback: rollback.to_string(),
+                    snapshot: snapshot_file,
+                },
+            );
+            return Err(StoreError::SchemaMigrationFailed(SchemaMigrationFailure {
+                from: current,
+                to: SCHEMA_VERSION,
+                rollback,
+                cause: Some(Box::new(error)),
+            }));
+        }
+        // The ladder landed: the marker of an older failure is history now.
+        clear_migration_failure(state_dir);
+        // Record the build that opened the store so the next encryption-library
+        // upgrade can tell it was an upgrade. Best-effort bookkeeping: a failed
+        // meta write must not fail an otherwise healthy open.
+        if let Some(cipher) = cipher.as_deref()
+            && recorded_cipher.as_deref() != Some(cipher)
+        {
+            let _ = record_meta(&conn, CIPHER_VERSION_KEY, cipher);
+        }
         // The startup sweep (contract revision 1.111, §4.92): a 'pending'
         // outgoing row is a send whose completion never landed — the process
         // died between the insert and the engine answer. No completion can
@@ -3083,11 +3485,30 @@ impl Store {
                 "startup sweep migrated stale pending sends to failed"
             );
         }
+        // 契约 1.279（§4.263）：启动时清理过期的出站附件 payload。保留期外的
+        // 行不再可重试；超过孤儿宽限且没有消息行的行没有重试目标。成功结算本
+        // 就即时删除，这一遍只兜底崩溃/历史遗留，不碰刚写下的 payload。
+        let pruned_payloads = prune_outgoing_attachment_payloads(
+            &conn,
+            crate::link::now_ms().min(i64::MAX as u64) as i64,
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if pruned_payloads > 0 {
+            tracing::info!(
+                pruned = pruned_payloads,
+                "startup sweep pruned expired outgoing attachment payloads"
+            );
+        }
+        let landed = current_schema_version(&conn);
+        let schema_version = if landed > 0 { landed } else { SCHEMA_VERSION };
         let readers = ReadPool::open(&path, &key)?;
         Ok(Self {
             path,
             conn: Mutex::new(conn),
             readers,
+            schema_version,
+            integrity,
+            snapshot,
         })
     }
 
@@ -3101,6 +3522,36 @@ impl Store {
     /// single source of truth), so the two can never drift.
     pub fn state_dir(&self) -> &Path {
         self.path.parent().unwrap_or(&self.path)
+    }
+
+    /// The store's read-only health face (contract revision 1.282, §4.266):
+    /// the schema version it landed on, what the last integrity gate said, how
+    /// big the database and its WAL are, what the pre-migration snapshot pass
+    /// did, the last recorded migration failure, and — since revision 1.284
+    /// (§4.268) — the last refused open because the store was newer than that
+    /// build.
+    ///
+    /// Nothing here takes the writer lock: the ladder runs only inside
+    /// [`Store::open`], so every value is a field set there or a file size — a
+    /// doctor or metrics read can never queue behind a request.
+    pub fn health(&self) -> StoreHealth {
+        let state_dir = self.state_dir();
+        let (count, bytes) = snapshot_dir_usage(&state_dir.join(SNAPSHOT_DIR));
+        StoreHealth {
+            schema_version: self.schema_version,
+            schema_target: SCHEMA_VERSION,
+            integrity: self.integrity.literal(),
+            db_bytes: file_bytes(&self.path),
+            wal_bytes: file_bytes(&append_suffix(&self.path, "-wal")),
+            snapshots: SnapshotHealth {
+                count,
+                bytes,
+                last_result: self.snapshot.last_result,
+                last_at: self.snapshot.last_at,
+            },
+            last_migration_failure: read_migration_failure(state_dir),
+            schema_newer: read_schema_newer(state_dir),
+        }
     }
 
     /// The store is one `Arc` shared by every proxy-group runtime, so all
@@ -3474,16 +3925,16 @@ impl Store {
     }
 
     /// Signal Core B: append one event in the same transaction as its product
-    /// write. The caller supplies the epoch; seq is store-assigned.
+    /// write. The caller supplies the epoch; seq is store-assigned. Contract
+    /// 1.283 (§4.267): the row is a thin change pointer — no payload.
     pub fn append_event_log(
         &self,
         epoch: u64,
         account_id: Option<&str>,
         event_type: &str,
-        payload: &str,
     ) -> Result<i64, StoreError> {
         let conn = self.lock_conn()?;
-        append_event_log_on(&conn, epoch, account_id, event_type, payload)
+        append_event_log_on(&conn, epoch, account_id, event_type)
     }
 
     /// Run product writes and their event_log rows in one SQLite transaction.
@@ -3545,51 +3996,187 @@ impl Store {
         Ok(Some((cursor, epoch)))
     }
 
-    pub fn list_events_since(
+    /// events.list (contract 1.283, §4.267): one token-checked page of the
+    /// thin ledger, read on a pool connection so a subscriber poll never queues
+    /// behind a writer commit.
+    ///
+    /// The cursor rules are the whole face:
+    ///
+    /// - a presented token that is not this ledger's current one means the
+    ///   generation rotated under the subscriber (fresh store, upgrade, account
+    ///   deletion) — reset, whatever the cursor says;
+    /// - no token and no cursor is a cold start — reset, so the host reloads;
+    /// - a cursor below the floor names events that were trimmed — reset;
+    /// - a cursor above every assigned seq belongs to a ledger that no longer
+    ///   exists — reset.
+    ///
+    /// A reset answers no events at all (a partial page from a dead cursor is
+    /// the gap the token exists to prevent) and points the caller at the floor
+    /// as the place to resume. Reads are two statements against one read-pool
+    /// connection; a trim landing between them self-heals on the next call
+    /// (the floor only advances, so the worst case is one extra reset), never
+    /// as a duplicated or reordered event.
+    pub fn events_page(
         &self,
-        after_seq: i64,
+        after_seq: Option<i64>,
+        token: Option<&str>,
         limit: u32,
-    ) -> Result<Vec<EventLogRow>, StoreError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT seq, epoch, account_id, type, payload
-                   FROM event_log WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
-            )
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let rows = stmt
-            .query_map(rusqlite::params![after_seq, i64::from(limit)], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| StoreError::Unavailable(Some(error)))
+    ) -> Result<EventLedgerPage, StoreError> {
+        self.events_page_with(after_seq, token, limit, EVENT_PAGE_BYTE_BUDGET)
     }
 
-    pub fn events_since(
+    /// [`Store::events_page`] with the response byte budget spelled out: the
+    /// page stops before it would cross the budget (unless a single event does,
+    /// which is always delivered so a caller can make progress).
+    pub fn events_page_with(
         &self,
-        after_seq: i64,
+        after_seq: Option<i64>,
+        token: Option<&str>,
         limit: u32,
-    ) -> Result<Vec<EventLogRecord>, StoreError> {
-        Ok(self
-            .list_events_since(after_seq, limit)?
-            .into_iter()
-            .map(
-                |(seq, epoch, account_id, event_type, payload)| EventLogRecord {
-                    seq,
-                    epoch,
-                    account_id,
-                    event_type,
-                    payload,
-                },
-            )
-            .collect())
+        byte_budget: u64,
+    ) -> Result<EventLedgerPage, StoreError> {
+        let conn = self.read_conn()?;
+        let state = event_ledger_state_on(&conn).map_err(unavailable)?;
+        let head: i64 = conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM event_log", [], |row| {
+                row.get(0)
+            })
+            .map_err(unavailable)?;
+        let after = after_seq.unwrap_or(state.floor);
+        // The four criteria are independent checks, not a precedence chain: a
+        // matching token must still reset a cursor that fell below the floor
+        // or ran ahead of the ledger.
+        let reset_reason = if token.is_some_and(|presented| presented != state.token) {
+            Some(EventResetReason::TokenMismatch)
+        } else if token.is_none() && after_seq.is_none() {
+            Some(EventResetReason::ColdStart)
+        } else if after < state.floor {
+            Some(EventResetReason::BelowFloor)
+        } else if after > head {
+            Some(EventResetReason::AheadOfLog)
+        } else {
+            None
+        };
+        if let Some(reason) = reset_reason {
+            return Ok(EventLedgerPage {
+                token: state.token,
+                reset: true,
+                reset_reason: Some(reason.literal()),
+                trimmed_through_seq: state.floor,
+                events: Vec::new(),
+                next_after_seq: state.floor,
+                truncated: false,
+            });
+        }
+        let (events, truncated) =
+            read_event_page(&conn, after, limit, byte_budget).map_err(unavailable)?;
+        let next_after_seq = events.last().map_or(after, |event| event.seq);
+        Ok(EventLedgerPage {
+            token: state.token,
+            reset: false,
+            reset_reason: None,
+            trimmed_through_seq: state.floor,
+            events,
+            next_after_seq,
+            truncated,
+        })
+    }
+
+    /// One retention pass (contract 1.283, §4.267): the head window is 7 days,
+    /// 20 000 rows and 64 MiB, whichever binds first. The floor moves and the
+    /// rows leave in **one** transaction, so a crash can never leave a floor
+    /// that promises rows it still has (or rows that a floor does not admit).
+    pub fn trim_event_log(&self, now_ms: u64) -> Result<EventTrimOutcome, StoreError> {
+        self.trim_event_log_with(now_ms, EVENT_LOG_RETENTION)
+    }
+
+    /// [`Store::trim_event_log`] with an explicit window (tests drive tiny
+    /// windows; production always passes the default retention window).
+    pub fn trim_event_log_with(
+        &self,
+        now_ms: u64,
+        retention: EventLogRetention,
+    ) -> Result<EventTrimOutcome, StoreError> {
+        let mut conn = self.lock_conn()?;
+        let transaction = conn
+            .transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let state = event_ledger_state_on(&transaction).map_err(unavailable)?;
+        let head: i64 = transaction
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM event_log", [], |row| {
+                row.get(0)
+            })
+            .map_err(unavailable)?;
+        let cut = event_trim_cut(&transaction, now_ms, retention)
+            .map_err(unavailable)?
+            .max(state.floor)
+            .min(head);
+        let mut removed = 0_u64;
+        let floor = if cut > state.floor {
+            removed = transaction
+                .execute("DELETE FROM event_log WHERE seq <= ?1", params![cut])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+                as u64;
+            transaction
+                .execute(
+                    "UPDATE event_log_state SET floor=?1, updated_at=?2 WHERE id=1",
+                    params![cut, now_ms.min(i64::MAX as u64) as i64],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            cut
+        } else {
+            state.floor
+        };
+        let (rows, bytes) = event_ledger_usage(&transaction).map_err(unavailable)?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(EventTrimOutcome {
+            removed,
+            trimmed_through_seq: floor,
+            rows,
+            bytes,
+        })
+    }
+
+    /// The ledger's read-only health face (contract 1.283, §4.267). Best
+    /// effort like the store health face: a state directory whose ledger
+    /// cannot be read answers readable=false instead of failing a doctor call.
+    /// No writer lock is taken, and the token itself never leaves the store.
+    pub fn event_log_health(&self) -> EventLogHealth {
+        let Ok(conn) = self.read_conn() else {
+            return EventLogHealth::unreadable();
+        };
+        let Ok(state) = event_ledger_state_on(&conn) else {
+            return EventLogHealth::unreadable();
+        };
+        let (rows, bytes) = match event_ledger_usage(&conn) {
+            Ok(usage) => usage,
+            Err(_) => return EventLogHealth::unreadable(),
+        };
+        let (oldest, newest, head): (Option<i64>, Option<i64>, i64) = match conn.query_row(
+            "SELECT MIN(created_at), MAX(created_at), COALESCE(MAX(seq), 0) FROM event_log",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ) {
+            Ok(stamps) => stamps,
+            Err(_) => return EventLogHealth::unreadable(),
+        };
+        EventLogHealth {
+            readable: true,
+            token_generation: state.generation,
+            trimmed_through_seq: state.floor,
+            seq_max: head,
+            rows,
+            bytes,
+            oldest_created_at: oldest.map(|value| value.max(0) as u64),
+            newest_created_at: newest.map(|value| value.max(0) as u64),
+            retention: EventLogRetentionHealth {
+                max_age_ms: EVENT_LOG_RETENTION.max_age_ms,
+                max_rows: EVENT_LOG_RETENTION.max_rows,
+                max_bytes: EVENT_LOG_RETENTION.max_bytes,
+            },
+        }
     }
 
     pub fn record_send_attempt(
@@ -4019,6 +4606,9 @@ impl Store {
             params![shell_id],
         )
         .map_err(map_err)?;
+        // 契约 1.279（§4.263）：shell 侧消息行离开后，没有消息行再引用的
+        // payload 一并清掉（已迁到 canonical 会话的消息仍能命中，保留）。
+        delete_orphan_outgoing_attachment_payloads(&tx).map_err(map_err)?;
 
         // Reactions move under the same guard on their own unique tuple —
         // the table's conversation FK has no cascade, so clearing the
@@ -4382,6 +4972,9 @@ impl Store {
             params![shell_id],
         )
         .map_err(map_err)?;
+        // 契约 1.279（§4.263）：shell 侧消息行离开后，没有消息行再引用的
+        // payload 一并清掉（已迁到 canonical 会话的消息仍能命中，保留）。
+        delete_orphan_outgoing_attachment_payloads(&tx).map_err(map_err)?;
 
         // Reactions move under the same guard on their own unique tuple —
         // the table's conversation FK has no cascade, so clearing the
@@ -4896,6 +5489,15 @@ impl Store {
                     params![account_id],
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            // 契约 1.279（§4.263）：payload 以 client_request_id 为键、不是
+            // message 外键，必须在消息行离开前按 account 显式清掉；否则
+            // 账号删除会留下无主的附件原文。
+            transaction
+                .execute(
+                    "DELETE FROM outgoing_attachment_payloads WHERE account_id=?1",
+                    params![account_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
             transaction
                 .execute(
                     "DELETE FROM messages WHERE account_id=?1",
@@ -4926,9 +5528,19 @@ impl Store {
                     params![format!("contacts_synced_at:{account_id}")],
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            // 契约 1.283（§4.267）：事件账本里这一账号的行先于账号行离开，
+            // 同一事务内轮换 token——订阅方持有的游标从此对不上代际，第一次
+            // events.list 就会得到 reset，而不是继续读一段「人已经删了」的流。
+            transaction
+                .execute(
+                    "DELETE FROM event_log WHERE account_id=?1",
+                    params![account_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
             transaction
                 .execute("DELETE FROM accounts WHERE id=?1", params![account_id])
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            rotate_event_log_token_on(&transaction, now_ms)?;
             receipt = Some(AccountDeleteReceipt {
                 account_id: account_id.to_string(),
                 completed_at: now_ms,
@@ -6976,7 +7588,6 @@ impl Store {
                 event.epoch,
                 event.account_id.as_deref(),
                 &event.event_type,
-                &event.payload,
             )?;
         }
         transaction
@@ -7276,6 +7887,329 @@ impl Store {
                         retry_attempt_count=0, next_attempt_at=NULL
                  WHERE id=?1 AND status='failed'",
                 params![message_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let record = transaction
+            .query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
+                 FROM messages WHERE id=?1",
+                params![message_id],
+                message_record_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(record.map(|record| (record, changed == 1)))
+    }
+
+    /// 契约 1.279（§4.263）+ 1.280（§4.264）：首发时记住这一条出站附件的原始
+    /// data URI。`attachment_index` 是这条附件在消息 `attachments` 数组里的
+    /// 位置（单附件恒为 0，多附件 0..n-1），与 accountId、clientRequestId 一起
+    /// 构成主键（同一个 clientRequestId 在两个账号下是两行，互不覆盖）。
+    ///
+    /// 这是「官方消息附件持久化」的 connector 半：payload 不再是桌面的内存
+    /// 责任，失败行在任何一次刷新/重启之后都还能重试。写入用
+    /// `ON CONFLICT DO NOTHING`——同一个 (accountId, clientRequestId, index)
+    /// 已经有 payload 时保留原来那一份（幂等重放/并发首发绝不能把首发的数据
+    /// 覆盖成后来的请求）。首次发送在 pending 行写入前调用；写失败即失败（不发送），
+    /// 否则修复会在无人察觉的情况下退化回「刷新即丢」。
+    pub fn remember_outgoing_attachment_payload(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        client_request_id: &str,
+        attachment_index: u32,
+        data_uri: &str,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.remember_outgoing_attachment_payloads(
+            account_id,
+            conversation_id,
+            client_request_id,
+            &[(attachment_index, data_uri)],
+            now_ms,
+        )
+    }
+
+    /// 多附件版本（契约 1.280，§4.264）：一个事务写入整组条目（0..n-1），要么
+    /// 全落、要么全不落——ids-only 重试按 index 重建整组字节，要求这组行是
+    /// 完整的一代；宁可首发失败，也不要留下半组 payload 让重试无解。
+    pub fn remember_outgoing_attachment_payloads(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        client_request_id: &str,
+        payloads: &[(u32, &str)],
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO outgoing_attachment_payloads(
+                       account_id, client_request_id, attachment_index,
+                       conversation_id, data_uri, created_at, updated_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                     ON CONFLICT(account_id, client_request_id, attachment_index) DO NOTHING",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for (attachment_index, data_uri) in payloads {
+                statement
+                    .execute(params![
+                        account_id,
+                        client_request_id,
+                        i64::from(*attachment_index),
+                        conversation_id,
+                        data_uri,
+                        now_ms as i64,
+                    ])
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// 契约 1.279（§4.263）+ 1.280（§4.264）：重试时用这一次的 data URI 覆盖
+    /// 对应 index 的 payload 行（`created_at` 保留首次落地时间），下一次刷新
+    /// 重试继续可用。
+    pub fn update_outgoing_attachment_payload(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        client_request_id: &str,
+        attachment_index: u32,
+        data_uri: &str,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.update_outgoing_attachment_payloads(
+            account_id,
+            conversation_id,
+            client_request_id,
+            &[(attachment_index, data_uri)],
+            now_ms,
+        )
+    }
+
+    /// 批量覆盖（见 `update_outgoing_attachment_payload`）：一个事务里的整组
+    /// upsert。调用方带 bytes 时只覆盖它声明的 index；ids-only 重试把按 index
+    /// 重建出来的整组 URI 写回（顺带刷新 updated_at，长失败的存量行不会在
+    /// 保留窗口里失去重发源）。
+    pub fn update_outgoing_attachment_payloads(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        client_request_id: &str,
+        payloads: &[(u32, &str)],
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO outgoing_attachment_payloads(
+                       account_id, client_request_id, attachment_index,
+                       conversation_id, data_uri, created_at, updated_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                     ON CONFLICT(account_id, client_request_id, attachment_index) DO UPDATE SET
+                       conversation_id=excluded.conversation_id,
+                       data_uri=excluded.data_uri,
+                       updated_at=excluded.updated_at",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for (attachment_index, data_uri) in payloads {
+                statement
+                    .execute(params![
+                        account_id,
+                        client_request_id,
+                        i64::from(*attachment_index),
+                        conversation_id,
+                        data_uri,
+                        now_ms as i64,
+                    ])
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// 契约 1.279（§4.263）+ 1.280（§4.264）：读取一条出站附件某个 index 的
+    /// 原始 data URI。account 是主键的第一段（payload 与消息行同属一个账号），
+    /// 跨账号的 clientRequestId 不会命中，也不会覆盖对方那一行。
+    pub fn outgoing_attachment_payload(
+        &self,
+        account_id: &str,
+        client_request_id: &str,
+        attachment_index: u32,
+    ) -> Result<Option<String>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT data_uri FROM outgoing_attachment_payloads
+                  WHERE account_id=?1 AND client_request_id=?2 AND attachment_index=?3",
+                params![account_id, client_request_id, i64::from(attachment_index)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// 契约 1.280（§4.264）：按 index 升序列出一组出站附件的原始 data URI——
+    /// ids-only 重试就是靠它把多附件消息的整组字节按原顺序重建出来。
+    pub fn outgoing_attachment_payloads(
+        &self,
+        account_id: &str,
+        client_request_id: &str,
+    ) -> Result<Vec<(u32, String)>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT attachment_index, data_uri FROM outgoing_attachment_payloads
+                  WHERE account_id=?1 AND client_request_id=?2
+                  ORDER BY attachment_index",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = statement
+            .query_map(params![account_id, client_request_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut payloads = Vec::new();
+        for row in rows {
+            let (attachment_index, data_uri) =
+                row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+            payloads.push((
+                u32::try_from(attachment_index).unwrap_or(u32::MAX),
+                data_uri,
+            ));
+        }
+        Ok(payloads)
+    }
+
+    /// 契约 1.279/1.280：删除一条出站附件某个 index 的 payload（显式路径用）。
+    /// 返回是否真的删了一行；幂等重放/已清理的请求返回 false。
+    pub fn delete_outgoing_attachment_payload(
+        &self,
+        account_id: &str,
+        client_request_id: &str,
+        attachment_index: u32,
+    ) -> Result<bool, StoreError> {
+        let changed = self
+            .lock_conn()?
+            .execute(
+                "DELETE FROM outgoing_attachment_payloads
+                  WHERE account_id=?1 AND client_request_id=?2 AND attachment_index=?3",
+                params![account_id, client_request_id, i64::from(attachment_index)],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed > 0)
+    }
+
+    /// 契约 1.279/1.280：删除这一个 clientRequestId 的全部 payload 行——成功
+    /// 结算（整条消息已送达，整组原始字节都完成使命）走这里；显式删除路径则由
+    /// store 内部的孤儿清理按同一个 clientRequestId 整组删除。失败/unknown
+    /// 保留。返回删掉的行数。
+    pub fn delete_outgoing_attachment_payloads(
+        &self,
+        account_id: &str,
+        client_request_id: &str,
+    ) -> Result<usize, StoreError> {
+        self.lock_conn()?
+            .execute(
+                "DELETE FROM outgoing_attachment_payloads
+                  WHERE account_id=?1 AND client_request_id=?2",
+                params![account_id, client_request_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Rearm one failed outgoing attachment row for an IN-PLACE retry
+    /// (contract revision 1.278, §4.262 — the §4.134 successor): the SAME
+    /// row id takes the `failed -> pending` transition together with this
+    /// request's content faces, in one guarded write. Nothing is deleted and
+    /// nothing is inserted — the row the desktop bubble renders is the row
+    /// the retry re-sends, so the history keeps exactly one row per
+    /// clientRequestId (the official retry-send shape: reuse the message,
+    /// never mint a second one beside it).
+    ///
+    /// Discipline, mirroring `rearm_failed_message`:
+    /// - the `WHERE status='failed'` guard is the authority: a row that
+    ///   settled meanwhile (or that a concurrent retry already rearmed) is
+    ///   left untouched and reported `changed=false`, so two dispatch arms
+    ///   can never race one row into two sends;
+    /// - a manual retry is a NEW job with its own §4.123 window, so the
+    ///   automatic face is retired with the rearm (`first_send_attempted_at`
+    ///   / `retry_attempt_count` / `next_attempt_at` cleared) exactly as the
+    ///   text retry does;
+    /// - the previous attempt's settlement faces are cleared with it: the
+    ///   §4.173 group-outcome ledger (`send_outcomes_json`) describes the
+    ///   attempt that failed, and the delivery stamps belong to a send that
+    ///   never landed;
+    /// - identity and position stay the original message's (`id`,
+    ///   `client_request_id`, `sent_at`): only the content faces follow this
+    ///   request. The bytes come either from the caller or — contract 1.279,
+    ///   §4.263 — from the persisted payload row; §4.183's local copy is still
+    ///   a rendering cache, evictable at any governor pass.
+    pub fn rearm_failed_attachment_retry(
+        &self,
+        message_id: &str,
+        text: &str,
+        quote_message_id: Option<&str>,
+        attachments: &[MessageAttachmentInfo],
+        rich: Option<&crate::engine::NormalizedRich>,
+    ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let changed = transaction
+            .execute(
+                "UPDATE messages SET status='pending', first_send_attempted_at=NULL,
+                        retry_attempt_count=0, next_attempt_at=NULL,
+                        body=?2, body_bytes=?3, body_truncated=0,
+                        quote_message_id=?4, attachments_json=?5,
+                        live_attachment_locators=?6, rich_json=?7,
+                        send_outcomes_json=NULL, delivered_at=NULL, read_at=NULL,
+                        viewed_at=NULL
+                 WHERE id=?1 AND status='failed'",
+                params![
+                    message_id,
+                    text,
+                    text.len() as i64,
+                    quote_message_id,
+                    (!attachments.is_empty())
+                        .then(|| { serde_json::to_string(attachments).expect("attachments json") }),
+                    (!attachments.is_empty()).then(|| {
+                        serde_json::to_string(
+                            &attachments
+                                .iter()
+                                .map(|descriptor| descriptor.locator.clone().unwrap_or_default())
+                                .collect::<Vec<_>>(),
+                        )
+                        .expect("live attachment locators json")
+                    }),
+                    rich.map(|rich| serde_json::to_string(rich).expect("rich json")),
+                ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let record = transaction
@@ -8182,6 +9116,20 @@ impl Store {
                     params![account_id, conversation_id, target_sent_at as i64],
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            // 契约 1.279（§4.263）：对所有人删除后这条消息不可能再重试，
+            // 原始 payload 一并删除（墓碑行保留）。
+            if let Some(client_request_id) = record
+                .as_ref()
+                .and_then(|record| record.client_request_id.as_deref())
+            {
+                transaction
+                    .execute(
+                        "DELETE FROM outgoing_attachment_payloads
+                          WHERE client_request_id=?1 AND account_id=?2",
+                        params![client_request_id, account_id],
+                    )
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
         }
         // 若被删行正占摘要槽，清掉旧正文预览；conversation_summary 随后
         // 仍会从该行 status=remote-deleted 计算 last_message_status，桌面据此
@@ -10815,6 +11763,10 @@ impl Store {
                 [],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // 契约 1.279（§4.263）：消息行被这条删除面带走后，没有重试目标的
+        // payload 一并清掉（同一事务；显式删除无需孤儿宽限）。
+        delete_orphan_outgoing_attachment_payloads(&transaction)
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
         transaction
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -10992,6 +11944,10 @@ impl Store {
                         )",
                 [],
             )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // 契约 1.279（§4.263）：被这条删除面带走的行不再有重试目标，payload
+        // 一并清掉（保留行自己的 payload 不动——孤儿判定以消息行为准）。
+        delete_orphan_outgoing_attachment_payloads(&transaction)
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         transaction
             .commit()
@@ -13258,6 +14214,8 @@ impl Store {
         let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // 契约 1.279（§4.263）：payload 清理放在本遍删行之后，本轮裁掉的
+        // 消息同轮清掉 payload，不留到下一轮。
         let mut touched_conversations = std::collections::BTreeSet::new();
         let mut messages_deleted = 0_u64;
         // Branch 1, age rule: no recency is involved, so the expression index
@@ -13335,6 +14293,8 @@ impl Store {
                 messages_deleted += 1;
             }
         }
+        prune_outgoing_attachment_payloads(&transaction, now)
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
         if touched_conversations.is_empty() {
             transaction
                 .commit()
@@ -13509,6 +14469,28 @@ impl Store {
                 touched.insert((account_id.clone(), conversation_id.clone()));
             }
             drop(erase);
+            // 契约 1.279（§4.263）+ 1.280（§4.264）：烧掉内容的 view-once 行不能
+            // 再被重发，它的原始 payload 同步删除（行本身保留，clientRequestId
+            // 仍在）。payload 的主键以账号开头：另一个账号用同一个
+            // clientRequestId 存的是它自己那组字节，擦除不能跨账号误删，所以
+            // 定位键补上 account_id 限定。
+            let mut drop_payload = transaction
+                .prepare(
+                    "DELETE FROM outgoing_attachment_payloads
+                      WHERE account_id = (
+                        SELECT account_id FROM messages WHERE id=?1
+                      )
+                        AND client_request_id = (
+                          SELECT client_request_id FROM messages WHERE id=?1
+                        )",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for (id, _, _, _) in &due_view_once {
+                drop_payload
+                    .execute(params![id])
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+            drop(drop_payload);
         }
         let erased = due_view_once.len();
         drop(due_view_once);
@@ -13518,6 +14500,7 @@ impl Store {
         let delete_cap = cap.saturating_sub(erased as u32);
         let mut groups: std::collections::BTreeMap<(String, String), Vec<String>> =
             std::collections::BTreeMap::new();
+        let mut had_due_rows = false;
         if delete_cap > 0 {
             let mut deleted = transaction
                 .prepare(
@@ -13557,8 +14540,16 @@ impl Store {
                     .entry((account_id, conversation_id))
                     .or_default()
                     .push(id);
+                had_due_rows = true;
             }
             drop(deleted);
+        }
+        // 契约 1.279（§4.263）：被过期删除带走的消息行不再有重试目标；
+        // 同一事务里清掉孤儿 payload（擦除行仍带 clientRequestId，已在上面
+        // 单独删除，不会被这一步误留）。
+        if had_due_rows {
+            delete_orphan_outgoing_attachment_payloads(&transaction)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
         // The newest row may be the one that expired *or* the one that was
         // just erased: recompute each touched conversation's summary from
@@ -13673,6 +14664,48 @@ fn expire_deadline(message: &MessageRecord, stored_at: u64) -> Option<u64> {
     )
 }
 
+/// 契约 1.279（§4.263）：payload 表的保留清扫。两条规则——超过保留期的行
+/// 一律走；以及超过孤儿宽限、且 `client_request_id` 已没有任何消息行对应的行
+/// （消息被删除/裁剪/合并时留下的）走。宽限保护 prepare 里「先写 payload、后写
+/// 消息行」的两步窗口。
+fn prune_outgoing_attachment_payloads(
+    conn: &Connection,
+    now_ms: i64,
+) -> Result<usize, rusqlite::Error> {
+    let expired_before = now_ms.saturating_sub(OUTGOING_ATTACHMENT_PAYLOAD_RETENTION_MS);
+    let orphan_cutoff = now_ms.saturating_sub(OUTGOING_ATTACHMENT_PAYLOAD_ORPHAN_GRACE_MS);
+    conn.execute(
+        // 相关 EXISTS 走 messages(account_id, client_request_id) 唯一索引，
+        // 不随历史表规模退化成全表 NOT IN 扫描。
+        "DELETE FROM outgoing_attachment_payloads
+          WHERE updated_at < ?1
+             OR (updated_at < ?2
+                 AND NOT EXISTS (
+                   SELECT 1 FROM messages
+                    WHERE messages.account_id = outgoing_attachment_payloads.account_id
+                      AND messages.client_request_id =
+                          outgoing_attachment_payloads.client_request_id
+                 ))",
+        params![expired_before, orphan_cutoff],
+    )
+}
+
+/// 契约 1.279（§4.263）：显式删除路径（会话/消息/账号/合并）上的即时孤儿清理。
+/// 这些路径与 prepare 同属 service 锁序，不受「先 payload 后消息」窗口影响；
+/// 没有任何消息行再引用的 payload 没有重试目标，留着只会占空间。
+fn delete_orphan_outgoing_attachment_payloads(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM outgoing_attachment_payloads
+          WHERE NOT EXISTS (
+            SELECT 1 FROM messages
+             WHERE messages.account_id = outgoing_attachment_payloads.account_id
+               AND messages.client_request_id =
+                   outgoing_attachment_payloads.client_request_id
+          )",
+        [],
+    )
+}
+
 fn prune_completed_account_deletes(
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<(), StoreError> {
@@ -13747,6 +14780,35 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, rusqlite::Error>
     )
     .optional()
     .map(|found| found.is_some())
+}
+
+/// One table's declared columns, in declaration order (PRAGMA table_info).
+/// Shape probes read this instead of trusting the schema version: a table can
+/// be half-rebuilt by a crashed migration, and its column set is the only fact
+/// that survives that.
+fn table_column_names(conn: &Connection, table: &str) -> Result<Vec<String>, rusqlite::Error> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    columns.collect()
+}
+
+/// One table's primary-key columns in key order. PRAGMA table_info's pk column
+/// is the 1-based position inside the key and 0 for a non-key column, so
+/// ordering by it reproduces the declared PRIMARY KEY(...) sequence — the
+/// probe that tells (account_id, client_request_id, attachment_index) apart
+/// from the intermediate (client_request_id, attachment_index) shape.
+fn table_primary_key_columns(
+    conn: &Connection,
+    table: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?))
+    })?;
+    let mut keyed = rows.collect::<Result<Vec<_>, _>>()?;
+    keyed.retain(|(position_in_key, _)| *position_in_key > 0);
+    keyed.sort_by_key(|(position_in_key, _)| *position_in_key);
+    Ok(keyed.into_iter().map(|(_, column)| column).collect())
 }
 
 /// Remove a plaintext migration backup that cannot be scrubbed row-wise. The
@@ -14019,6 +15081,356 @@ fn migrate_plaintext_store(path: &Path, key: &StoreKey) -> Result<(), StoreError
             Err(StoreError::MigrationFailed(Some(Box::new(error))))
         }
     }
+}
+
+/// The opening DDL plus the schema ladder, in the one order that stays valid
+/// at every step: [`SCHEMA_DDL`] creates the tables the ladder then adds
+/// columns to, and [`POST_MIGRATION_SCHEMA_DDL`] references columns only the
+/// ladder adds.
+fn apply_schema(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(SCHEMA_DDL)
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    migrate_schema(conn)?;
+    // 2026-10-20 事故修复：**纯加列/改名无条件幂等执行**，不靠版本号门控。
+    // 事故复盘见 ensure_additive_columns 的文档注释——已发布的迁移内容被
+    // 改名后，跑过该版本的库永远补不上新列，读面 SELECT 因此整面报错
+    // （会话列表 INTERNAL_ERROR / UI「暂无聊天」）。这一层保证任何
+    // 加列都不会再被版本号门控漏掉。
+    ensure_additive_columns(conn)?;
+    conn.execute_batch(POST_MIGRATION_SCHEMA_DDL)
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(())
+}
+
+/// Whether this file already carries a connector schema (contract revision
+/// 1.282). A brand-new store has no user tables at all: nothing to gate and
+/// nothing to snapshot, the DDL creates everything from scratch.
+fn store_has_schema(conn: &Connection) -> Result<bool, StoreError> {
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master
+              WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| StoreError::StoreCorrupt(Some(error)))?;
+    Ok(tables > 0)
+}
+
+/// The schema version the store answers, or 0 when it has none yet (no `meta`
+/// table, or no key). The same lenient read [`migrate_schema`] starts from, so
+/// the gate and the ladder can never disagree about which version they see.
+fn current_schema_version(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// The SQLCipher build answering this connection, when the build reports one.
+fn cipher_version(conn: &Connection) -> Option<String> {
+    let raw: String = conn
+        .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+        .ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn meta_value(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row("SELECT value FROM meta WHERE key=?1", params![key], |row| {
+        row.get(0)
+    })
+    .ok()
+}
+
+fn record_meta(conn: &Connection, key: &str, value: &str) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, value],
+    )
+    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(())
+}
+
+/// An encryption-library upgrade is a store the running build has never opened.
+/// Missing on either side (a store written before this key existed, a build
+/// that reports nothing) is **not** an upgrade — the gate is never invented.
+fn cipher_upgrade_pending(recorded: Option<&str>, current: Option<&str>) -> bool {
+    match (recorded, current) {
+        (Some(recorded), Some(current)) => !recorded.is_empty() && recorded != current,
+        _ => false,
+    }
+}
+
+/// The pre-migration integrity gate (contract revision 1.282, §4.266).
+///
+/// It runs **before any DDL**. A store whose pages cannot be read, or whose
+/// b-trees disagree with its schema, must never be handed to the ALTER ladder:
+/// that is exactly how a half-migrated file with a stale version stamp is made,
+/// and afterwards no snapshot can tell it from a good one. Fail closed, classify
+/// (`corrupt` for "cannot read it at all", `integrity` for reported damage),
+/// and let the caller stop serving.
+fn integrity_gate(conn: &Connection) -> Result<StoreIntegrity, StoreError> {
+    let mut statement = conn
+        .prepare("PRAGMA integrity_check")
+        .map_err(|error| StoreError::StoreCorrupt(Some(error)))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| StoreError::StoreCorrupt(Some(error)))?;
+    let mut findings: u32 = 0;
+    let mut first_is_ok = false;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| StoreError::StoreCorrupt(Some(error)))?
+    {
+        let verdict: String = row
+            .get(0)
+            .map_err(|error| StoreError::StoreCorrupt(Some(error)))?;
+        findings = findings.saturating_add(1);
+        if findings == 1 {
+            first_is_ok = verdict == "ok";
+            if !first_is_ok {
+                // One finding is enough to fail closed; the rest of the
+                // checker's output is content-bearing and is never read.
+                break;
+            }
+        }
+    }
+    if findings == 1 && first_is_ok {
+        return Ok(StoreIntegrity::Ok);
+    }
+    // An empty answer counts as one finding: a checker that answered nothing
+    // proved nothing.
+    Err(StoreError::StoreIntegrity(findings.max(1)))
+}
+
+fn snapshot_failed(
+    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+) -> StoreError {
+    StoreError::SnapshotFailed(source)
+}
+
+/// One consistent pre-migration snapshot (contract revision 1.282, §4.266).
+///
+/// `VACUUM INTO` *is* the copy: SQLite performs it inside one read
+/// transaction, so the result is a consistent single-file replica with no WAL
+/// to replay, and SQLCipher re-encrypts the destination under the source's own
+/// key — the snapshot is never a plaintext copy. Retention runs after the copy
+/// and never considers the file that was just written.
+fn take_pre_migration_snapshot(
+    conn: &Connection,
+    state_dir: &Path,
+    from: i64,
+    to: i64,
+) -> Result<SnapshotStamp, StoreError> {
+    let dir = state_dir.join(SNAPSHOT_DIR);
+    prepare_state_dir(&dir).map_err(|error| snapshot_failed(Some(Box::new(error))))?;
+    let stamp = now_ms();
+    let file = format!(
+        "pre-migration-v{from:03}-to-v{to:03}-{stamp:020}-{}.sqlite3",
+        std::process::id()
+    );
+    let target = dir.join(&file);
+    let _ = std::fs::remove_file(&target);
+    let target_spec = path_str(&target).map_err(|_| snapshot_failed(None))?;
+    conn.execute("VACUUM INTO ?1", params![target_spec])
+        .map_err(|error| snapshot_failed(Some(Box::new(error))))?;
+    let bytes = std::fs::metadata(&target)
+        .map(|metadata| metadata.len())
+        .map_err(|error| snapshot_failed(Some(Box::new(error))))?;
+    if bytes == 0 {
+        // A zero-byte copy is not a rollback point; drop it and refuse.
+        let _ = std::fs::remove_file(&target);
+        return Err(snapshot_failed(None));
+    }
+    if let Err(error) = prune_snapshots(&dir, SNAPSHOT_KEEP, SNAPSHOT_BYTES_CAP, &file) {
+        // The snapshot itself is good. Failing the whole upgrade over a prune
+        // that could not finish would trade a protected migration for an
+        // unbounded directory; the next upgrade retries retention.
+        tracing::warn!(
+            error = ?error.kind(),
+            "pre-migration snapshot retention pass failed"
+        );
+    }
+    Ok(SnapshotStamp {
+        last_result: "created",
+        last_file: Some(file),
+        last_at: Some(stamp),
+    })
+}
+
+/// Keep the newest `keep` snapshots inside `cap` bytes, and never the one that
+/// was just written (contract revision 1.282).
+///
+/// Ordering is the file name's own — the stamp is zero-padded, so lexicographic
+/// order is chronological. Two rules decide what survives: the newest `keep`
+/// entries, and a running byte total under `cap`. The protected file survives
+/// even when it alone exceeds the cap: deleting the only snapshot of the
+/// upgrade in flight is the exact failure this feature exists to prevent.
+fn prune_snapshots(dir: &Path, keep: usize, cap: u64, protect: &str) -> io::Result<()> {
+    let mut entries: Vec<(String, u64)> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_string();
+                if !is_snapshot_file(&name) {
+                    return None;
+                }
+                Some((name, entry.metadata().ok()?.len()))
+            })
+            .take(MAX_SNAPSHOT_SCAN)
+            .collect(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    entries.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut kept_count = 0_usize;
+    let mut kept_bytes = 0_u64;
+    for (name, bytes) in entries {
+        let protected = name == protect;
+        let within_count = kept_count < keep;
+        let within_cap = kept_bytes.saturating_add(bytes) <= cap;
+        if protected || (within_count && within_cap) {
+            kept_count += 1;
+            kept_bytes = kept_bytes.saturating_add(bytes);
+            continue;
+        }
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    Ok(())
+}
+
+/// Snapshot file names are ours: `pre-migration-v<from>-to-v<to>-<stamp>-<pid>.sqlite3`.
+fn is_snapshot_file(name: &str) -> bool {
+    name.starts_with("pre-migration-v") && name.ends_with(".sqlite3")
+}
+
+/// Put the pre-migration snapshot back over the failed store (contract revision
+/// 1.282). The caller has already dropped the writer connection.
+///
+/// Sidecars go first: a `-wal` left beside a replaced `connector.sqlite3`
+/// would be replayed into it, which is a corrupted restore rather than a
+/// rollback. The result is verified by reopening under the store key and reading
+/// the schema version back — the literal is `restored` only when the store
+/// really answers its old version again.
+fn restore_snapshot(
+    path: &Path,
+    snapshot: Option<&str>,
+    key: &StoreKey,
+    expected: i64,
+) -> &'static str {
+    let Some(name) = snapshot else {
+        return "failed";
+    };
+    let Some(state_dir) = path.parent() else {
+        return "failed";
+    };
+    let source = state_dir.join(SNAPSHOT_DIR).join(name);
+    if !source.is_file() {
+        return "failed";
+    }
+    if remove_sidecars(path).is_err() || std::fs::copy(&source, path).is_err() {
+        return "failed";
+    }
+    match open_encrypted(path, key, true) {
+        Ok(conn) if current_schema_version(&conn) == expected => "restored",
+        _ => "failed",
+    }
+}
+
+fn write_migration_failure(state_dir: &Path, face: &MigrationFailureFace) {
+    let Ok(bytes) = serde_json::to_vec_pretty(face) else {
+        return;
+    };
+    let path = state_dir.join(MIGRATION_FAILURE_FILE);
+    let temp = state_dir.join(format!(
+        ".{MIGRATION_FAILURE_FILE}.{}.tmp",
+        std::process::id()
+    ));
+    if std::fs::write(&temp, bytes).is_ok() && std::fs::rename(&temp, &path).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_file(&temp);
+}
+
+fn clear_migration_failure(state_dir: &Path) {
+    let _ = std::fs::remove_file(state_dir.join(MIGRATION_FAILURE_FILE));
+}
+
+/// The marker is diagnostic data this module wrote; anything larger than
+/// [`MAX_MIGRATION_FAILURE_BYTES`] or unparsable reads as absent rather than
+/// failing a health read.
+fn read_migration_failure(state_dir: &Path) -> Option<MigrationFailureFace> {
+    let path = state_dir.join(MIGRATION_FAILURE_FILE);
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_MIGRATION_FAILURE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Best-effort atomic write of the schema-newer marker: the same temp-then-
+/// rename shape the migration failure marker uses, so a half-written file is
+/// never readable as a verdict.
+fn write_schema_newer(state_dir: &Path, current: i64, supported: i64) {
+    let face = SchemaNewerFace {
+        at: now_ms(),
+        current,
+        supported,
+    };
+    let Ok(bytes) = serde_json::to_vec(&face) else {
+        return;
+    };
+    let path = state_dir.join(SCHEMA_NEWER_FILE);
+    let temp = state_dir.join(format!(".{SCHEMA_NEWER_FILE}.{}.tmp", std::process::id()));
+    if std::fs::write(&temp, bytes).is_ok() && std::fs::rename(&temp, &path).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_file(&temp);
+}
+
+/// The marker is diagnostic data this module wrote; anything larger than
+/// [`MAX_SCHEMA_NEWER_BYTES`] or unparsable reads as absent rather than failing
+/// a health read.
+fn read_schema_newer(state_dir: &Path) -> Option<SchemaNewerFace> {
+    let path = state_dir.join(SCHEMA_NEWER_FILE);
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_SCHEMA_NEWER_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn file_bytes(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+/// Count and total bytes of the snapshot directory, bounded by
+/// [`MAX_SNAPSHOT_SCAN`] entries.
+fn snapshot_dir_usage(dir: &Path) -> (u32, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let mut count = 0_u32;
+    let mut bytes = 0_u64;
+    for entry in entries.flatten().take(MAX_SNAPSHOT_SCAN) {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !is_snapshot_file(&name) {
+            continue;
+        }
+        count = count.saturating_add(1);
+        bytes = bytes.saturating_add(entry.metadata().map(|metadata| metadata.len()).unwrap_or(0));
+    }
+    (count, bytes)
 }
 
 fn unavailable(error: rusqlite::Error) -> StoreError {
@@ -14403,16 +15815,18 @@ fn ensure_additive_columns(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-pub(crate) type EventLogRow = (i64, u64, Option<String>, String, String);
-
+/// 契约 1.283（§4.267）：账本里的一行就是「某账号上发生了某类变化」的指针。
+/// payload 已经从账本里移除——回放消费方拿到 (seq, type) 后去读面重取实体，
+/// 事件本身不再是投影的副本。type 沿用账本列名（wire 键也是 type）。
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventLogRecord {
     pub seq: i64,
     pub epoch: u64,
     pub account_id: Option<String>,
+    #[serde(rename = "type")]
     pub event_type: String,
-    pub payload: String,
+    pub created_at: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -14420,7 +15834,129 @@ pub struct EventLogWrite {
     pub epoch: u64,
     pub account_id: Option<String>,
     pub event_type: String,
-    pub payload: String,
+}
+
+/// Why a subscriber's cursor was rejected (contract 1.283, §4.267). Every
+/// reason means the same thing on the wire — drop the cursor and reload from
+/// trimmedThroughSeq — but the literals stay distinct so a host log and a
+/// doctor read can tell a rotated generation from a lagging subscriber or a
+/// cold start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventResetReason {
+    /// The caller presented a token this ledger did not mint (a rotation: a
+    /// fresh store, an upgrade, or an account deletion).
+    TokenMismatch,
+    /// The cursor predates the retention floor: the events it wants are gone.
+    BelowFloor,
+    /// The cursor is ahead of every seq this ledger ever assigned — a store
+    /// that was recreated under a subscriber's feet.
+    AheadOfLog,
+    /// No cursor at all: a first attach.
+    ColdStart,
+}
+
+impl EventResetReason {
+    pub fn literal(self) -> &'static str {
+        match self {
+            Self::TokenMismatch => "tokenMismatch",
+            Self::BelowFloor => "belowFloor",
+            Self::AheadOfLog => "aheadOfLog",
+            Self::ColdStart => "coldStart",
+        }
+    }
+}
+
+/// One events.list answer (contract 1.283, §4.267): the ledger's token, the
+/// reset verdict, the floor the subscriber can rely on, one bounded page of
+/// thin events, the cursor to present next, and whether more rows remain.
+///
+/// A reset never carries events: the caller's cursor is no longer meaningful,
+/// so a partial page from that cursor would be exactly the silent gap the
+/// token exists to prevent.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventLedgerPage {
+    pub token: String,
+    pub reset: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_reason: Option<&'static str>,
+    pub trimmed_through_seq: i64,
+    pub events: Vec<EventLogRecord>,
+    pub next_after_seq: i64,
+    pub truncated: bool,
+}
+
+/// The retention window one trim pass applies (contract 1.283, §4.267). Kept
+/// as a value so tests can drive tiny windows without minting 20 000 rows or
+/// six months of clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventLogRetention {
+    pub max_age_ms: u64,
+    pub max_rows: i64,
+    pub max_bytes: u64,
+}
+
+pub const EVENT_LOG_RETENTION: EventLogRetention = EventLogRetention {
+    max_age_ms: EVENT_LOG_RETENTION_MS,
+    max_rows: EVENT_LOG_MAX_ROWS,
+    max_bytes: EVENT_LOG_MAX_BYTES,
+};
+
+/// What one trim pass did (contract 1.283, §4.267).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventTrimOutcome {
+    pub removed: u64,
+    pub trimmed_through_seq: i64,
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+/// The ledger's read-only health face (contract 1.283, §4.267): generation,
+/// floor, head, rows and bytes, plus the retention window they are held to.
+/// The token itself never appears here — doctor output is copied into bug
+/// reports, and the token is the only value a stale subscriber could replay
+/// with.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventLogHealth {
+    pub readable: bool,
+    pub token_generation: u64,
+    pub trimmed_through_seq: i64,
+    pub seq_max: i64,
+    pub rows: u64,
+    pub bytes: u64,
+    pub oldest_created_at: Option<u64>,
+    pub newest_created_at: Option<u64>,
+    pub retention: EventLogRetentionHealth,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventLogRetentionHealth {
+    pub max_age_ms: u64,
+    pub max_rows: i64,
+    pub max_bytes: u64,
+}
+
+impl EventLogHealth {
+    fn unreadable() -> Self {
+        Self {
+            readable: false,
+            token_generation: 0,
+            trimmed_through_seq: 0,
+            seq_max: 0,
+            rows: 0,
+            bytes: 0,
+            oldest_created_at: None,
+            newest_created_at: None,
+            retention: EventLogRetentionHealth {
+                max_age_ms: EVENT_LOG_RETENTION.max_age_ms,
+                max_rows: EVENT_LOG_RETENTION.max_rows,
+                max_bytes: EVENT_LOG_RETENTION.max_bytes,
+            },
+        }
+    }
 }
 
 pub(crate) fn append_event_log_on(
@@ -14428,15 +15964,251 @@ pub(crate) fn append_event_log_on(
     epoch: u64,
     account_id: Option<&str>,
     event_type: &str,
-    payload: &str,
 ) -> Result<i64, StoreError> {
     conn.execute(
-        "INSERT INTO event_log(epoch, account_id, type, payload, created_at)
-         VALUES(?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![epoch, account_id, event_type, payload, now_ms()],
+        "INSERT INTO event_log(epoch, account_id, type, created_at)
+         VALUES(?1, ?2, ?3, ?4)",
+        rusqlite::params![epoch, account_id, event_type, now_ms()],
     )
     .map_err(|error| StoreError::Unavailable(Some(error)))?;
     Ok(conn.last_insert_rowid())
+}
+
+/// The ledger's single state row (contract 1.283, §4.267).
+struct EventLedgerState {
+    token: String,
+    generation: u64,
+    floor: i64,
+}
+
+fn event_ledger_state_on(conn: &Connection) -> Result<EventLedgerState, rusqlite::Error> {
+    conn.query_row(
+        "SELECT token, generation, floor FROM event_log_state WHERE id=1",
+        [],
+        |row| {
+            Ok(EventLedgerState {
+                token: row.get(0)?,
+                generation: row.get::<_, i64>(1)?.max(0) as u64,
+                floor: row.get(2)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// One bounded page of thin rows, stopping on the caller's limit and on the
+/// response byte budget (an event is always delivered when it is the first of
+/// its page, so a caller can never be wedged by a budget smaller than one row).
+/// The truncation flag is true when a row exists beyond what this page carries.
+fn read_event_page(
+    conn: &Connection,
+    after: i64,
+    limit: u32,
+    byte_budget: u64,
+) -> Result<(Vec<EventLogRecord>, bool), rusqlite::Error> {
+    let mut statement = conn.prepare(
+        "SELECT seq, epoch, account_id, type, created_at
+           FROM event_log WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
+    )?;
+    // One row past the limit is the truncation probe: fetching it means "there
+    // is more", and it is never returned.
+    let mut rows = statement.query(params![after, i64::from(limit) + 1])?;
+    let mut events: Vec<EventLogRecord> = Vec::new();
+    let mut used = 0_u64;
+    while let Some(row) = rows.next()? {
+        if events.len() >= limit as usize {
+            return Ok((events, true));
+        }
+        let record = EventLogRecord {
+            seq: row.get(0)?,
+            epoch: row.get(1)?,
+            account_id: row.get(2)?,
+            event_type: row.get(3)?,
+            created_at: row.get(4)?,
+        };
+        // The budget is measured on the wire frame, not on the row: the answer
+        // the host will serialize is the thing that has to stay bounded.
+        let cost = serde_json::to_string(&record)
+            .map(|frame| frame.len() as u64 + 1)
+            .unwrap_or(0);
+        if !events.is_empty() && used + cost > byte_budget {
+            return Ok((events, true));
+        }
+        used += cost;
+        events.push(record);
+    }
+    Ok((events, false))
+}
+
+/// The highest seq the retention window says must leave (contract 1.283,
+/// §4.267): the max of the age boundary, the row-count boundary and the byte
+/// boundary. All three are head cuts — the ledger is a log, so the oldest rows
+/// are the ones that go.
+fn event_trim_cut(
+    conn: &Connection,
+    now_ms: u64,
+    retention: EventLogRetention,
+) -> Result<i64, rusqlite::Error> {
+    let cutoff = now_ms
+        .saturating_sub(retention.max_age_ms)
+        .min(i64::MAX as u64) as i64;
+    let age_cut: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM event_log WHERE created_at < ?1",
+        params![cutoff],
+        |row| row.get(0),
+    )?;
+    // Keep the newest max_rows rows: the row one past the window is the cut,
+    // and deleting seq <= cut leaves exactly the window behind. An absent row
+    // past the window (the ledger is inside it) reads as "no cut".
+    let row_cut: i64 = conn.query_row(
+        "SELECT COALESCE(
+           (SELECT seq FROM event_log ORDER BY seq DESC LIMIT 1 OFFSET ?1), 0)",
+        params![retention.max_rows.max(0)],
+        |row| row.get(0),
+    )?;
+    // Keep the newest rows whose cumulative row cost fits the byte ceiling. The
+    // window sum runs newest-first, so the rows over the ceiling are exactly
+    // the head; MAX(seq) of that set is the cut.
+    let byte_cut: i64 = conn.query_row(
+        &format!(
+            "SELECT COALESCE(MAX(seq), 0) FROM
+               (SELECT seq, SUM({EVENT_ROW_BYTES_SQL}) OVER (ORDER BY seq DESC) AS cumulative
+                  FROM event_log)
+             WHERE cumulative > ?1"
+        ),
+        params![retention.max_bytes.min(i64::MAX as u64) as i64],
+        |row| row.get(0),
+    )?;
+    Ok(age_cut.max(row_cut).max(byte_cut))
+}
+
+/// Rows and estimated bytes under the same expression the retention window
+/// uses, so the health face and the trimmer can never disagree about size.
+fn event_ledger_usage(conn: &Connection) -> Result<(u64, u64), rusqlite::Error> {
+    let (rows, bytes): (i64, i64) = conn.query_row(
+        &format!("SELECT COUNT(*), COALESCE(SUM({EVENT_ROW_BYTES_SQL}), 0) FROM event_log"),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((rows.max(0) as u64, bytes.max(0) as u64))
+}
+
+/// Seed the ledger's state row when it is absent (contract 1.283, §4.267).
+/// Idempotent and shape-driven: an existing row — and therefore its token —
+/// is never rewritten here, so opening a store always preserves whatever
+/// generation its subscribers already hold.
+fn seed_event_log_state(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO event_log_state(id, token, generation, floor, updated_at)
+         VALUES(1, ?1, 1, 0, ?2)",
+        params![random_id(), now_ms().min(i64::MAX as u64) as i64],
+    )
+    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(())
+}
+
+/// Rotate the ledger's generation (contract 1.283, §4.267): a new random token
+/// and a bumped counter. Called inside the caller's transaction — the account
+/// deletion rotates the token in the same commit that removes its rows, so no
+/// subscriber can observe a half-deleted stream.
+pub(crate) fn rotate_event_log_token_on(
+    conn: &Connection,
+    now_ms: u64,
+) -> Result<String, StoreError> {
+    let token = random_id();
+    conn.execute(
+        "INSERT INTO event_log_state(id, token, generation, floor, updated_at)
+         VALUES(1, ?1, 1, 0, ?2)
+         ON CONFLICT(id) DO UPDATE SET
+           token=excluded.token,
+           generation=generation+1,
+           updated_at=excluded.updated_at",
+        params![token, now_ms.min(i64::MAX as u64) as i64],
+    )
+    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(token)
+}
+
+/// 契约 1.283（§4.267）：v50 的形状收尾。payload 列从 event_log 里消失，孤儿
+/// 行（账号已经不存在的账号级事件）清掉，状态行播种 token + floor。
+///
+/// **形状驱动**：不看版本号，只看 payload 列在不在。版本号已经写成 50、但重建
+/// 被崩溃打断的库照样收尾；重建成一条 BEGIN IMMEDIATE / COMMIT，任何一步失败
+/// ROLLBACK，绝不留下「旧表已 drop、新表还没 rename」的库。
+///
+/// 保留 seq/epoch/account_id/type/created_at 原值——thin ledger 里旧行仍然是
+/// 合法的「变化指针」，消费方看到它去读面重取实体即可；token 是新播的，所以
+/// 任何旧游标都会在第一次 events.list 得到 reset，而不是从半张账本继续。
+///
+/// 孤儿清理只在**升级这一次**跑（clear_orphans）：账本只能由存在的账号写出
+/// 事件，v1.283 之后的删除路径会显式删掉自己那一行，所以孤儿是历史遗留（v46
+/// 到 v49 的删除不认账本）。每次开库都跑一遍既没必要，也会把「事件先于账号行
+/// 落地」这类合法顺序当成脏数据。
+fn ensure_event_log_ledger(conn: &Connection, clear_orphans: bool) -> Result<(), StoreError> {
+    rebuild_event_log_without_payload(conn)?;
+    if clear_orphans
+        && table_exists(conn, "accounts").map_err(|error| StoreError::Unavailable(Some(error)))?
+    {
+        // 孤儿：账号行已经不在了，但账本还留着一行「这个账号变了」。它永远
+        // 读不出实体，只会让消费方反复重取一个不存在的账号，所以迁移时清掉。
+        conn.execute(
+            "DELETE FROM event_log
+              WHERE account_id IS NOT NULL
+                AND account_id NOT IN (SELECT id FROM accounts)",
+            [],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
+    seed_event_log_state(conn)?;
+    Ok(())
+}
+
+/// Rebuild the ledger without its payload column (contract 1.283, §4.267).
+/// SQLite cannot drop a column in a way that rewrites the table's shape here,
+/// so this is the create-copy-drop-rename path: one transaction, no view or
+/// index left dangling, and the AUTOINCREMENT high-water travels with the rows
+/// (the sequence is rebuilt from the largest copied seq, so no future event can
+/// reuse a trimmed seq).
+fn rebuild_event_log_without_payload(conn: &Connection) -> Result<bool, StoreError> {
+    const LIVE: &str = "event_log";
+    const REBUILD: &str = "event_log_v50_rebuild";
+    if !table_exists(conn, LIVE).map_err(|error| StoreError::Unavailable(Some(error)))? {
+        return Ok(false);
+    }
+    let columns =
+        table_column_names(conn, LIVE).map_err(|error| StoreError::Unavailable(Some(error)))?;
+    if !columns.iter().any(|column| column == "payload") {
+        return Ok(false);
+    }
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let rebuilt = (|| -> Result<(), StoreError> {
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {REBUILD};
+             CREATE TABLE {REBUILD} (
+               seq INTEGER PRIMARY KEY AUTOINCREMENT,
+               epoch INTEGER NOT NULL,
+               account_id TEXT,
+               type TEXT NOT NULL,
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO {REBUILD}(seq, epoch, account_id, type, created_at)
+               SELECT seq, epoch, account_id, type, created_at FROM {LIVE};
+             DROP TABLE {LIVE};
+             ALTER TABLE {REBUILD} RENAME TO {LIVE};
+             CREATE INDEX IF NOT EXISTS event_log_account ON {LIVE}(account_id, seq);"
+        ))
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    })();
+    if let Err(error) = rebuilt {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+    conn.execute_batch("COMMIT;")
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(true)
 }
 
 fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
@@ -14448,7 +16220,13 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         )
         .unwrap_or(0);
     if current > SCHEMA_VERSION {
-        return Err(StoreError::Unavailable(None));
+        // Defence in depth behind `Store::open`'s own gate: a caller that
+        // reaches the ladder directly still gets the classified answer, never
+        // a bare `Unavailable` (contract revision 1.284, §4.268).
+        return Err(StoreError::SchemaNewer {
+            current,
+            supported: SCHEMA_VERSION,
+        });
     }
     if current < 2 {
         // Older DBs created before display_name column.
@@ -15339,6 +17117,23 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         )
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
+    if current < 48 {
+        // 契约 1.279（§4.263）：出站附件原始 payload 表。表与索引由
+        // SCHEMA_DDL 的 CREATE TABLE IF NOT EXISTS 建立——这里只推进版本号，
+        // 没有数据迁移；旧库里已有的失败行在修复前没有 payload，重试会
+        // 要求调用方带 bytes。（v49 把主键改成
+        // (account_id, client_request_id, attachment_index) 并重写这张表，见下。）
+    }
+    // 契约 1.280（§4.264）：payload 表的主键重建。这一步是**形状驱动**的，
+    // 既不被版本号跳过，也不假设「跑到一半」不存在：版本号已经写成 49 的库
+    // 可能还是中间形状（(client_request_id, attachment_index)，主键不含
+    // account_id），上一次非事务重建被打断的库还留着 staging 残表。两种状态
+    // 都在这里收尾（见 migrate_outgoing_attachment_payloads 的文档注释）。
+    migrate_outgoing_attachment_payloads(conn)?;
+    // 契约 1.283（§4.267）：thin ledger 的形状收尾（去 payload）、孤儿事件清理
+    // 与 token/floor 播种。同样形状驱动：v50 之前的库在这里重建一次，之后每次
+    // 开库只做一次幂等播种，没有迁移成本。
+    ensure_event_log_ledger(conn, current < SCHEMA_VERSION)?;
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -15346,6 +17141,134 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
     )
     .map_err(|error| StoreError::Unavailable(Some(error)))?;
     Ok(())
+}
+
+/// 契约 1.280（§4.264）：payload 表的主键重建，形状驱动、一条事务、可从中断里
+/// 收尾。
+///
+/// 主键必须恰好是 (account_id, client_request_id, attachment_index)：同一个
+/// clientRequestId 只在**一个账号内**幂等——两个账号可以用同一个 id，各自必须
+/// 能写、也必须读回自己的字节，所以账号落在主键第一段。SQLite 改不了主键，只能
+/// create-copy-drop-rename（并重建 account/conversation 索引）。
+///
+/// 这里不看版本号，只看表形状，因为版本号不是安全网：
+/// - 版本号已经写成 49 的库可能还是中间形状 (client_request_id,
+///   attachment_index)，主键还不含 account_id；
+/// - 上一次重建（旧实现逐条 DDL、没有事务）被打断的库会留下残表
+///   outgoing_attachment_payloads_v49：已经搬过去的行在残表里，没搬到的还在
+///   现表里。残表不是「跳过」的信号，而是搬运要继续的目标——先把现表按主键
+///   写进重建表（INSERT OR IGNORE 让已经搬过的行自然去重），再合并残表里现表
+///   已经没有的行；崩溃发生在 DROP 之后时现表只剩 SCHEMA_DDL 刚建的空表，
+///   残表里的整组行就是唯一副本，同样会被 rename 回来；
+/// - 现表形状有 attachment_index（v49 中间形态）就原样搬 index，没有（v48
+///   单键）就按 index 0 搬——那一代只可能是单附件，index 0 就是它自己的位置，
+///   account/conversation/data_uri 与两个时间戳全部保留。
+///
+/// 整个过程是一条 BEGIN IMMEDIATE / COMMIT：任何一步失败 ROLLBACK，绝不会留下
+/// 「旧表已 drop、新表还没 rename」的库，合并进来的残表行也一起回滚，下次开库
+/// 重来。返回是否真的重建过（测试与调用方观测用）。
+fn migrate_outgoing_attachment_payloads(conn: &Connection) -> Result<bool, StoreError> {
+    const LIVE: &str = "outgoing_attachment_payloads";
+    const RESIDUAL: &str = "outgoing_attachment_payloads_v49";
+    const REBUILD: &str = "outgoing_attachment_payloads_rebuild";
+    const TARGET_KEY: [&str; 3] = ["account_id", "client_request_id", "attachment_index"];
+    // SCHEMA_DDL 已经跑过，现表在任何一条路径上都存在；残表只在重建被打断
+    // 之后才存在。
+    if !table_exists(conn, LIVE).map_err(|error| StoreError::Unavailable(Some(error)))? {
+        return Ok(false);
+    }
+    let residual_exists =
+        table_exists(conn, RESIDUAL).map_err(|error| StoreError::Unavailable(Some(error)))?;
+    if !residual_exists
+        && table_primary_key_columns(conn, LIVE)
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            == TARGET_KEY
+    {
+        return Ok(false);
+    }
+    let live_index_expression = if table_column_names(conn, LIVE)
+        .map_err(|error| StoreError::Unavailable(Some(error)))?
+        .iter()
+        .any(|column| column == "attachment_index")
+    {
+        "attachment_index"
+    } else {
+        "0"
+    };
+    let residual_index_expression = if residual_exists
+        && table_column_names(conn, RESIDUAL)
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .iter()
+            .any(|column| column == "attachment_index")
+    {
+        "attachment_index"
+    } else {
+        "0"
+    };
+    let rebuild_ddl = format!(
+        "CREATE TABLE {REBUILD} (
+           account_id TEXT NOT NULL,
+           client_request_id TEXT NOT NULL,
+           attachment_index INTEGER NOT NULL,
+           conversation_id TEXT NOT NULL,
+           data_uri TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY(account_id, client_request_id, attachment_index),
+           FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+         );"
+    );
+    let payload_columns = "account_id, client_request_id, attachment_index,
+           conversation_id, data_uri, created_at, updated_at";
+    let copy_from_live = format!(
+        "INSERT OR IGNORE INTO {REBUILD}({payload_columns})
+           SELECT account_id, client_request_id, {live_index_expression},
+                  conversation_id, data_uri, created_at, updated_at
+             FROM {LIVE};"
+    );
+    let copy_from_residual = format!(
+        "INSERT OR IGNORE INTO {REBUILD}({payload_columns})
+           SELECT account_id, client_request_id, {residual_index_expression},
+                  conversation_id, data_uri, created_at, updated_at
+             FROM {RESIDUAL};"
+    );
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let rebuilt = (|| -> Result<(), StoreError> {
+        conn.execute_batch(&format!("DROP TABLE IF EXISTS {REBUILD};"))
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        conn.execute_batch(&rebuild_ddl)
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // 现表是这一代记录的真身：它先落重建表，残表只补它缺的行（已经搬过的
+        // 行被主键挡掉，不会双写）。
+        conn.execute_batch(&copy_from_live)
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if residual_exists {
+            conn.execute_batch(&copy_from_residual)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        conn.execute_batch(&format!("DROP TABLE {LIVE};"))
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        conn.execute_batch(&format!("ALTER TABLE {REBUILD} RENAME TO {LIVE};"))
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS outgoing_attachment_payloads_account
+               ON {LIVE}(account_id, conversation_id);"
+        ))
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if residual_exists {
+            conn.execute_batch(&format!("DROP TABLE {RESIDUAL};"))
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = rebuilt {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+    conn.execute_batch("COMMIT;")
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(true)
 }
 
 /// The S21 one-shot backfill (contract 1.262 §4.245): rebuild the archive
@@ -15960,6 +17883,12 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
     let quote_snapshot: Option<String> = row.get("quote_snapshot")?;
     let attachments_json: Option<String> = row.get("attachments_json")?;
     let rich_json: Option<String> = row.get("rich_json")?;
+    let direction = static_direction(row.get::<_, String>("direction")?);
+    let status = static_status(row.get::<_, String>("status")?);
+    let attachments: Vec<MessageAttachmentInfo> = attachments_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default();
     Ok(MessageRecord {
         is_erased: row.get::<_, i64>("is_erased")? != 0,
         delete_failed: row.get::<_, i64>("delete_failed")? != 0,
@@ -15967,7 +17896,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         id: row.get("id")?,
         account_id: row.get("account_id")?,
         conversation_id: row.get("conversation_id")?,
-        direction: static_direction(row.get::<_, String>("direction")?),
+        direction,
         sender_id: row.get("sender_id")?,
         sent_at: row.get::<_, i64>("sent_at")? as u64,
         received_at: row
@@ -15977,17 +17906,14 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         text,
         text_bytes,
         text_truncated: persisted_truncated,
-        status: static_status(row.get::<_, String>("status")?),
+        status,
         client_request_id: row.get("client_request_id")?,
         quote_message_id: row.get("quote_message_id")?,
         quote_snapshot: quote_snapshot
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
         quote: None,
-        attachments: attachments_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok())
-            .unwrap_or_default(),
+        attachments,
         rich: rich_json
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
@@ -16179,18 +18105,20 @@ mod tests {
                 .unwrap_or(0),
             account_id: Some(account.id.clone()),
             event_type: "message.upserted".into(),
-            payload: "{}".into(),
         };
         assert!(
             store
                 .insert_message_with_event(&message, None, Some("atomic"), true, &event)
                 .unwrap()
         );
-        let rows = store.list_events_since(0, 10).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].3, "message.upserted");
-        assert_eq!(rows[0].2.as_deref(), Some(account.id.as_str()));
-        let seq = rows[0].0;
+        let page = store.events_page(Some(0), None, 10).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event_type, "message.upserted");
+        assert_eq!(
+            page.events[0].account_id.as_deref(),
+            Some(account.id.as_str())
+        );
+        let seq = page.events[0].seq;
 
         // 1. restart: message and event survive.
         drop(store);
@@ -16206,10 +18134,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
-        assert_eq!(store.list_events_since(0, 10).unwrap().len(), 1);
-        let records = store.events_since(0, 10).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].event_type, "message.upserted");
+        let records = store.events_page(Some(0), None, 10).unwrap();
+        assert_eq!(records.events.len(), 1);
+        assert_eq!(records.events[0].event_type, "message.upserted");
 
         // 2. unlink keeps history and bumps epoch.
         store.set_event_cursor("desktop", seq, 1).unwrap();
@@ -16295,15 +18222,16 @@ mod tests {
         assert!(store.advance_inbound_watermark("a", 2, 1).unwrap());
 
         let first = store
-            .append_event_log(1, Some("a"), "account.changed", "{}")
+            .append_event_log(1, Some("a"), "account.changed")
             .unwrap();
         let second = store
-            .append_event_log(1, Some("a"), "message.upserted", "{}")
+            .append_event_log(1, Some("a"), "message.upserted")
             .unwrap();
         assert_eq!(second, first + 1);
-        let rows = store.list_events_since(0, 10).unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1, 1);
+        let page = store.events_page(Some(0), None, 10).unwrap();
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.events[0].epoch, 1);
+        assert_eq!(page.trimmed_through_seq, 0);
 
         store.set_event_cursor("sub", second, 1).unwrap();
         assert_eq!(store.event_cursor("sub").unwrap(), Some((second, 1)));
@@ -16328,7 +18256,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let result: Result<(), StoreError> = store.write_transaction(|tx| {
-            append_event_log_on(tx, 1, Some("a"), "must.rollback", "{}")?;
+            append_event_log_on(tx, 1, Some("a"), "must.rollback")?;
             Err(StoreError::Unavailable(None))
         });
         assert!(result.is_err());
@@ -16342,7 +18270,7 @@ mod tests {
 
         store
             .write_transaction(|tx| {
-                append_event_log_on(tx, 1, Some("a"), "must.commit", "{}")?;
+                append_event_log_on(tx, 1, Some("a"), "must.commit")?;
                 Ok(())
             })
             .unwrap();
@@ -16353,6 +18281,491 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM event_log", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ---- 契约 1.283（§4.267）：thin ledger + 头部保留窗 + 游标代际 --------
+
+    /// One ledger page through the public face, with the token this ledger
+    /// currently hands out (the cold-start reset is the bootstrap path a real
+    /// subscriber uses).
+    fn ledger_page(
+        store: &Store,
+        after: Option<i64>,
+        token: Option<&str>,
+        limit: u32,
+    ) -> EventLedgerPage {
+        store.events_page(after, token, limit).unwrap()
+    }
+
+    fn ledger_token(store: &Store) -> String {
+        ledger_page(store, None, None, 10).token
+    }
+
+    fn append_events(store: &Store, count: usize) -> Vec<i64> {
+        (0..count)
+            .map(|index| {
+                store
+                    .append_event_log(
+                        1,
+                        Some("a"),
+                        if index % 2 == 0 {
+                            "message.upserted"
+                        } else {
+                            "conversation.changed"
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// The cursor face: a cold start resets, a stamped page resumes, the
+    /// truncation flag is honest, and a page never carries a payload.
+    #[test]
+    fn event_ledger_pages_forward_under_one_token() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        append_events(&store, 3);
+
+        let cold = ledger_page(&store, None, None, 10);
+        assert!(cold.reset);
+        assert_eq!(cold.reset_reason, Some("coldStart"));
+        assert!(cold.events.is_empty(), "a reset never clamps events");
+        assert_eq!(cold.trimmed_through_seq, 0);
+        assert_eq!(cold.next_after_seq, 0);
+        assert!(!cold.truncated);
+        let token = cold.token.clone();
+        assert_eq!(token.len(), 32, "the token is one random generation stamp");
+
+        let page = ledger_page(&store, Some(0), Some(&token), 10);
+        assert!(!page.reset);
+        assert_eq!(page.reset_reason, None);
+        assert_eq!(page.events.len(), 3);
+        assert_eq!(page.events[0].seq, 1);
+        assert_eq!(page.events[0].event_type, "message.upserted");
+        assert_eq!(page.events[0].account_id.as_deref(), Some("a"));
+        assert_eq!(page.next_after_seq, 3);
+        assert!(!page.truncated);
+        // Thin: the wire row carries the pointer and its stamp, never a body.
+        let wire = serde_json::to_value(&page.events[0]).unwrap();
+        assert_eq!(wire["type"], json!("message.upserted"));
+        assert!(wire.get("payload").is_none());
+        assert!(wire.get("createdAt").is_some());
+
+        let first = ledger_page(&store, Some(0), Some(&token), 2);
+        assert_eq!(first.events.len(), 2);
+        assert_eq!(first.next_after_seq, 2);
+        assert!(first.truncated, "a third row exists beyond this page");
+
+        let rest = ledger_page(&store, Some(first.next_after_seq), Some(&token), 2);
+        assert_eq!(rest.events.len(), 1);
+        assert_eq!(rest.events[0].seq, 3);
+        assert!(!rest.truncated);
+
+        let idle = ledger_page(&store, Some(3), Some(&token), 2);
+        assert!(idle.events.is_empty());
+        assert_eq!(idle.next_after_seq, 3, "an idle poll keeps the cursor put");
+    }
+
+    /// The four reset criteria, each on its own: a rotated token, no cursor at
+    /// all, a cursor below the floor, and a cursor ahead of the ledger.
+    #[test]
+    fn event_ledger_resets_on_token_floor_and_head() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        append_events(&store, 4);
+        let token = ledger_token(&store);
+
+        let mismatched = ledger_page(&store, Some(1), Some("not-this-generation"), 10);
+        assert!(mismatched.reset);
+        assert_eq!(mismatched.reset_reason, Some("tokenMismatch"));
+        assert!(mismatched.events.is_empty());
+
+        let cold = ledger_page(&store, None, None, 10);
+        assert_eq!(cold.reset_reason, Some("coldStart"));
+
+        // Trim the first two rows: a cursor that points at them is dead.
+        let retention = EventLogRetention {
+            max_age_ms: u64::MAX,
+            max_rows: 2,
+            max_bytes: u64::MAX,
+        };
+        let trimmed = store
+            .trim_event_log_with(crate::link::now_ms(), retention)
+            .unwrap();
+        assert_eq!(trimmed.removed, 2);
+        assert_eq!(trimmed.trimmed_through_seq, 2);
+
+        let below = ledger_page(&store, Some(1), Some(&token), 10);
+        assert!(below.reset);
+        assert_eq!(below.reset_reason, Some("belowFloor"));
+        assert_eq!(below.trimmed_through_seq, 2);
+        assert_eq!(below.next_after_seq, 2);
+        assert!(below.events.is_empty());
+
+        let ahead = ledger_page(&store, Some(99), Some(&token), 10);
+        assert!(ahead.reset);
+        assert_eq!(ahead.reset_reason, Some("aheadOfLog"));
+
+        // The floor itself is a valid cursor: it neither resets nor skips.
+        let at_floor = ledger_page(&store, Some(2), Some(&token), 10);
+        assert!(!at_floor.reset);
+        assert_eq!(at_floor.events.first().map(|event| event.seq), Some(3));
+        assert_eq!(at_floor.events.len(), 2);
+    }
+
+    /// The head window: age, row count and bytes each cut on their own, the
+    /// floor follows the rows, and a second pass over the same ledger is a
+    /// quiet no-op (the floor never moves backwards).
+    #[test]
+    fn event_ledger_trim_honours_age_rows_and_bytes() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let now = crate::link::now_ms();
+        append_events(&store, 10);
+        // Five rows age out; the newest five stay inside the window.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE event_log SET created_at=?1 WHERE seq <= 5",
+                params![now.saturating_sub(120_000) as i64],
+            )
+            .unwrap();
+
+        let age = store
+            .trim_event_log_with(
+                now,
+                EventLogRetention {
+                    max_age_ms: 60_000,
+                    max_rows: i64::MAX,
+                    max_bytes: u64::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(age.removed, 5);
+        assert_eq!(age.trimmed_through_seq, 5);
+        assert_eq!(age.rows, 5);
+
+        // The row cap binds next: five rows in, keep two.
+        let rows = store
+            .trim_event_log_with(
+                now,
+                EventLogRetention {
+                    max_age_ms: u64::MAX,
+                    max_rows: 2,
+                    max_bytes: u64::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(rows.removed, 3);
+        assert_eq!(rows.trimmed_through_seq, 8);
+        assert_eq!(rows.rows, 2);
+
+        // Then the byte ceiling: the row cost is 27 + type + account + 12, so
+        // the newest row (60 bytes) fits a 100-byte ceiling and the one behind
+        // it (56 more) does not.
+        let bytes = store
+            .trim_event_log_with(
+                now,
+                EventLogRetention {
+                    max_age_ms: u64::MAX,
+                    max_rows: i64::MAX,
+                    max_bytes: 100,
+                },
+            )
+            .unwrap();
+        assert_eq!(bytes.removed, 1, "one row's cost fits, two do not");
+        assert_eq!(bytes.trimmed_through_seq, 9);
+        assert_eq!(bytes.rows, 1);
+
+        // Idempotent, and the floor never regresses on a wider window.
+        let again = store
+            .trim_event_log_with(
+                now,
+                EventLogRetention {
+                    max_age_ms: u64::MAX,
+                    max_rows: 100,
+                    max_bytes: u64::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(again.removed, 0);
+        assert_eq!(again.trimmed_through_seq, 9);
+        assert_eq!(store.event_log_health().trimmed_through_seq, 9);
+        assert!(ledger_page(&store, None, None, 10).reset);
+    }
+
+    /// The floor and the deletion are one transaction: a delete that cannot
+    /// land leaves the floor exactly where it was (a floor that promises rows
+    /// it still has, or rows a floor refuses, is the failure this rules out).
+    #[test]
+    fn event_ledger_trim_is_atomic_with_the_floor() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        append_events(&store, 4);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER event_ledger_guard BEFORE DELETE ON event_log
+                 BEGIN SELECT RAISE(ABORT, 'ledger delete blocked'); END;",
+            )
+            .unwrap();
+
+        let outcome = store.trim_event_log_with(
+            crate::link::now_ms(),
+            EventLogRetention {
+                max_age_ms: u64::MAX,
+                max_rows: 1,
+                max_bytes: u64::MAX,
+            },
+        );
+        assert!(
+            outcome.is_err(),
+            "the aborted delete must not be reported as a trim"
+        );
+        // Nothing moved: floor 0, all four rows, and the cursor face still
+        // serves them.
+        let health = store.event_log_health();
+        assert_eq!(health.trimmed_through_seq, 0);
+        assert_eq!(health.rows, 4);
+        let token = ledger_token(&store);
+        assert_eq!(
+            ledger_page(&store, Some(0), Some(&token), 10).events.len(),
+            4
+        );
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER event_ledger_guard;")
+            .unwrap();
+        let trimmed = store
+            .trim_event_log_with(
+                crate::link::now_ms(),
+                EventLogRetention {
+                    max_age_ms: u64::MAX,
+                    max_rows: 1,
+                    max_bytes: u64::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(trimmed.removed, 3);
+        assert_eq!(trimmed.trimmed_through_seq, 3);
+    }
+
+    /// The generation survives a restart: reopening the store keeps the token,
+    /// so a subscriber that was closed politely resumes instead of resetting.
+    #[test]
+    fn event_ledger_generation_survives_reopen() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        append_events(&store, 2);
+        let token = ledger_token(&store);
+        store
+            .trim_event_log_with(
+                crate::link::now_ms(),
+                EventLogRetention {
+                    max_age_ms: u64::MAX,
+                    max_rows: 1,
+                    max_bytes: u64::MAX,
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert_eq!(reopened.event_log_health().trimmed_through_seq, 1);
+        let page = ledger_page(&reopened, Some(1), Some(&token), 10);
+        assert!(!page.reset, "the same generation resumes across a restart");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.next_after_seq, 2);
+    }
+
+    /// The response byte budget stops a page before it crosses the ceiling and
+    /// says so — while still delivering the first row, so a caller can always
+    /// make progress.
+    #[test]
+    fn event_ledger_page_respects_the_byte_budget() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        append_events(&store, 6);
+        let token = ledger_token(&store);
+
+        let page = store
+            .events_page_with(Some(0), Some(&token), 500, 100)
+            .unwrap();
+        assert_eq!(page.events.len(), 1, "one frame fits the 100-byte budget");
+        assert!(page.truncated);
+        assert_eq!(page.next_after_seq, 1);
+
+        // The same page under an impossible budget still carries its first row.
+        let tiny = store
+            .events_page_with(Some(0), Some(&token), 500, 1)
+            .unwrap();
+        assert_eq!(tiny.events.len(), 1);
+        assert!(tiny.truncated);
+    }
+
+    /// Account deletion is the token's other rotation point: the account's
+    /// rows leave, every other account's rows stay, the receipt counts the
+    /// ledger's rows, and the subscriber is told to reset.
+    #[test]
+    fn event_ledger_account_delete_cascades_and_rotates_the_token() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let doomed = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let kept = store
+            .upsert_account_from_signal("+15555550101", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .append_event_log(1, Some(&doomed.id), "message.upserted")
+            .unwrap();
+        store
+            .append_event_log(1, Some(&kept.id), "message.upserted")
+            .unwrap();
+        store
+            .append_event_log(1, Some(&doomed.id), "conversation.changed")
+            .unwrap();
+        let before = ledger_token(&store);
+        assert_eq!(store.event_log_health().token_generation, 1);
+
+        let receipt = store
+            .complete_account_delete_recorded(&doomed.id, None, crate::link::now_ms())
+            .unwrap()
+            .expect("a live account is deleted");
+        assert_eq!(receipt.table_counts.get("event_log"), Some(&2));
+
+        let after = store.event_log_health();
+        assert_eq!(after.rows, 1, "only the surviving account's row is left");
+        assert_eq!(after.token_generation, 2, "the generation rotated");
+        let current = ledger_token(&store);
+        assert_ne!(before, current);
+        let reset = ledger_page(&store, Some(0), Some(&before), 10);
+        assert!(reset.reset);
+        assert_eq!(reset.reset_reason, Some("tokenMismatch"));
+        assert!(reset.events.is_empty());
+        assert_eq!(
+            ledger_page(&store, Some(0), Some(&current), 10)
+                .events
+                .len(),
+            1
+        );
+    }
+
+    /// v50: the stored ledger loses its payload column, keeps its surviving
+    /// rows and their seq/type, clears the deleted account's rows, and seeds a
+    /// fresh generation at floor 0 — so the first subscriber reset is honest
+    /// rather than a replay of a half-thin log.
+    #[test]
+    fn schema_v50_thin_ledger_migration_drops_payload_and_clears_orphans() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let path = legacy_store(
+            &state_dir,
+            20,
+            "INSERT INTO accounts(id, signal_account, masked_address, state)
+               VALUES('acc-1', '+15555550100', '+15***00', 'ready');
+             CREATE TABLE event_log (
+               seq INTEGER PRIMARY KEY AUTOINCREMENT,
+               epoch INTEGER NOT NULL,
+               account_id TEXT,
+               type TEXT NOT NULL,
+               payload TEXT NOT NULL,
+               created_at INTEGER NOT NULL
+             );
+             CREATE INDEX event_log_account ON event_log(account_id, seq);
+             INSERT INTO event_log(epoch, account_id, type, payload, created_at) VALUES
+               (1, 'acc-1', 'message.upserted', '{\"body\":\"secret\"}', 100),
+               (1, 'gone', 'message.upserted', '{\"body\":\"orphan\"}', 200),
+               (1, NULL, 'storage.changed', '{}', 300);",
+        );
+        // The old ledger really carries payloads and a deleted account's row.
+        let legacy = keyed(&path);
+        assert!(
+            table_column_names(&legacy, "event_log")
+                .unwrap()
+                .iter()
+                .any(|column| column == "payload")
+        );
+        drop(legacy);
+
+        let store = Store::open(&state_dir, Some(test_store_key())).unwrap();
+        let health = store.event_log_health();
+        assert!(health.readable);
+        assert_eq!(health.rows, 2, "the deleted account's row is an orphan");
+        assert_eq!(health.trimmed_through_seq, 0);
+        assert_eq!(health.token_generation, 1);
+        assert_eq!(health.seq_max, 3, "seq keeps its high-water");
+
+        let check = keyed(&path);
+        assert!(
+            !table_column_names(&check, "event_log")
+                .unwrap()
+                .iter()
+                .any(|column| column == "payload"),
+            "the payload column is gone"
+        );
+        drop(check);
+
+        let token = ledger_token(&store);
+        assert_eq!(token.len(), 32);
+        let page = ledger_page(&store, Some(0), Some(&token), 10);
+        let types: Vec<&str> = page
+            .events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect();
+        assert_eq!(types, vec!["message.upserted", "storage.changed"]);
+        assert_eq!(page.events[0].seq, 1);
+        assert_eq!(page.events[1].seq, 3);
+        assert_eq!(
+            page.events[1].created_at, 300,
+            "the timestamps survived verbatim"
+        );
+        assert!(
+            page.events
+                .iter()
+                .all(|event| event.account_id.as_deref() != Some("gone"))
+        );
+    }
+
+    /// The ledger's health face is read-only and reports the same numbers the
+    /// trimmer and the retention window use.
+    #[test]
+    fn event_ledger_health_reports_floor_rows_and_window() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let empty = store.event_log_health();
+        assert!(empty.readable);
+        assert_eq!(empty.rows, 0);
+        assert_eq!(empty.bytes, 0);
+        assert_eq!(empty.seq_max, 0);
+        assert_eq!(empty.oldest_created_at, None);
+        assert_eq!(empty.retention.max_rows, EVENT_LOG_MAX_ROWS);
+        assert_eq!(empty.retention.max_bytes, EVENT_LOG_MAX_BYTES);
+        assert_eq!(empty.retention.max_age_ms, EVENT_LOG_RETENTION_MS);
+
+        append_events(&store, 3);
+        let health = store.event_log_health();
+        assert_eq!(health.rows, 3);
+        assert!(health.bytes > 3 * 40, "the row cost covers the columns");
+        assert_eq!(health.seq_max, 3);
+        assert!(health.oldest_created_at.is_some());
+        assert!(health.newest_created_at >= health.oldest_created_at);
+
+        let wire = serde_json::to_value(&health).unwrap();
+        assert!(
+            wire.get("token").is_none(),
+            "the token never leaves the store"
+        );
+        assert_eq!(wire["retention"]["maxRows"], json!(EVENT_LOG_MAX_ROWS));
     }
 
     /// Every unit-test store is encrypted: the fixture key exercises the same
@@ -20237,6 +22650,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.verified, Some(false));
+        // 契约 §4.223/§4.244：信任重置臂的写穿戳是**只有 trustLevel 的新
+        // 对象**——引擎 sidecar 的 `pending` 挂起位随写穿一起消失（本地
+        // 投影不残留挂起态；权威位仍在引擎，下一次 identities.get 收敛）。
+        let raw_stamp: String = store
+            .lock_conn()
+            .unwrap()
+            .query_row(
+                "SELECT identity_verified_json FROM conversations WHERE id=?1",
+                rusqlite::params![direct_uuid.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_stamp, r#"{"trustLevel":"TRUSTED_UNVERIFIED"}"#);
         store
             .set_conversation_identity_verified_for_conversation(
                 &account.id,
@@ -22258,6 +24684,450 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    /// 契约 1.280（§4.264）schema v49: the payload table's primary key widens
+    /// from clientRequestId alone to (clientRequestId, attachmentIndex). A v48
+    /// row migrates to index 0 with every field preserved, the rebuilt table
+    /// accepts a second index for the same request (the composite key is real),
+    /// and the account index comes back with the rename.
+    #[test]
+    fn schema_v49_upgrades_attachment_payloads_to_composite_key() {
+        const DATA_URI: &str = "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw==";
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let now = crate::link::now_ms();
+        let created_at = now.saturating_sub(1_000);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '48');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               state TEXT NOT NULL
+             );
+             INSERT INTO accounts VALUES('a1', '+15555550100', '+1555***00', 'ready');
+             CREATE TABLE outgoing_attachment_payloads (
+               client_request_id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               data_uri TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE INDEX outgoing_attachment_payloads_account
+               ON outgoing_attachment_payloads(account_id, conversation_id);
+             INSERT INTO outgoing_attachment_payloads VALUES
+               ('req-v48', 'a1', 'c1', '{DATA_URI}', {created_at}, {now});"
+        ))
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(
+            store
+                .outgoing_attachment_payload("a1", "req-v48", 0)
+                .unwrap()
+                .as_deref(),
+            Some(DATA_URI),
+            "the v48 single-key row lands at index 0"
+        );
+        assert_eq!(
+            store.outgoing_attachment_payloads("a1", "req-v48").unwrap(),
+            vec![(0, DATA_URI.to_string())]
+        );
+        let migrated: (String, String, String, i64, i64) = store
+            .conn()
+            .query_row(
+                "SELECT account_id, conversation_id, data_uri, created_at, updated_at
+                   FROM outgoing_attachment_payloads
+                  WHERE client_request_id='req-v48' AND attachment_index=0",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            migrated,
+            (
+                "a1".to_string(),
+                "c1".to_string(),
+                DATA_URI.to_string(),
+                created_at as i64,
+                now as i64,
+            ),
+            "every column the v48 row carried survives the rebuild"
+        );
+        // The composite key is real: a second index for the same request fits.
+        store
+            .remember_outgoing_attachment_payload("a1", "c1", "req-v48", 1, DATA_URI, now)
+            .unwrap();
+        assert_eq!(
+            store.outgoing_attachment_payloads("a1", "req-v48").unwrap(),
+            vec![(0, DATA_URI.to_string()), (1, DATA_URI.to_string())]
+        );
+        let account_index: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='index' AND name='outgoing_attachment_payloads_account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(account_index, 1, "the account/conversation index is back");
+    }
+
+    /// 契约 1.280（§4.264）schema v49（形状驱动）：版本号已经写成 49、主键还是
+    /// 中间形状 (client_request_id, attachment_index) 的库，在下一次开库时按当前
+    /// 形状重建——主键补上 account_id、两行原样保留；重建后同一个
+    /// clientRequestId 在两个账号下各是一行，互不覆盖。
+    #[test]
+    fn schema_v49_rebuilds_the_intermediate_payload_key_and_keeps_rows() {
+        const DATA_URI: &str = "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw==";
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let now = crate::link::now_ms();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '49');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               state TEXT NOT NULL
+             );
+             INSERT INTO accounts VALUES('a1', '+15555550100', '+1555***00', 'ready');
+             INSERT INTO accounts VALUES('a2', '+15555550101', '+1555***01', 'ready');
+             CREATE TABLE outgoing_attachment_payloads (
+               client_request_id TEXT NOT NULL,
+               attachment_index INTEGER NOT NULL,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               data_uri TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(client_request_id, attachment_index)
+             );
+             INSERT INTO outgoing_attachment_payloads VALUES
+               ('req-intermediate', 0, 'a1', 'c1', '{DATA_URI}', {now}, {now}),
+               ('req-intermediate', 1, 'a1', 'c1', '{DATA_URI}', {now}, {now});"
+        ))
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert_eq!(
+            table_primary_key_columns(&store.conn(), "outgoing_attachment_payloads").unwrap(),
+            vec![
+                "account_id".to_string(),
+                "client_request_id".to_string(),
+                "attachment_index".to_string(),
+            ],
+            "the rebuild widens the primary key to the account-scoped shape"
+        );
+        assert_eq!(
+            store
+                .outgoing_attachment_payloads("a1", "req-intermediate")
+                .unwrap(),
+            vec![(0, DATA_URI.to_string()), (1, DATA_URI.to_string())],
+            "both intermediate rows survive the rebuild"
+        );
+        // The widened key is account-scoped: the same clientRequestId lands as
+        // the second account's own row instead of colliding with a1's group.
+        store
+            .remember_outgoing_attachment_payload("a2", "c2", "req-intermediate", 0, DATA_URI, now)
+            .unwrap();
+        assert_eq!(
+            store
+                .outgoing_attachment_payloads("a2", "req-intermediate")
+                .unwrap(),
+            vec![(0, DATA_URI.to_string())],
+            "the second account reads back its own bytes"
+        );
+        assert_eq!(
+            store
+                .outgoing_attachment_payloads("a1", "req-intermediate")
+                .unwrap()
+                .len(),
+            2,
+            "a2's write never touches a1's group"
+        );
+    }
+
+    /// 契约 1.280（§4.264）schema v49（中断恢复）：旧实现逐条 DDL、没有事务，
+    /// 崩在 COPY 与 DROP 之间会留下残表 outgoing_attachment_payloads_v49。开库
+    /// 时必须**继续搬运**：已经搬进残表的行不重复、还留在现表的行补上，残表随后
+    /// 消失，主键是当前形状。
+    #[test]
+    fn schema_v49_recovers_an_interrupted_payload_rebuild() {
+        const MOVED_URI: &str =
+            "data:text/plain;filename=moved.txt;base64,YXR0YWNobWVudCBieXRlcw==";
+        const LEFT_URI: &str = "data:text/plain;filename=left.txt;base64,bGVmdCBieXRlcw==";
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let now = crate::link::now_ms();
+        let moved_created_at = now.saturating_sub(5_000);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '48');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               state TEXT NOT NULL
+             );
+             INSERT INTO accounts VALUES('a1', '+15555550100', '+1555***00', 'ready');
+             CREATE TABLE outgoing_attachment_payloads (
+               client_request_id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               data_uri TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             INSERT INTO outgoing_attachment_payloads VALUES
+               ('req-moved', 'a1', 'c1', '{MOVED_URI}', {moved_created_at}, {now}),
+               ('req-left', 'a1', 'c1', '{LEFT_URI}', {now}, {now});
+             CREATE TABLE outgoing_attachment_payloads_v49 (
+               client_request_id TEXT NOT NULL,
+               attachment_index INTEGER NOT NULL,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               data_uri TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(client_request_id, attachment_index),
+               FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+             );
+             INSERT INTO outgoing_attachment_payloads_v49 VALUES
+               ('req-moved', 0, 'a1', 'c1', '{MOVED_URI}', {moved_created_at}, {now});"
+        ))
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert_eq!(
+            store
+                .outgoing_attachment_payload("a1", "req-moved", 0)
+                .unwrap()
+                .as_deref(),
+            Some(MOVED_URI),
+            "the row the interrupted copy already moved is still there"
+        );
+        assert_eq!(
+            store
+                .outgoing_attachment_payload("a1", "req-left", 0)
+                .unwrap()
+                .as_deref(),
+            Some(LEFT_URI),
+            "the row the interrupted copy never reached is picked up now"
+        );
+        let total: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM outgoing_attachment_payloads",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 2, "no row is duplicated by resuming the copy");
+        let created_at: i64 = store
+            .conn()
+            .query_row(
+                "SELECT created_at FROM outgoing_attachment_payloads
+                  WHERE account_id='a1' AND client_request_id='req-moved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            created_at, moved_created_at as i64,
+            "the moved row keeps its original creation stamp"
+        );
+        assert!(
+            !table_exists(&store.conn(), "outgoing_attachment_payloads_v49").unwrap(),
+            "the residual staging table is consumed, not left behind"
+        );
+        assert_eq!(
+            table_primary_key_columns(&store.conn(), "outgoing_attachment_payloads").unwrap(),
+            vec![
+                "account_id".to_string(),
+                "client_request_id".to_string(),
+                "attachment_index".to_string(),
+            ],
+            "the resumed rebuild lands on the account-scoped key"
+        );
+    }
+
+    /// 契约 1.280（§4.264）schema v49（中断恢复，DROP 之后）：崩在 DROP 与
+    /// RENAME 之间的库开库时现表由 SCHEMA_DDL 重新建成空表，残表里的行是唯一
+    /// 副本——必须被搬回来，而不是当成「表已经是新形状」而跳过。
+    #[test]
+    fn schema_v49_recovers_a_payload_rebuild_that_stopped_after_the_drop() {
+        const DATA_URI: &str =
+            "data:text/plain;filename=only-copy.txt;base64,YXR0YWNobWVudCBieXRlcw==";
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let now = crate::link::now_ms();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '48');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               state TEXT NOT NULL
+             );
+             INSERT INTO accounts VALUES('a1', '+15555550100', '+1555***00', 'ready');
+             CREATE TABLE outgoing_attachment_payloads_v49 (
+               client_request_id TEXT NOT NULL,
+               attachment_index INTEGER NOT NULL,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               data_uri TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(client_request_id, attachment_index),
+               FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+             );
+             INSERT INTO outgoing_attachment_payloads_v49 VALUES
+               ('req-only-copy', 0, 'a1', 'c1', '{DATA_URI}', {now}, {now});"
+        ))
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert_eq!(
+            store
+                .outgoing_attachment_payload("a1", "req-only-copy", 0)
+                .unwrap()
+                .as_deref(),
+            Some(DATA_URI),
+            "the staging copy is rescued when the live table was already dropped"
+        );
+        assert!(
+            !table_exists(&store.conn(), "outgoing_attachment_payloads_v49").unwrap(),
+            "the rescued staging table is gone"
+        );
+        assert_eq!(
+            table_primary_key_columns(&store.conn(), "outgoing_attachment_payloads").unwrap(),
+            vec![
+                "account_id".to_string(),
+                "client_request_id".to_string(),
+                "attachment_index".to_string(),
+            ]
+        );
+    }
+
+    /// 契约 1.280（§4.264）：重建是一条事务。搬运中途失败（这里用一个缺少必需
+    /// 列的畸形残表逼失败）必须整体 ROLLBACK：现表连同它的行原样还在、残表也
+    /// 还在、没有半张重建表留下——下一次开库可以重来，而不是丢掉现表。
+    #[test]
+    fn schema_v49_payload_rebuild_rolls_back_on_failure() {
+        const DATA_URI: &str = "data:text/plain;filename=kept.txt;base64,YXR0YWNobWVudCBieXRlcw==";
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let now = crate::link::now_ms();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '48');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               state TEXT NOT NULL
+             );
+             INSERT INTO accounts VALUES('a1', '+15555550100', '+1555***00', 'ready');
+             CREATE TABLE outgoing_attachment_payloads (
+               client_request_id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               data_uri TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             INSERT INTO outgoing_attachment_payloads VALUES
+               ('req-kept', 'a1', 'c1', '{DATA_URI}', {now}, {now});
+             CREATE TABLE outgoing_attachment_payloads_v49 (
+               client_request_id TEXT NOT NULL,
+               attachment_index INTEGER NOT NULL,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(client_request_id, attachment_index)
+             );"
+        ))
+        .unwrap();
+        drop(conn);
+
+        let refused = match Store::open(temp.path(), Some(test_store_key())) {
+            Ok(_) => panic!("a malformed residual table must fail the open, not skip the copy"),
+            Err(error) => error,
+        };
+        // Contract revision 1.282 (§4.266): a ladder that failed after its
+        // pre-migration snapshot is its own class, and it reports what the
+        // rollback did. The refusal is the same; what changes is that the
+        // operator gets a rollback point instead of a bare `Unavailable`.
+        let StoreError::SchemaMigrationFailed(failure) = &refused else {
+            panic!("a failed ladder is classified, not {refused:?}");
+        };
+        assert_eq!(failure.rollback, "restored");
+        assert_eq!(failure.from, 48);
+        assert_eq!(failure.to, SCHEMA_VERSION);
+        assert!(
+            !snapshot_names(temp.path()).is_empty(),
+            "the snapshot of the failed upgrade is kept"
+        );
+        // The rollback kept the live table (and its row) where it was; nothing
+        // half-rebuilt survives.
+        let observer = Connection::open(temp.path().join(DATABASE_FILE_NAME)).unwrap();
+        observer
+            .execute_batch(&format!(
+                "PRAGMA key = \"x'{}'\"",
+                hex::encode(TEST_KEY_BYTES)
+            ))
+            .unwrap();
+        assert!(table_exists(&observer, "outgoing_attachment_payloads").unwrap());
+        let rows: i64 = observer
+            .query_row(
+                "SELECT COUNT(*) FROM outgoing_attachment_payloads",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "the pre-rebuild row survives the rollback");
+        assert!(
+            table_exists(&observer, "outgoing_attachment_payloads_v49").unwrap(),
+            "the residual table is left for the next attempt"
+        );
+        assert!(
+            !table_exists(&observer, "outgoing_attachment_payloads_rebuild").unwrap(),
+            "no half-built table is left behind"
+        );
     }
 
     /// Schema 32 (contract 1.197, §4.197): a v31 database migrates in place —
@@ -24732,6 +27602,220 @@ mod tests {
         );
     }
 
+    /// §4.263: the startup sweep prunes payloads past the 30-day retention and
+    /// older-than-grace orphans with no message row, while a fresh row and a
+    /// row still backed by its message survive a reopen.
+    #[test]
+    fn outgoing_attachment_payloads_prune_expired_and_orphaned_rows_on_open() {
+        const DATA_URI: &str = "data:text/plain;base64,YXR0YWNobWVudCBieXRlcw==";
+        let temp = TempDir::new().unwrap();
+        let now = crate::link::now_ms();
+        let account_id = {
+            let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+            let account = store
+                .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+                .unwrap();
+            let conversation = store
+                .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+                .unwrap();
+            let message = pin_test_message(&account.id, &conversation.id, "m-payload", 10);
+            store
+                .insert_message(&message, Some("req-kept"), Some("body"), false)
+                .unwrap();
+            for client_request_id in ["req-fresh", "req-expired", "req-orphan", "req-kept"] {
+                store
+                    .remember_outgoing_attachment_payload(
+                        &account.id,
+                        &conversation.id,
+                        client_request_id,
+                        0,
+                        DATA_URI,
+                        now,
+                    )
+                    .unwrap();
+            }
+            let expired = now.saturating_sub(31 * 24 * 60 * 60 * 1_000);
+            let orphan = now.saturating_sub(2 * 60 * 60 * 1_000);
+            store
+                .conn()
+                .execute(
+                    "UPDATE outgoing_attachment_payloads SET updated_at=?1
+                      WHERE client_request_id IN ('req-expired', 'req-orphan')",
+                    params![expired as i64],
+                )
+                .unwrap();
+            store
+                .conn()
+                .execute(
+                    "UPDATE outgoing_attachment_payloads SET updated_at=?1
+                      WHERE client_request_id='req-kept'",
+                    params![orphan as i64],
+                )
+                .unwrap();
+            account.id
+        };
+        // A new store instance runs the startup sweep before serving.
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert_eq!(
+            store
+                .outgoing_attachment_payload(&account_id, "req-fresh", 0)
+                .unwrap()
+                .as_deref(),
+            Some(DATA_URI),
+            "a fresh payload survives the startup sweep"
+        );
+        assert_eq!(
+            store
+                .outgoing_attachment_payload(&account_id, "req-expired", 0)
+                .unwrap(),
+            None,
+            "a payload past the retention window is pruned"
+        );
+        assert_eq!(
+            store
+                .outgoing_attachment_payload(&account_id, "req-orphan", 0)
+                .unwrap(),
+            None,
+            "an orphan past the grace window is pruned"
+        );
+        assert_eq!(
+            store
+                .outgoing_attachment_payload(&account_id, "req-kept", 0)
+                .unwrap()
+                .as_deref(),
+            Some(DATA_URI),
+            "a payload still backed by its message row survives"
+        );
+    }
+
+    /// 契约 1.280（§4.264）：payload 的主键以账号开头。两个账号可以用同一个
+    /// clientRequestId，各自首发都必须写进去、各自都能读回自己的字节；覆盖、
+    /// 删除也只动自己那一组。
+    #[test]
+    fn outgoing_attachment_payloads_are_scoped_to_their_own_account() {
+        const SHARED_ID: &str = "req-shared-client-request";
+        const FIRST_URI_0: &str = "data:text/plain;filename=first-0.txt;base64,YQ==";
+        const FIRST_URI_1: &str = "data:text/plain;filename=first-1.txt;base64,YTE=";
+        const SECOND_URI_0: &str = "data:text/plain;filename=second-0.txt;base64,Yg==";
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let first = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let second = store
+            .upsert_account_from_signal("+15555550101", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let first_conversation = store
+            .ensure_conversation(&first.id, "direct", "+15555550111", "First peer")
+            .unwrap();
+        let second_conversation = store
+            .ensure_conversation(&second.id, "direct", "+15555550112", "Second peer")
+            .unwrap();
+        let now = crate::link::now_ms();
+        // Two desktops picking the same idempotency key is legal: the payload
+        // rows belong to their account, not to the id alone.
+        store
+            .remember_outgoing_attachment_payloads(
+                &first.id,
+                &first_conversation.id,
+                SHARED_ID,
+                &[(0, FIRST_URI_0), (1, FIRST_URI_1)],
+                now,
+            )
+            .unwrap();
+        store
+            .remember_outgoing_attachment_payload(
+                &second.id,
+                &second_conversation.id,
+                SHARED_ID,
+                0,
+                SECOND_URI_0,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .outgoing_attachment_payloads(&first.id, SHARED_ID)
+                .unwrap(),
+            vec![(0, FIRST_URI_0.to_string()), (1, FIRST_URI_1.to_string())],
+            "the first account keeps its whole group"
+        );
+        assert_eq!(
+            store
+                .outgoing_attachment_payloads(&second.id, SHARED_ID)
+                .unwrap(),
+            vec![(0, SECOND_URI_0.to_string())],
+            "the second account's first send is not swallowed by the first account's key"
+        );
+        assert_eq!(
+            store
+                .outgoing_attachment_payload(&first.id, SHARED_ID, 0)
+                .unwrap()
+                .as_deref(),
+            Some(FIRST_URI_0),
+            "single-index reads are account-scoped too"
+        );
+        // The idempotent-replay discipline is per account: an index the first
+        // account already holds is still writable for the second.
+        store
+            .remember_outgoing_attachment_payload(
+                &second.id,
+                &second_conversation.id,
+                SHARED_ID,
+                1,
+                SECOND_URI_0,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .outgoing_attachment_payloads(&second.id, SHARED_ID)
+                .unwrap()
+                .len(),
+            2
+        );
+        // A rewrite through one account never rewrites the other's row.
+        store
+            .update_outgoing_attachment_payload(
+                &second.id,
+                &second_conversation.id,
+                SHARED_ID,
+                0,
+                SECOND_URI_0,
+                now + 1,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .outgoing_attachment_payload(&first.id, SHARED_ID, 0)
+                .unwrap()
+                .as_deref(),
+            Some(FIRST_URI_0),
+            "the other account's bytes are untouched"
+        );
+        // A group delete scoped to one account leaves the other intact.
+        assert_eq!(
+            store
+                .delete_outgoing_attachment_payloads(&second.id, SHARED_ID)
+                .unwrap(),
+            2
+        );
+        assert!(
+            store
+                .outgoing_attachment_payloads(&second.id, SHARED_ID)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .outgoing_attachment_payloads(&first.id, SHARED_ID)
+                .unwrap()
+                .len(),
+            2,
+            "the surviving account keeps its group"
+        );
+    }
+
     #[test]
     fn account_delete_is_atomic_cascading_and_idempotent() {
         let temp = TempDir::new().unwrap();
@@ -25176,20 +28260,125 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
+    /// Contract revision 1.284 (§4.268): a store written by a newer connector
+    /// refuses with its own class and both numbers — never a bare
+    /// `Unavailable` — and the launcher line carries exactly that shape.
     #[test]
-    fn future_schema_version_fails_closed() {
+    fn a_newer_schema_refuses_with_the_classified_error_and_the_launcher_line() {
         let temp = TempDir::new().unwrap();
+        let current = SCHEMA_VERSION + 1;
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         store
             .conn()
-            .execute("UPDATE meta SET value='999' WHERE key='schema_version'", [])
+            .execute(
+                "UPDATE meta SET value=?1 WHERE key='schema_version'",
+                params![current.to_string()],
+            )
             .unwrap();
         drop(store);
 
+        let error = match Store::open(temp.path(), Some(test_store_key())) {
+            Ok(_) => panic!("a newer store must refuse to open"),
+            Err(error) => error,
+        };
+        let StoreError::SchemaNewer {
+            current: refused,
+            supported,
+        } = &error
+        else {
+            panic!("expected SchemaNewer, got {error:?}");
+        };
+        assert_eq!(*refused, current);
+        assert_eq!(*supported, SCHEMA_VERSION);
+        assert_eq!(error.class(), "store_schema_newer");
+        assert_eq!(
+            fatal_line_for(&error).expect("schema-newer owns a launcher line"),
+            format!(
+                "KT_FATAL code=STORE_SCHEMA_NEWER retryable=false current={current} supported={SCHEMA_VERSION}"
+            )
+        );
+        // Retryable=false is the class's own claim: the same store refuses in
+        // the same way on the next start — nothing was downgraded.
+        let again = match Store::open(temp.path(), Some(test_store_key())) {
+            Ok(_) => panic!("the refusal must repeat on the next start"),
+            Err(error) => error,
+        };
         assert!(matches!(
-            Store::open(temp.path(), Some(test_store_key())),
-            Err(StoreError::Unavailable(_))
+            again,
+            StoreError::SchemaNewer { current: c, .. } if c == current
         ));
+        // No integrity gate, no snapshot, no DDL ran on the newer store.
+        assert!(
+            !temp.path().join(SNAPSHOT_DIR).exists(),
+            "a refusal happens before the snapshot pass"
+        );
+        // The refusal is recorded for the next run and the doctor.
+        let marker = read_schema_newer(temp.path()).expect("refusal marker");
+        assert_eq!(marker.current, current);
+        assert_eq!(marker.supported, SCHEMA_VERSION);
+        assert!(marker.at > 0, "the marker carries its wall-clock stamp");
+    }
+
+    /// The same refusal stays readable after the refusing process exits: the
+    /// doctor's store face reports it from the marker file.
+    #[test]
+    fn health_surfaces_the_recorded_schema_newer_refusal() {
+        let temp = TempDir::new().unwrap();
+        write_schema_newer(temp.path(), SCHEMA_VERSION + 1, SCHEMA_VERSION);
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let health = store.health();
+        let face = health
+            .schema_newer
+            .clone()
+            .expect("the recorded refusal stays visible");
+        assert_eq!(face.current, SCHEMA_VERSION + 1);
+        assert_eq!(face.supported, SCHEMA_VERSION);
+        assert!(face.at > 0);
+        // The doctor serializes it as `store.schemaNewer` with exactly the two
+        // numbers (never a path, never stored content).
+        let value = serde_json::to_value(&health).unwrap();
+        assert_eq!(
+            value["schemaNewer"]["current"].as_i64(),
+            Some(SCHEMA_VERSION + 1)
+        );
+        assert_eq!(
+            value["schemaNewer"]["supported"].as_i64(),
+            Some(SCHEMA_VERSION)
+        );
+        // A state directory that never refused carries the key absent, not a
+        // fabricated "false" object.
+        let clean = TempDir::new().unwrap();
+        let store = Store::open(clean.path(), Some(test_store_key())).unwrap();
+        let value = serde_json::to_value(store.health()).unwrap();
+        assert!(value.get("schemaNewer").is_none());
+    }
+
+    /// A store that is merely unreadable keeps the generic class: the newer-
+    /// schema classification is never widened to "anything that failed to
+    /// open", and no refusal marker is invented for it.
+    #[test]
+    fn an_ordinary_store_failure_is_not_reclassified_as_schema_newer() {
+        let temp = TempDir::new().unwrap();
+        // The database path is a directory: opening it cannot work, and the
+        // failure has nothing to do with schema versions.
+        std::fs::create_dir(temp.path().join(DATABASE_FILE_NAME)).unwrap();
+        let error = match Store::open(temp.path(), Some(test_store_key())) {
+            Ok(_) => panic!("an unreadable store must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, StoreError::Unavailable(_)),
+            "ordinary failures keep the unavailable class: {error:?}"
+        );
+        assert_eq!(error.class(), "unavailable");
+        assert!(
+            fatal_line_for(&error).is_none(),
+            "no launcher line is invented for a generic unavailable"
+        );
+        assert!(
+            !temp.path().join(SCHEMA_NEWER_FILE).exists(),
+            "a generic failure never leaves the schema-newer marker"
+        );
     }
 
     /// Phase 4 (ADR 0001 R4): a pre-Phase-4 database (accounts without the
@@ -27205,7 +30394,18 @@ mod tests {
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
 
         assert_eq!(db_file_state(&db_path).unwrap(), DbFileState::Encrypted);
-        assert_eq!(table_counts(&store.conn()), before);
+        // Contract revision 1.282 (§4.266): the store also records the
+        // SQLCipher build that opened it in `meta`, so a later
+        // encryption-library upgrade can tell it is one. That single
+        // bookkeeping row is the only addition; every content table is
+        // byte-for-byte the same set of rows.
+        let mut expected = before.clone();
+        for (table, count) in expected.iter_mut() {
+            if *table == "meta" {
+                *count += 1;
+            }
+        }
+        assert_eq!(table_counts(&store.conn()), expected);
         let probe_after: String = store
             .conn()
             .query_row("SELECT body FROM messages WHERE id='m1'", [], |row| {
@@ -27223,7 +30423,7 @@ mod tests {
         // The migrated store is durable: a fresh keyed open sees every row.
         drop(store);
         let reopened = Store::open(temp.path(), Some(test_store_key())).unwrap();
-        assert_eq!(table_counts(&reopened.conn()), before);
+        assert_eq!(table_counts(&reopened.conn()), expected);
     }
 
     #[test]
@@ -27731,10 +30931,20 @@ mod tests {
             )
             .unwrap();
         drop(store);
-        assert!(matches!(
-            Store::open(temp.path(), Some(test_store_key())),
-            Err(StoreError::Unavailable(_))
-        ));
+        let error = match Store::open(temp.path(), Some(test_store_key())) {
+            Ok(_) => panic!("a newer store must not be opened"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                StoreError::SchemaNewer {
+                    current,
+                    supported: SCHEMA_VERSION,
+                } if current == SCHEMA_VERSION + 1
+            ),
+            "the refusal names both sides: {error:?}"
+        );
     }
 
     #[test]
@@ -29908,6 +33118,110 @@ mod tests {
         let still = rows.items.iter().find(|row| row.id == "m-vo-due").unwrap();
         assert!(still.is_erased);
         assert_eq!(still.text, None);
+    }
+
+    /// 契约 1.280（§4.264）：view-once 擦除删 payload 的定位键必须带账号。两个
+    /// 账号可以用同一个 clientRequestId 各存一组字节；只有真正被擦除的消息所属
+    /// 账号的那一组离开，另一个账号的那一组原样保留（子查询只认消息 id，不认
+    /// 账号的话这里会连带删掉对方那一组）。
+    #[test]
+    fn sweep_erases_view_once_payload_only_for_its_own_account() {
+        use crate::engine::NormalizedRich;
+        const SHARED_ID: &str = "req-vo-shared";
+        const FIRST_URI: &str = "data:image/jpeg;filename=snap.jpg;base64,c25hcA==";
+        const SECOND_URI: &str = "data:text/plain;filename=other.txt;base64,b3RoZXI=";
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let first = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let second = store
+            .upsert_account_from_signal("+15555550101", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let first_conversation = store
+            .ensure_conversation(&first.id, "direct", "+15555550111", "First peer")
+            .unwrap();
+        let second_conversation = store
+            .ensure_conversation(&second.id, "direct", "+15555550112", "Second peer")
+            .unwrap();
+
+        // Account one: due now, so the sweep burns its content.
+        let mut due = expire_record("m-vo-shared-first", &first.id, &first_conversation.id);
+        due.sent_at = 300;
+        due.expire_seconds = Some(60);
+        due.expire_start_at = Some(1_000);
+        due.rich = Some(NormalizedRich {
+            view_once: true,
+            ..Default::default()
+        });
+        // Account two: the same idempotency key, not due — its payload must not
+        // be collateral damage of the first account's erase.
+        let mut waiting = expire_record("m-vo-shared-second", &second.id, &second_conversation.id);
+        waiting.sent_at = 300;
+        waiting.expire_seconds = Some(60);
+        waiting.expire_start_at = Some(1_000_000_000_000);
+        waiting.rich = Some(NormalizedRich {
+            view_once: true,
+            ..Default::default()
+        });
+        for record in [&due, &waiting] {
+            assert!(
+                store
+                    .insert_message(
+                        record,
+                        Some(SHARED_ID),
+                        Some(record.text.as_deref().unwrap_or("")),
+                        true
+                    )
+                    .unwrap()
+            );
+        }
+        let now = crate::link::now_ms();
+        store
+            .remember_outgoing_attachment_payload(
+                &first.id,
+                &first_conversation.id,
+                SHARED_ID,
+                0,
+                FIRST_URI,
+                now,
+            )
+            .unwrap();
+        store
+            .remember_outgoing_attachment_payload(
+                &second.id,
+                &second_conversation.id,
+                SHARED_ID,
+                0,
+                SECOND_URI,
+                now,
+            )
+            .unwrap();
+
+        let groups = store
+            .sweep_expired_messages(1_000_000, EXPIRE_SWEEP_BATCH)
+            .unwrap();
+        assert!(groups.is_empty(), "the erase path never feeds the groups");
+        assert_eq!(
+            store
+                .outgoing_attachment_payload(&first.id, SHARED_ID, 0)
+                .unwrap(),
+            None,
+            "the burned view-once row loses its own payload"
+        );
+        assert_eq!(
+            store
+                .outgoing_attachment_payload(&second.id, SHARED_ID, 0)
+                .unwrap()
+                .as_deref(),
+            Some(SECOND_URI),
+            "the other account's payload under the same clientRequestId survives"
+        );
+        let erased = store
+            .message_by_id(&first.id, &first_conversation.id, "m-vo-shared-first")
+            .unwrap()
+            .unwrap();
+        assert!(erased.is_erased, "the row itself stays as a tombstone");
     }
 
     /// The conversation timer mirror writes only on real transitions: the
@@ -33936,5 +37250,482 @@ mod tests {
         assert_eq!(summary.oldest_unseen_message_id, None);
         let wire = serde_json::to_value(&summary).unwrap();
         assert!(wire.get("oldestUnseenMessageId").is_none());
+    }
+
+    // ---- contract revision 1.282 (§4.266): upgrade safety ---------------
+
+    /// A keyed connection to a store file: the same SQLCipher open production
+    /// performs, so assertions read the bytes the way the runtime does.
+    fn keyed(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA key = \"x'{}'\"",
+            hex::encode(TEST_KEY_BYTES)
+        ))
+        .unwrap();
+        conn
+    }
+
+    /// A store file that already exists at `version`, built without
+    /// [`Store::open`] — which would immediately bring it to
+    /// [`SCHEMA_VERSION`] and erase exactly the state the gate, the snapshot
+    /// and the rollback tests need to observe. The DDL is the same v20-era
+    /// shape the §4.77 upgrade tests use, so the whole ladder runs.
+    fn legacy_store(state_dir: &Path, version: i64, seed: &str) -> PathBuf {
+        std::fs::create_dir_all(state_dir).unwrap();
+        let path = state_dir.join(DATABASE_FILE_NAME);
+        let conn = keyed(&path);
+        conn.execute_batch(&format!(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '{version}');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE conversations (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               peer_key TEXT NOT NULL,
+               title TEXT NOT NULL,
+               last_message_preview TEXT,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0,
+               unread_mentions INTEGER NOT NULL DEFAULT 0,
+               muted INTEGER NOT NULL DEFAULT 0,
+               pinned INTEGER NOT NULL DEFAULT 0,
+               expire_timer_seconds INTEGER,
+               mrr_factors_json TEXT,
+               UNIQUE(account_id, kind, peer_key)
+             );
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               attachment_locators TEXT,
+               live_attachment_locators TEXT,
+               rich_json TEXT,
+               sticker_json TEXT,
+               expire_seconds INTEGER,
+               expire_start_at INTEGER,
+               expire_at INTEGER,
+               server_guid TEXT,
+               edited_at INTEGER,
+               sender_name TEXT,
+               mentions_self INTEGER NOT NULL DEFAULT 0,
+               delivered_at INTEGER,
+               read_at INTEGER,
+               admin_deleted INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO messages(id, account_id, conversation_id, direction, sender_id, sent_at, status)
+               VALUES('m-1', 'acc-1', 'conv-1', 'incoming', 'peer', 400, 'delivered');
+             {seed}"
+        ))
+        .unwrap();
+        drop(conn);
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(append_suffix(&path, suffix));
+        }
+        path
+    }
+
+    /// `Store` is not `Debug` (it holds the store key path and live
+    /// connections), so a failing open is unwrapped by hand.
+    fn open_error(state_dir: &Path) -> StoreError {
+        match Store::open(state_dir, Some(test_store_key())) {
+            Ok(_) => panic!("the store must fail closed"),
+            Err(error) => error,
+        }
+    }
+
+    fn snapshot_names(state_dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(state_dir.join(SNAPSHOT_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| is_snapshot_file(name))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Requirement 1 and 4 of the upgrade-safety contract: a store that needs
+    /// the ladder is snapshotted first, consistently and still encrypted, and
+    /// the health face reports the version, the gate verdict, the sizes and
+    /// the snapshot outcome.
+    #[test]
+    fn schema_migration_snapshots_the_store_before_touching_it() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let path = legacy_store(&state_dir, 20, "");
+
+        let store = Store::open(&state_dir, Some(test_store_key())).unwrap();
+        let names = snapshot_names(&state_dir);
+        assert_eq!(names.len(), 1, "one snapshot per upgrade run");
+        assert!(
+            names[0].starts_with(&format!("pre-migration-v020-to-v{SCHEMA_VERSION:03}-")),
+            "the name carries both schema versions: {}",
+            names[0]
+        );
+
+        // The copy is a store, not a plaintext dump: it keeps the profile key.
+        let snapshot = state_dir.join(SNAPSHOT_DIR).join(&names[0]);
+        let header = std::fs::read(&snapshot).unwrap();
+        assert_ne!(
+            &header[..16],
+            SQLITE_PLAINTEXT_HEADER,
+            "the snapshot is never a plaintext copy"
+        );
+        let restore = keyed(&snapshot);
+        assert_eq!(
+            current_schema_version(&restore),
+            20,
+            "the snapshot predates the ladder"
+        );
+        assert!(
+            !table_has_column(&restore, "messages", "viewed_at").unwrap(),
+            "the snapshot carries the old shape, so it is a real rollback point"
+        );
+
+        // The live store did migrate, and says so.
+        let health = store.health();
+        assert_eq!(health.schema_version, SCHEMA_VERSION);
+        assert_eq!(health.schema_target, SCHEMA_VERSION);
+        assert_eq!(health.integrity, "ok");
+        assert_eq!(health.snapshots.last_result, "created");
+        assert_eq!(health.snapshots.count, 1);
+        assert!(health.snapshots.bytes > 0);
+        assert!(health.db_bytes > 0);
+        assert!(
+            !state_dir.join(MIGRATION_FAILURE_FILE).exists(),
+            "a clean upgrade leaves no failure marker"
+        );
+        drop(store);
+        assert!(!path.exists() || path.is_file());
+        let wire = serde_json::to_value(&health).unwrap();
+        assert_eq!(wire["schemaVersion"], json!(SCHEMA_VERSION));
+        assert_eq!(wire["integrity"], json!("ok"));
+        assert_eq!(wire["snapshots"]["lastResult"], json!("created"));
+    }
+
+    /// Requirement 1, fail-closed half: when the snapshot cannot be taken, the
+    /// ladder never starts — an upgrade without a rollback point is not an
+    /// upgrade this connector performs.
+    #[test]
+    fn a_failed_snapshot_blocks_the_ladder() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let path = legacy_store(&state_dir, 20, "");
+        // A plain file where the snapshot directory belongs: the copy cannot be
+        // staged, so the open must refuse before any ALTER runs.
+        std::fs::write(state_dir.join(SNAPSHOT_DIR), b"not a directory").unwrap();
+
+        let error = open_error(&state_dir);
+        assert_eq!(error.class(), "snapshot_failed", "{error:?}");
+        let untouched = keyed(&path);
+        assert_eq!(current_schema_version(&untouched), 20);
+        assert!(!table_has_column(&untouched, "messages", "viewed_at").unwrap());
+        assert!(!state_dir.join(MIGRATION_FAILURE_FILE).exists());
+    }
+
+    /// Requirement 2: the gate fails closed **before** any ALTER, and the two
+    /// failure classes stay distinguishable — `integrity` for a checker that
+    /// reported damage.
+    #[test]
+    fn integrity_findings_stop_the_ladder_before_any_alter() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let path = legacy_store(
+            &state_dir,
+            20,
+            "CREATE TABLE scratch(a TEXT);
+             CREATE INDEX scratch_index ON scratch(a);
+             INSERT INTO scratch VALUES('x');",
+        );
+        // Drop the index from the schema without dropping its pages: SQLite
+        // reports the orphaned b-tree as an integrity finding, which is a
+        // readable store that is not sound.
+        keyed(&path)
+            .execute_batch(
+                "PRAGMA writable_schema=ON;
+                 DELETE FROM sqlite_master WHERE name='scratch_index';
+                 PRAGMA writable_schema=OFF;",
+            )
+            .unwrap();
+
+        let error = open_error(&state_dir);
+        assert_eq!(error.class(), "integrity", "{error:?}");
+        assert!(
+            matches!(error, StoreError::StoreIntegrity(findings) if findings >= 1),
+            "{error:?}"
+        );
+        assert!(
+            !state_dir.join(SNAPSHOT_DIR).exists(),
+            "a store that failed the gate is never snapshotted"
+        );
+        assert!(
+            !state_dir.join(MIGRATION_FAILURE_FILE).exists(),
+            "nothing was migrated, so there is no migration failure to report"
+        );
+        // Nothing was altered: the store still answers its old version and the
+        // ladder's columns are absent.
+        let untouched = keyed(&path);
+        assert_eq!(current_schema_version(&untouched), 20);
+        assert!(!table_has_column(&untouched, "messages", "viewed_at").unwrap());
+        assert!(!table_has_column(&untouched, "accounts", "state_revision").unwrap());
+    }
+
+    /// Requirement 2: a store with a genuinely damaged page is classified as
+    /// damage — and the ladder still never runs.
+    ///
+    /// SQLite folds a page-level read failure into the checker's *report*
+    /// rather than failing the statement, so a damaged page lands in the
+    /// `integrity` bucket; `corrupt` is the stricter bucket for a check that
+    /// could not run at all (see `damage_classes_are_distinct`). Both are the
+    /// same refusal, and both must stop the ALTER ladder.
+    #[test]
+    fn a_damaged_page_fails_closed_before_the_ladder() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let path = legacy_store(
+            &state_dir,
+            20,
+            &format!(
+                "INSERT INTO messages(id, account_id, conversation_id, direction, sender_id, sent_at, status, body)
+                   VALUES('m-big', 'acc-1', 'conv-1', 'incoming', 'peer', 500, 'delivered', '{}');",
+                "A".repeat(200 * 1024)
+            ),
+        );
+        // Damage one page past the first: the header still opens (so the file
+        // is recognisably a keyed store) while SQLCipher's page HMAC fails as
+        // soon as anything walks the b-tree that owns it.
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len > 16 * 1024, "the fixture spills over several pages");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let target = bytes.len() - 1024;
+        bytes[target] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = open_error(&state_dir);
+        assert!(
+            matches!(error.class(), "corrupt" | "integrity"),
+            "damage is classified, not folded into \"unavailable\": {error:?}"
+        );
+        assert!(
+            !state_dir.join(SNAPSHOT_DIR).exists(),
+            "a damaged store is never snapshotted"
+        );
+        assert!(
+            !state_dir.join(MIGRATION_FAILURE_FILE).exists(),
+            "the ladder never started, so there is no migration failure"
+        );
+        assert!(
+            !table_has_column(&keyed(&path), "accounts", "state_revision").unwrap(),
+            "a damaged store is never altered"
+        );
+    }
+
+    /// The two damage classes stay distinguishable on the wire: a check that
+    /// could not run (`corrupt`) is not the same report as a check that ran and
+    /// found damage (`integrity`), and neither collapses into "unavailable".
+    #[test]
+    fn damage_classes_are_distinct() {
+        assert_eq!(StoreError::StoreCorrupt(None).class(), "corrupt");
+        assert_eq!(StoreError::StoreIntegrity(2).class(), "integrity");
+        assert_eq!(StoreIntegrity::Corrupt.literal(), "corrupt");
+        assert_eq!(StoreIntegrity::Integrity.literal(), "integrity");
+        assert_eq!(StoreIntegrity::Ok.literal(), "ok");
+        assert_eq!(StoreIntegrity::NotChecked.literal(), "notChecked");
+        assert_ne!(
+            StoreError::StoreCorrupt(None).class(),
+            StoreError::Unavailable(None).class()
+        );
+    }
+
+    /// Requirement 3: a ladder that fails after its snapshot restores the
+    /// snapshot, keeps it on disk, leaves a diagnostic marker, and reports the
+    /// classified `schema_migration_failed` instead of a bare `Unavailable`.
+    #[test]
+    fn a_failed_migration_restores_its_snapshot_and_reports_it() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        // The poison is content, not a test hook: the v48 payload table keeps
+        // its old primary key (so the §4.264 rebuild runs) and a **view**
+        // squats on the rebuild table's name, so `DROP TABLE IF EXISTS` fails
+        // inside the migration's own transaction.
+        let path = legacy_store(
+            &state_dir,
+            20,
+            "CREATE TABLE outgoing_attachment_payloads (
+               client_request_id TEXT NOT NULL,
+               attachment_index INTEGER NOT NULL,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               data_uri TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(client_request_id, attachment_index)
+             );
+             CREATE VIEW outgoing_attachment_payloads_rebuild AS SELECT 1 AS x;",
+        );
+
+        let error = open_error(&state_dir);
+        assert_eq!(error.class(), "schema_migration_failed", "{error:?}");
+        let StoreError::SchemaMigrationFailed(failure) = &error else {
+            panic!("a failed ladder is its own class, not {error:?}");
+        };
+        assert_eq!(failure.from, 20);
+        assert_eq!(failure.to, SCHEMA_VERSION);
+        assert_eq!(failure.rollback, "restored");
+
+        // The snapshot survives the failure: it is the operator's rollback.
+        assert_eq!(snapshot_names(&state_dir).len(), 1);
+        let marker = read_migration_failure(&state_dir).expect("diagnostic marker");
+        assert_eq!(marker.from, 20);
+        assert_eq!(marker.to, SCHEMA_VERSION);
+        assert_eq!(marker.rollback, "restored");
+        assert_eq!(
+            marker.snapshot.as_deref(),
+            Some(snapshot_names(&state_dir)[0].as_str())
+        );
+
+        // The rollback really undid the ALTERs the ladder had already run: the
+        // store answers its old version again and carries none of the new
+        // columns (the half-migrated trap this contract closes).
+        let restored = keyed(&path);
+        assert_eq!(current_schema_version(&restored), 20);
+        assert!(!table_has_column(&restored, "messages", "viewed_at").unwrap());
+        assert!(!table_has_column(&restored, "accounts", "state_revision").unwrap());
+        assert!(
+            table_has_column(&restored, "messages", "body").unwrap(),
+            "the restored store still has its own rows"
+        );
+    }
+
+    /// Requirement 5: a successful upgrade keeps the newest snapshots and drops
+    /// the rest, so the directory is bounded by count.
+    #[test]
+    fn a_successful_migration_prunes_older_snapshots() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        legacy_store(&state_dir, 20, "");
+        let dir = state_dir.join(SNAPSHOT_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        for stamp in 1..=5 {
+            std::fs::write(
+                dir.join(format!("pre-migration-v019-to-v020-{stamp:020}-1.sqlite3")),
+                b"stale",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&state_dir, Some(test_store_key())).unwrap();
+        let names = snapshot_names(&state_dir);
+        assert_eq!(names.len(), SNAPSHOT_KEEP, "{names:?}");
+        assert!(
+            names
+                .iter()
+                .any(|name| name
+                    .starts_with(&format!("pre-migration-v020-to-v{SCHEMA_VERSION:03}-"))),
+            "the snapshot of this upgrade is never a prune candidate"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("pre-migration-v019-to-v020-00000000000000000005")),
+            "the newest pre-existing snapshots outlive the oldest ones"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("pre-migration-v019-to-v020-00000000000000000001")),
+            "the oldest snapshot is dropped"
+        );
+        assert_eq!(store.health().snapshots.count as usize, SNAPSHOT_KEEP);
+    }
+
+    /// Requirement 1 (bounded by bytes as well as by count), tested directly:
+    /// the newest snapshots stay while the running total fits, and the file the
+    /// caller just wrote is never deleted even when it alone exceeds the cap.
+    #[test]
+    fn snapshot_retention_is_bounded_by_bytes_and_never_drops_the_new_one() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let name = |stamp: u32| format!("pre-migration-v048-to-v049-{stamp:020}-1.sqlite3");
+        for stamp in 1..=4 {
+            std::fs::write(dir.join(name(stamp)), vec![0_u8; 100]).unwrap();
+        }
+
+        // Cap 150 with four 100-byte copies: the newest fits, nothing else does.
+        prune_snapshots(dir, 10, 150, &name(4)).unwrap();
+        let mut kept: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, vec![name(4)]);
+
+        // Count bound: three kept out of four, newest first.
+        for stamp in 5..=7 {
+            std::fs::write(dir.join(name(stamp)), vec![0_u8; 10]).unwrap();
+        }
+        prune_snapshots(dir, SNAPSHOT_KEEP, SNAPSHOT_BYTES_CAP, &name(7)).unwrap();
+        let mut kept: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, vec![name(5), name(6), name(7)]);
+
+        // The protected file outlives the count rule even when nothing else does.
+        for stamp in 8..=10 {
+            std::fs::write(dir.join(name(stamp)), vec![0_u8; 10]).unwrap();
+        }
+        prune_snapshots(dir, 1, SNAPSHOT_BYTES_CAP, &name(8)).unwrap();
+        assert!(
+            dir.join(name(8)).exists(),
+            "the just-written snapshot survives"
+        );
+    }
+
+    /// An ordinary start migrates nothing, so it pays for neither the gate nor
+    /// a snapshot — the feature must not tax every launch.
+    #[test]
+    fn a_start_without_a_migration_takes_no_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let store = Store::open(&state_dir, Some(test_store_key())).unwrap();
+        let health = store.health();
+        assert_eq!(health.integrity, "notChecked");
+        assert_eq!(health.snapshots.last_result, "notNeeded");
+        assert_eq!(health.snapshots.count, 0);
+        assert_eq!(health.schema_version, SCHEMA_VERSION);
+        drop(store);
+
+        let again = Store::open(&state_dir, Some(test_store_key())).unwrap();
+        assert_eq!(again.health().snapshots.count, 0);
+        assert!(!state_dir.join(SNAPSHOT_DIR).exists());
     }
 }

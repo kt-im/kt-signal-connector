@@ -48,7 +48,11 @@ may have moved on. Nothing in the answer is a lease or a reservation.
                   "reachable", "unreachableReason"?,
                   "version"?:            { "present", "face"?|, "reason"? },
                   "protocolCapabilities"?: { "present", "face"?|, "reason"? },
-                  "perfMetrics"?:        { "present", "face"?*, "reason"? } },
+                  "perfMetrics"?:        { "present", "face"?*, "reason"? },
+                  "engineVersion"?,
+                  "engineContractRevision"?,
+                  "engineContractStatus",
+                  "engineContractReason"? },
     "dataDir":  { "path", "exists", "writable", "freeBytes"?, "totalBytes"? },
     "lock":     { "present", "held", "pid"?, "holderAlive"?, "classification" },
     "credentials": { "state" }
@@ -114,6 +118,31 @@ exclusive by construction:
 
 Absent engine answers are the designed degradation — a diagnostic never fails
 as a whole because one engine face could not answer.
+
+## Engine contract face (O1)
+
+Four additive fields fold the supervisor's startup handshake into the same
+group face (they are the parsed counterpart of the two verbatim method faces
+above, never a re-encoded answer):
+
+| field | meaning |
+| ----- | ------- |
+| `engineVersion?` | the engine's own `version` string, verbatim. Present when the live probe answered it or a previous handshake recorded it. |
+| `engineContractRevision?` | the contract revision the engine states (`engine.protocolCapabilities.contractRevision`, the `version` answer as fallback), verbatim. Absent for a legacy engine — absence stays absence. |
+| `engineContractStatus` | `match` \| `legacy` \| `mismatch` \| `unverified` \| `unreachable`. The supervisor's verdict — the gate that decided whether the account pipeline may run. |
+| `engineContractReason?` | for `mismatch`: `version_missing` \| `revision_out_of_range` \| `revision_malformed`. |
+
+The precedence is deliberately split: the two values prefer this diagnostic's
+live probe answers (freshest truth) and fall back to the recorded handshake
+verdict when the engine cannot answer now; the status reads the verdict
+itself, because that is what actually gated the runtime. A latched refusal
+wins over `unreachable` so a killed engine still explains why.
+
+`match` means the stated revision is inside the connector's closed supported
+interval; `legacy` means the engine states no revision (a pre-handshake
+build) and is served degraded; `mismatch` means the engine was refused and
+never enters the account pipeline (`runtime.start` answers
+`ENGINE_CONTRACT_MISMATCH`, `retryable: false`).
 
 ## Perf-metrics face
 

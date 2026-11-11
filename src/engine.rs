@@ -285,6 +285,15 @@ pub enum CallClass {
 pub enum EngineError {
     #[error("engine process could not be started")]
     StartFailed,
+    /// O1: the engine answered the contract handshake but cannot be verified —
+    /// its identity is missing, or the contract revision it states is outside
+    /// the connector's supported interval (or is not a revision at all). The
+    /// fault is latched on the supervisor for the process lifetime: the same
+    /// binary answers the same revision on every restart, so a retry cannot
+    /// heal it. The payload is the structured facts the host wire answer and
+    /// the launcher's fixed `KT_FATAL` line carry.
+    #[error("engine contract could not be verified; the engine is not served")]
+    ContractMismatch(crate::engine_contract::EngineContractFault),
     #[error("engine is not running")]
     NotRunning,
     #[error("engine request queue is full")]
@@ -352,6 +361,54 @@ pub enum EngineError {
     /// never touches account state.
     #[error("engine send was rejected: recipient identity is unverified")]
     IdentityUnverified,
+    /// Contract 1.285 §4.269: the engine's dispatch-level busy face. The
+    /// engine's in-flight table is full, so the request is rejected without
+    /// being executed — the server-error code `-32000` whose `message`
+    /// embeds `(EngineBusyException)` and whose `data` carries
+    /// `{reason, retryable, inFlightLimit}`. Because the request never ran,
+    /// a later attempt is safe; the payload rides verbatim (pass-through
+    /// facts, never re-keyed, never stripped).
+    #[error("engine is busy with in-flight requests")]
+    EngineBusy {
+        /// The engine's `error.data` object, pass-through only.
+        data: Option<Value>,
+    },
+    /// Contract 1.285 §4.269: the engine's READ-ONLY request-budget face —
+    /// the dispatch future was cancelled after the method's budget expired
+    /// and the engine answered `-32000` with `(EngineTimeoutException)` and
+    /// `data = {reason, retryable, timeoutMs}`. A read-only call cannot have
+    /// written anything, so it keeps the structured timeout face
+    /// (`retryable: false`) with the payload verbatim. A cancelled MUTATING
+    /// dispatch may already have been written and never reaches this variant:
+    /// the classifier folds it to `EngineError::UnknownOutcome` (the same
+    /// answer the connector's own mutating deadline gives), so the send row
+    /// settles unknown and is never retried automatically.
+    #[error("engine cancelled the read-only request after its budget expired")]
+    EngineRequestTimeout {
+        /// The engine's `error.data` object, pass-through only.
+        data: Option<Value>,
+    },
+    /// Contract 1.285 §4.269: the attachment upload gate's busy face —
+    /// `-32603` with `(AttachmentBusyException)`: both global upload slots
+    /// stayed occupied past the bounded wait, so the upload never started
+    /// and the message is definitely undelivered. A later attempt is safe;
+    /// the engine sends no `data` on this face today (a future one rides
+    /// verbatim).
+    #[error("engine attachment upload slot is busy")]
+    AttachmentBusy {
+        /// The engine's `error.data` object, pass-through only.
+        data: Option<Value>,
+    },
+    /// Contract 1.285 §4.269: the attachment upload gate's byte-budget face
+    /// — `-32603` with `(AttachmentBudgetException)`: the 320 MiB global
+    /// decoded-byte budget could not be reserved before base64 decode, so
+    /// neither decode nor upload happened. The same request can stay over
+    /// budget, so it is never retried automatically.
+    #[error("engine attachment byte budget is exhausted")]
+    AttachmentBudget {
+        /// The engine's `error.data` object, pass-through only.
+        data: Option<Value>,
+    },
     /// The engine answered a JSON-RPC error object with an upstream error
     /// code (contract 1.36 sticker/pin faces): the code string is carried
     /// structurally so the connector maps engine error codes onto the host
@@ -377,6 +434,7 @@ impl EngineError {
     pub(crate) fn class(&self) -> &'static str {
         match self {
             EngineError::StartFailed => "start_failed",
+            EngineError::ContractMismatch(_) => "contract_mismatch",
             EngineError::NotRunning => "not_running",
             EngineError::Backpressure => "backpressure",
             EngineError::Timeout => "timeout",
@@ -390,6 +448,10 @@ impl EngineError {
             EngineError::ServerUnavailable => "server_unavailable",
             EngineError::IdentityUnverified => "identity_unverified",
             EngineError::AppExpired => "app_expired",
+            EngineError::EngineBusy { .. } => "engine_busy",
+            EngineError::EngineRequestTimeout { .. } => "engine_request_timeout",
+            EngineError::AttachmentBusy { .. } => "attachment_busy",
+            EngineError::AttachmentBudget { .. } => "attachment_budget",
             EngineError::UpstreamCode { .. } => "upstream_code",
         }
     }
@@ -4041,6 +4103,19 @@ async fn handle_upstream_line(
             // vs. an exact allowlist literal), so the order only documents
             // that the §4.17 recovery chain keeps precedence.
             let _ = request.response.send(Err(class));
+        } else if let Some(class) =
+            upstream_error_resource_class(object.get("error"), request.class)
+        {
+            // Contract 1.285 §4.269: the engine's M4/M5 resource faces —
+            // the dispatch-level busy/timeout rejections (-32000) and the
+            // attachment gate's slot-busy / byte-budget refusals (-32603).
+            // Each surfaces as its own variant so the host sees the
+            // contract-fixed code and retryability instead of the generic
+            // upstream face; the engine's `error.data` object rides along
+            // verbatim. No event, and the arm sits before the structured-code
+            // ladder (an embedded anchor in a longer message vs. an exact
+            // allowlist literal — the two cannot collide).
+            let _ = request.response.send(Err(class));
         } else if let Some(code) = upstream_error_code(object.get("error")) {
             // Contract 1.36 faces: the engine answers structured errors with
             // a code field (STICKER_*, STORAGE_*, CONVERSATION_NOT_RESOLVED
@@ -4051,11 +4126,7 @@ async fn handle_upstream_line(
             // facts such as PROFILE_UPLOAD_FAILED's {retryable, textSaved})
             // rides along verbatim when present — pass-through only, no
             // key invention, no stripping.
-            let data = object
-                .get("error")
-                .and_then(|error| error.get("data"))
-                .filter(|data| data.is_object())
-                .cloned();
+            let data = object.get("error").and_then(upstream_error_data);
             let _ = request
                 .response
                 .send(Err(EngineError::UpstreamCode { code, data }));
@@ -4157,6 +4228,18 @@ const ENGINE_SEND_SERVER_UNAVAILABLE_ANCHOR: &str = "(ServerUnavailableException
 const ENGINE_SEND_IDENTITY_UNVERIFIED_ANCHOR: &str = "(UntrustedIdentityException)";
 const ENGINE_SEND_APP_EXPIRED_ANCHOR: &str = "(AppExpiredException)";
 
+/// Contract 1.285 §4.269: the engine's M4/M5 resource faces — four fixed
+/// literals the engine pins in its JSON-RPC compatibility contract
+/// (jsonrpc-compat §3/§5). Two are dispatch-level (-32000, any method): the
+/// in-flight limit rejection and the request-budget cancellation. Two are the
+/// attachment upload gate's (-32603, send chain): the upload-slot busy face
+/// and the decoded-byte budget face. Matched exactly, like the §4.80/§4.95
+/// anchors above, so incidental message text can never flip a class.
+const ENGINE_BUSY_ANCHOR: &str = "(EngineBusyException)";
+const ENGINE_TIMEOUT_ANCHOR: &str = "(EngineTimeoutException)";
+const ENGINE_ATTACHMENT_BUSY_ANCHOR: &str = "(AttachmentBusyException)";
+const ENGINE_ATTACHMENT_BUDGET_ANCHOR: &str = "(AttachmentBudgetException)";
+
 /// Classify a send-chain error (contract 1.99 §4.80, joined by the 1.114
 /// §4.95 identity gate) from the raw JSON-RPC error body: `Some` variant when
 /// the error `message` embeds one of the fixed anchors, `None` otherwise. The
@@ -4185,6 +4268,57 @@ fn upstream_error_send_class(error: Option<&Value>) -> Option<EngineError> {
         Some(EngineError::IdentityUnverified)
     } else if message.contains(ENGINE_SEND_APP_EXPIRED_ANCHOR) {
         Some(EngineError::AppExpired)
+    } else {
+        None
+    }
+}
+
+/// The engine's optional `error.data` object, pass-through only (contract
+/// 1.50: the connector never invents a data face and never strips keys from
+/// one the engine sent). A non-object data face reads as absent.
+fn upstream_error_data(error: &Value) -> Option<Value> {
+    error.get("data").filter(|data| data.is_object()).cloned()
+}
+
+/// Classify the engine's M4/M5 resource faces (contract 1.285 §4.269) from
+/// the raw JSON-RPC error body: `Some` variant when the error `message`
+/// embeds one of the four fixed anchors, `None` otherwise. The dispatch faces
+/// ride `-32000` and the attachment-gate faces `-32603`; the classifier
+/// reads the message text only (the anchor is the contract — the numeric code
+/// and the additive `data.reason` hint are not required), exactly like the
+/// §4.80/§4.95 send-chain classifier. The request's call class decides the
+/// timeout face: a read-only cancellation cannot have written anything and
+/// keeps [`EngineError::EngineRequestTimeout`]; a mutating cancellation may
+/// already have been written and folds to [`EngineError::UnknownOutcome`]
+/// (the pre-existing unknown-outcome face, so the send funnel settles the row
+/// unknown and never retries it). The engine's `data` object rides along
+/// verbatim when present (the busy face's `{reason, retryable,
+/// inFlightLimit}`, the read-only timeout face's `{reason, retryable,
+/// timeoutMs}`); nothing is invented for the two attachment faces, which
+/// carry no data. No event: a resource refusal never touches account state.
+fn upstream_error_resource_class(error: Option<&Value>, class: CallClass) -> Option<EngineError> {
+    let error = error?;
+    let message = error.get("message").and_then(Value::as_str)?;
+    let data = upstream_error_data(error);
+    if message.contains(ENGINE_BUSY_ANCHOR) {
+        Some(EngineError::EngineBusy { data })
+    } else if message.contains(ENGINE_TIMEOUT_ANCHOR) {
+        // The cancelled dispatch may already have been written — the
+        // engine's own `retryable: false` is the honest admission. A
+        // mutating call therefore folds to the existing unknown-outcome
+        // face (the same answer the connector's own mutating request
+        // deadline gives), so the send funnel settles the row unknown and
+        // never retries it automatically; a read-only call cannot have
+        // written anything and keeps the structured timeout face with the
+        // engine's payload.
+        match class {
+            CallClass::Mutating => Some(EngineError::UnknownOutcome),
+            CallClass::ReadOnly => Some(EngineError::EngineRequestTimeout { data }),
+        }
+    } else if message.contains(ENGINE_ATTACHMENT_BUSY_ANCHOR) {
+        Some(EngineError::AttachmentBusy { data })
+    } else if message.contains(ENGINE_ATTACHMENT_BUDGET_ANCHOR) {
+        Some(EngineError::AttachmentBudget { data })
     } else {
         None
     }
@@ -9485,6 +9619,103 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    /// Contract 1.285 §4.269: all four resource anchors reach the pending
+    /// request through the real line handler with their engine payloads
+    /// intact, and none emits an account event (a resource refusal is never
+    /// account state).
+    #[tokio::test]
+    async fn resource_anchor_responses_classify_through_the_line_handler() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+
+        let cases = [
+            (
+                CallClass::Mutating,
+                json!({
+                    "code": -32000,
+                    "message": "Engine busy: in-flight request limit reached. (EngineBusyException)",
+                    "data": { "reason": "ENGINE_BUSY", "retryable": true, "inFlightLimit": 8 }
+                }),
+                EngineError::EngineBusy {
+                    data: Some(json!({
+                        "reason": "ENGINE_BUSY",
+                        "retryable": true,
+                        "inFlightLimit": 8
+                    })),
+                },
+            ),
+            (
+                CallClass::ReadOnly,
+                json!({
+                    "code": -32000,
+                    "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                    "data": { "reason": "REQUEST_TIMEOUT", "retryable": false, "timeoutMs": 60000 }
+                }),
+                EngineError::EngineRequestTimeout {
+                    data: Some(json!({
+                        "reason": "REQUEST_TIMEOUT",
+                        "retryable": false,
+                        "timeoutMs": 60000
+                    })),
+                },
+            ),
+            (
+                CallClass::Mutating,
+                json!({
+                    "code": -32000,
+                    "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                    "data": { "reason": "REQUEST_TIMEOUT", "retryable": false, "timeoutMs": 120000 }
+                }),
+                EngineError::UnknownOutcome,
+            ),
+            (
+                CallClass::Mutating,
+                json!({
+                    "code": -32603,
+                    "message": "Failed to send message: Attachment upload slot busy. (AttachmentBusyException)"
+                }),
+                EngineError::AttachmentBusy { data: None },
+            ),
+            (
+                CallClass::Mutating,
+                json!({
+                    "code": -32603,
+                    "message": "Failed to send message: Attachment byte budget exhausted. (AttachmentBudgetException)"
+                }),
+                EngineError::AttachmentBudget { data: None },
+            ),
+        ];
+
+        for (index, (class, error, expected)) in cases.into_iter().enumerate() {
+            let id = format!("kt-resource-{index}");
+            let (response_tx, response_rx) = oneshot::channel();
+            pending.insert(
+                id.clone(),
+                PendingRequest {
+                    class,
+                    account: Some("+15555550100".to_string()),
+                    response: response_tx,
+                },
+            );
+            let line = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": error
+            }))
+            .unwrap();
+            handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+                .await
+                .unwrap();
+            assert_eq!(response_rx.await.unwrap(), Err(expected));
+            assert!(
+                event_rx.try_recv().is_err(),
+                "a resource refusal must not emit an account event"
+            );
+        }
+    }
+
     /// §4.166 regression pin: resolution is strictly per request id — a
     /// response completes only its own waiting call, the other pending call
     /// stays waiting, and an id with no waiting request warns and completes
@@ -9846,6 +10077,177 @@ mod tests {
         );
     }
 
+    /// Contract 1.285 §4.269: the four fixed resource anchors each classify
+    /// to their own variant, with the engine's `data` object riding verbatim
+    /// (the two dispatch faces carry one; the attachment faces carry none
+    /// today), and both the realistic wire shape and the bare literal
+    /// classify — the anchor is a contained literal, not a trailing suffix.
+    #[test]
+    fn resource_anchor_classifier_maps_the_four_anchors() {
+        let classify = |error: serde_json::Value| {
+            upstream_error_resource_class(Some(&error), CallClass::Mutating)
+        };
+        let classify_read = |error: serde_json::Value| {
+            upstream_error_resource_class(Some(&error), CallClass::ReadOnly)
+        };
+
+        // M4 dispatch-level busy (-32000): the request was never executed.
+        assert_eq!(
+            classify(json!({
+                "code": -32000,
+                "message": "Engine busy: in-flight request limit reached. (EngineBusyException)",
+                "data": { "reason": "ENGINE_BUSY", "retryable": true, "inFlightLimit": 8 }
+            })),
+            Some(EngineError::EngineBusy {
+                data: Some(json!({
+                    "reason": "ENGINE_BUSY",
+                    "retryable": true,
+                    "inFlightLimit": 8
+                }))
+            })
+        );
+
+        // M5 dispatch-level timeout (-32000): a READ-ONLY cancellation cannot
+        // have written anything and keeps the structured timeout face with the
+        // engine's payload.
+        assert_eq!(
+            classify_read(json!({
+                "code": -32000,
+                "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                "data": { "reason": "REQUEST_TIMEOUT", "retryable": false, "timeoutMs": 60000 }
+            })),
+            Some(EngineError::EngineRequestTimeout {
+                data: Some(json!({
+                    "reason": "REQUEST_TIMEOUT",
+                    "retryable": false,
+                    "timeoutMs": 60000
+                }))
+            })
+        );
+
+        // The same anchor on a MUTATING call may already have been written:
+        // it folds to the existing unknown-outcome face (the send funnel then
+        // settles the row unknown and never retries it). The advisory payload
+        // is dropped with it — the unknown face is content-free by contract.
+        assert_eq!(
+            classify(json!({
+                "code": -32000,
+                "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                "data": { "reason": "REQUEST_TIMEOUT", "retryable": false, "timeoutMs": 60000 }
+            })),
+            Some(EngineError::UnknownOutcome)
+        );
+
+        // The attachment gate's two -32603 faces carry no data today.
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Attachment upload slot busy. (AttachmentBusyException)"
+            })),
+            Some(EngineError::AttachmentBusy { data: None })
+        );
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Attachment byte budget exhausted. (AttachmentBudgetException)"
+            })),
+            Some(EngineError::AttachmentBudget { data: None })
+        );
+
+        // A future data face on an attachment refusal rides verbatim too
+        // (pass-through only: no key invented, none stripped).
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "(AttachmentBudgetException)",
+                "data": { "budgetBytes": 335544320u64 }
+            })),
+            Some(EngineError::AttachmentBudget {
+                data: Some(json!({ "budgetBytes": 335544320u64 }))
+            })
+        );
+
+        // Bare literals classify as well (contained literal, not a suffix).
+        assert_eq!(
+            classify(json!({ "code": -32000, "message": "(EngineBusyException)" })),
+            Some(EngineError::EngineBusy { data: None })
+        );
+        assert_eq!(
+            classify(json!({ "code": -32603, "message": "(AttachmentBusyException)" })),
+            Some(EngineError::AttachmentBusy { data: None })
+        );
+    }
+
+    /// Contract 1.285 §4.269 boundary and no-regression pin: the new
+    /// classifier answers only for its own four anchors. Near misses, an
+    /// anchor in the `code` slot, every pre-1.285 send-chain/identity anchor,
+    /// and ordinary errors stay `None` — the old classification surface is
+    /// untouched.
+    #[test]
+    fn resource_anchor_classifier_answers_none_outside_its_contract() {
+        let classify = |error: serde_json::Value| {
+            upstream_error_resource_class(Some(&error), CallClass::Mutating)
+        };
+        let classify_read = |error: serde_json::Value| {
+            upstream_error_resource_class(Some(&error), CallClass::ReadOnly)
+        };
+        assert_eq!(
+            upstream_error_resource_class(None, CallClass::Mutating),
+            None
+        );
+        assert_eq!(classify(json!({ "code": -32000 })), None);
+        assert_eq!(classify(json!({ "code": -32000, "message": 42 })), None);
+
+        // Near misses: the class name without the parenthesized anchor.
+        for message in [
+            "EngineBusyException without the wrapper",
+            "Request timed out (EngineTimeout)",
+            "Attachment upload slot busy (AttachmentBusy) and over budget (AttachmentBudget)",
+        ] {
+            assert_eq!(
+                classify(json!({ "code": -32000, "message": message })),
+                None,
+                "{message} must not classify"
+            );
+        }
+        // The read-only face reads the same message-only anchor: a near miss
+        // stays unclassified there too.
+        assert_eq!(
+            classify_read(json!({
+                "code": -32000,
+                "message": "Request timed out (EngineTimeout)"
+            })),
+            None
+        );
+        // An anchor only in the `code` slot is not a classification.
+        assert_eq!(
+            classify(json!({ "code": "(EngineBusyException)", "message": "fixture" })),
+            None
+        );
+
+        // The pre-1.285 send-chain anchors keep their own classifier.
+        for message in [
+            "Failed to send message: Timed out waiting for a response (RateLimitExceeded)",
+            "Failed to send message: Proof required (ProofRequiredException)",
+            "Failed to send message: Bad gateway (ServerUnavailableException)",
+            "Failed to send message: Identity unverified. (UntrustedIdentityException)",
+            "Failed to send message: Client version expired. (AppExpiredException)",
+        ] {
+            let error = json!({ "code": -32603, "message": message });
+            assert_eq!(classify(error.clone()), None, "{message}");
+            assert!(
+                upstream_error_send_class(Some(&error)).is_some(),
+                "the pre-1.285 anchor still classifies: {message}"
+            );
+        }
+
+        // Ordinary engine errors stay unclassified (the ladder's else arm).
+        assert_eq!(
+            classify(json!({ "code": -32603, "message": "fixture send failed" })),
+            None
+        );
+    }
+
     /// Red line (audit conclusion): the §4.17 authorization matcher's match
     /// set is frozen — a message carrying only a transport anchor never
     /// trips it, so the AccountUnauthorized → ACCOUNT_UNLINKED chain cannot
@@ -9856,6 +10258,13 @@ mod tests {
             "Failed to send message: Timed out waiting for a response (RateLimitExceeded)",
             "Failed to send message: Proof required (ProofRequiredException)",
             "Failed to send message: Bad gateway (ServerUnavailableException)",
+            // Contract 1.285 §4.269: the resource anchors are not account
+            // state either — a busy/timeout/attachment-gate refusal must
+            // never fold into ACCOUNT_UNLINKED.
+            "Engine busy: in-flight request limit reached. (EngineBusyException)",
+            "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+            "Failed to send message: Attachment upload slot busy. (AttachmentBusyException)",
+            "Failed to send message: Attachment byte budget exhausted. (AttachmentBudgetException)",
         ] {
             assert!(
                 !upstream_error_is_unauthorized(Some(&json!({ "message": message }))),

@@ -25,32 +25,24 @@ impl EventPublisher {
     }
 
     /// Read committed events after a cursor. Main/renderer replay uses this
-    /// when a broadcast frame was missed; the caller advances its own cursor
-    /// only after applying the returned rows.
-    #[allow(dead_code)] // consumed by D's host replay in the next slice
-    pub(crate) fn replay(
-        &self,
-        after_seq: i64,
-        limit: u32,
-    ) -> Result<Vec<crate::store::EventLogRow>, StoreError> {
-        self.store.list_events_since(after_seq, limit)
-    }
-
     /// Append the event row and then broadcast it. Returns the assigned seq.
     /// This is not a substitute for product-write atomicity: the caller that
     /// needs atomicity must wrap its product write and append_event_log_on in
     /// Store::write_transaction.
+    ///
+    /// Contract 1.283 (§4.267): the row is a thin change pointer — the ledger
+    /// no longer stores a payload, so replaying it means "re-read the entity",
+    /// not "reconstruct the frame from the log".
     pub(crate) fn publish(
         &self,
         epoch: u64,
         account_id: Option<&str>,
         event_type: &str,
-        payload: &str,
         event: HostSideEvent,
     ) -> Result<i64, StoreError> {
-        let seq = self.store.write_transaction(|tx| {
-            append_event_log_on(tx, epoch, account_id, event_type, payload)
-        })?;
+        let seq = self
+            .store
+            .write_transaction(|tx| append_event_log_on(tx, epoch, account_id, event_type))?;
         let _ = self.events.send(event);
         Ok(seq)
     }
@@ -73,7 +65,6 @@ mod tests {
                 1,
                 Some("a"),
                 "storage.changed",
-                "{\"state\":\"recovered\"}",
                 HostSideEvent::StorageChanged { state: "recovered" },
             )
             .unwrap();
@@ -82,9 +73,18 @@ mod tests {
             rx.try_recv().unwrap(),
             HostSideEvent::StorageChanged { state: "recovered" }
         ));
-        let rows = publisher.replay(0, 10).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, 1);
-        assert!(publisher.replay(1, 10).unwrap().is_empty());
+        // Contract 1.283 (§4.267): the row is a thin pointer, and it is what
+        // the host's events.list replays.
+        let page = store.events_page(Some(0), None, 10).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].seq, 1);
+        assert_eq!(page.events[0].event_type, "storage.changed");
+        assert!(
+            store
+                .events_page(Some(1), None, 10)
+                .unwrap()
+                .events
+                .is_empty()
+        );
     }
 }

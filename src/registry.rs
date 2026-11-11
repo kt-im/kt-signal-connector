@@ -42,15 +42,22 @@ use crate::engine::{EngineConfig, EngineError, EngineEvent, EngineState, EngineS
 use crate::groups::{MAX_PROXY_GROUPS, ProxyGroupPlan};
 use crate::protocol::ApiError;
 use crate::service::{
-    ConnectorService, ContactsSyncOutcome, HostSideEvent, MessageText, SendTarget,
-    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
+    ConnectorService, ContactsSyncOutcome, EventsListParams, HostSideEvent, MessageText,
+    SendTarget, SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
 };
 use crate::store::{
-    AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
-    Store, StoreError, StoreKey,
+    AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EventLedgerPage,
+    MessageRecord, Page, Store, StoreError, StoreKey,
 };
 use crate::supervisor::RuntimeSupervisor;
 use std::time::Duration;
+
+/// Contract 1.283 (§4.267): how often the event ledger's head retention runs.
+/// Thirty seconds is the same beat the disappearing-message sweeper uses — a
+/// ledger that trims a little late is harmless (the read face is bounded by
+/// both the page limit and its byte budget), while a fast loop would keep the
+/// store lock hot for no gain.
+const EVENT_LOG_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// One group slot: opaque id plus its full supervision stack.
 pub struct ProxyGroupSlot {
@@ -205,6 +212,11 @@ fn account_already_linked_error() -> ServiceError {
 pub enum StartFailure {
     AlreadyRunning,
     StartFailed,
+    /// O1: at least one engine refused the contract handshake (identity
+    /// missing or revision outside the supported interval). Not retryable: the
+    /// fault is latched on the supervisor and the same binary answers the same
+    /// revision on every restart.
+    ContractMismatch(crate::engine_contract::EngineContractFault),
 }
 
 /// Why `runtime.stop` failed.
@@ -226,6 +238,11 @@ pub struct ProxyGroupRuntime {
     router: Arc<Mutex<ConnectorService>>,
     /// The launcher's effective media-ingest decision (handshake gate).
     media_ingest_armed: bool,
+    /// The one per-instance store (contract revision 1.282, §4.266). The
+    /// routing service already owns a handle; this one exists so the
+    /// process-wide store health face (doctor + metrics) does not have to take
+    /// the service lock to answer.
+    store: Arc<Store>,
     /// Dynamic per-account engine registry. `None` on the pre-pool path: no
     /// account routing, no `engines[]`, no `degraded`, and every legacy path
     /// runs exactly as before. `Some` is **full pooling**: no group engine is
@@ -239,6 +256,10 @@ pub struct ProxyGroupRuntime {
     /// One process-wide history-retention pass (spawned on the first available
     /// supervisor, legacy or pooled).
     retention_spawned: AtomicBool,
+    /// One process-wide event-ledger retention pass (contract 1.283, §4.267):
+    /// the ledger is one table in the one store, so exactly one sweeper owns
+    /// it per runtime no matter how many groups or account slots exist.
+    event_log_sweeper: AtomicBool,
     events: broadcast::Sender<RegistryEvent>,
     host_events: broadcast::Sender<HostSideEvent>,
     /// Forwarder tasks merging every slot's streams into this runtime;
@@ -265,11 +286,13 @@ impl ProxyGroupRuntime {
         let group_ids = groups.iter().map(|slot| slot.id.clone()).collect();
         let router = Arc::clone(groups[0].supervisor.service());
         let media_ingest_armed = groups[0].supervisor.media_ingest_armed();
+        let store = groups[0].supervisor.store();
         Self::assemble(
             groups.into_iter().map(Arc::new).collect(),
             group_ids,
             router,
             media_ingest_armed,
+            store,
             None,
         )
     }
@@ -297,8 +320,16 @@ impl ProxyGroupRuntime {
             group_ids.len() <= MAX_PROXY_GROUPS,
             "the launch plan enforces the group ceiling"
         );
+        let health_store = Arc::clone(&store);
         let router = Arc::new(Mutex::new(ConnectorService::with_media(store, None)));
-        let runtime = Self::assemble(Vec::new(), group_ids, router, media_ingest, Some(pool));
+        let runtime = Self::assemble(
+            Vec::new(),
+            group_ids,
+            router,
+            media_ingest,
+            health_store,
+            Some(pool),
+        );
         // The shared flag starts where the freshly assembled runtime stands
         // (stopped), then every start/stop writes it as well as its own.
         running.store(runtime.running.load(Ordering::Acquire), Ordering::Release);
@@ -324,6 +355,7 @@ impl ProxyGroupRuntime {
         group_ids: Vec<String>,
         router: Arc<Mutex<ConnectorService>>,
         media_ingest_armed: bool,
+        store: Arc<Store>,
         pool: Option<Arc<crate::pool::AccountPool>>,
     ) -> Arc<Self> {
         assert!(
@@ -342,9 +374,11 @@ impl ProxyGroupRuntime {
             group_ids,
             router,
             media_ingest_armed,
+            store,
             pool,
             running: AtomicBool::new(false),
             retention_spawned: AtomicBool::new(false),
+            event_log_sweeper: AtomicBool::new(false),
             events,
             host_events,
             forwarders: StdMutex::new(Vec::new()),
@@ -352,6 +386,7 @@ impl ProxyGroupRuntime {
             shared_running: StdMutex::new(None),
         });
         runtime.spawn_forwarders();
+        runtime.spawn_event_log_sweeper();
         if let Some(pool) = &runtime.pool {
             for slot in pool.slots() {
                 runtime.spawn_account_forwarders(&slot);
@@ -362,6 +397,52 @@ impl ProxyGroupRuntime {
             runtime.spawn_link_reaper();
         }
         runtime
+    }
+
+    /// The event ledger's retention pass (contract 1.283, §4.267): one
+    /// process-wide task, because the ledger is one table in the one store.
+    /// It runs one pass immediately (so an upgrade trims at startup instead of
+    /// thirty seconds later) and then every EVENT_LOG_SWEEP_INTERVAL. Every
+    /// pass is single-flight and runs on the blocking pool — rusqlite is
+    /// synchronous and must never occupy a tokio worker — and a store failure
+    /// only logs: the next tick retries.
+    fn spawn_event_log_sweeper(self: &Arc<Self>) {
+        // A runtime assembled outside a tokio context (unit fixtures) simply
+        // does not sweep, and leaves the slot free so a later assembly inside
+        // one still claims it; in production the assembly always runs inside
+        // the runtime.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.event_log_sweeper.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        handle.spawn(async move {
+            loop {
+                let outcome = tokio::task::spawn_blocking({
+                    let store = Arc::clone(&store);
+                    move || store.trim_event_log(crate::link::now_ms())
+                })
+                .await
+                .unwrap_or(Err(StoreError::Unavailable(None)));
+                match outcome {
+                    Ok(outcome) if outcome.removed > 0 => tracing::info!(
+                        removed = outcome.removed,
+                        trimmed_through_seq = outcome.trimmed_through_seq,
+                        rows = outcome.rows,
+                        bytes = outcome.bytes,
+                        "event ledger retention trimmed the head"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        error_class = error.class(),
+                        "event ledger retention stopped: store unavailable"
+                    ),
+                }
+                tokio::time::sleep(EVENT_LOG_SWEEP_INTERVAL).await;
+            }
+        });
     }
 
     /// Reclaim half-finished link slots (engine running, no committed store
@@ -818,6 +899,35 @@ impl ProxyGroupRuntime {
             .map(|slot| (slot.id.as_str(), &slot.supervisor))
     }
 
+    /// O1: every engine slot's handshake state for the periodic per-group
+    /// metrics line (legacy groups by group id, pooled slots by opaque account
+    /// id). Read-only; the supervisor's lock is taken only to copy the state.
+    pub async fn engine_contract_samples(&self) -> Vec<crate::metrics::EngineContractSample> {
+        let mut samples = Vec::with_capacity(self.groups.len());
+        for slot in &self.groups {
+            samples.push(crate::metrics::EngineContractSample {
+                group_id: slot.id.clone(),
+                state: slot.supervisor.engine_contract_state().await,
+            });
+        }
+        if let Some(pool) = &self.pool {
+            for slot in pool.slots() {
+                samples.push(crate::metrics::EngineContractSample {
+                    group_id: slot.account_id().to_string(),
+                    state: slot.supervisor().engine_contract_state().await,
+                });
+            }
+        }
+        samples
+    }
+
+    /// The one store this process serves (contract revision 1.282, §4.266).
+    /// The doctor's `store` face and the periodic metrics line read it; both
+    /// are read-only and neither takes a group's service lock.
+    pub(crate) fn store(&self) -> Arc<Store> {
+        Arc::clone(&self.store)
+    }
+
     /// Start every group's engine (R7). Success reports the per-group states;
     /// RUNTIME_START_FAILED only when no group engine started. With the
     /// per-account pool enabled, the resident window (top-K most recently
@@ -829,6 +939,15 @@ impl ProxyGroupRuntime {
             // Full pooling: no group engine exists. The resident window (top-K
             // most recently used account slots) starts here.
             pool.start_resident().await;
+            // O1: one engine binary backs every slot, so one contract refusal
+            // is a runtime-wide refusal. Stop what already started instead of
+            // leaving a half-running account pipeline behind the fatal.
+            if let Some(fault) = pool.contract_fault().await {
+                pool.stop_all().await;
+                self.running.store(false, Ordering::Release);
+                self.publish_running();
+                return Err(StartFailure::ContractMismatch(fault));
+            }
             let mut any_running = false;
             for slot in pool.slots() {
                 if slot.supervisor().status().await.state == EngineState::Running {
@@ -845,16 +964,40 @@ impl ProxyGroupRuntime {
         }
         let mut any_running = false;
         let mut already_running = false;
+        let mut started = Vec::new();
+        let mut contract_fault = None;
         for slot in &self.groups {
             match slot.supervisor.start().await {
                 Ok(status) => {
                     if status.state == EngineState::Running {
                         any_running = true;
+                        started.push(std::sync::Arc::clone(slot));
                     }
                 }
                 Err(EngineError::Backpressure) => already_running = true,
+                // O1: every group runs the same engine binary; the first
+                // refusal is the runtime's verdict. Stop what already started
+                // so no account pipeline keeps running behind the fatal.
+                Err(EngineError::ContractMismatch(fault)) => {
+                    contract_fault = Some(fault);
+                    break;
+                }
                 Err(_) => {}
             }
+        }
+        if let Some(fault) = contract_fault {
+            for slot in &started {
+                if let Err(error) = slot.supervisor.stop().await {
+                    tracing::warn!(
+                        group_id = %slot.id,
+                        error_class = error.class(),
+                        "group engine did not stop after the contract refusal"
+                    );
+                }
+            }
+            self.running.store(false, Ordering::Release);
+            self.publish_running();
+            return Err(StartFailure::ContractMismatch(fault));
         }
         if !any_running && !already_running {
             return Err(StartFailure::StartFailed);
@@ -1620,14 +1763,16 @@ impl ProxyGroupRuntime {
             .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn events_since(
+    /// events.list (contract 1.283, §4.267). The ledger is process-wide, so
+    /// this read does not need an account slot — but it still routes through
+    /// the one routing service that owns the store handle, the same way every
+    /// other store-only read face does.
+    pub async fn events_page(
         &self,
-        after_seq: i64,
-        limit: u32,
-    ) -> Result<Vec<crate::store::EventLogRecord>, ServiceError> {
+        params: EventsListParams,
+    ) -> Result<EventLedgerPage, ServiceError> {
         let service = self.router.lock().await;
-        service.events_since(after_seq, limit)
+        service.events_page(params)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1711,6 +1856,50 @@ impl ProxyGroupRuntime {
         let slot = self.slot_for_account(&account_id).await?;
         slot.supervisor
             .send_attachment(
+                account_id,
+                target,
+                client_request_id,
+                data_base64,
+                size_bytes,
+                filename,
+                content_type,
+                text,
+                quote_message_id,
+                voice_note,
+                view_once,
+                blur_hash,
+                gif,
+            )
+            .await
+    }
+
+    /// Retry one definitively-failed outgoing attachment in place (contract
+    /// revision 1.278, §4.262; bytes optional = 1.279, §4.263; plural rebuild =
+    /// 1.280, §4.264): routed through the account's own proxy-group slot exactly
+    /// like the original send — the retry must reach the same engine the first
+    /// attempt used, and it settles the same row, in the shape the original
+    /// used. A missing dataBase64/sizeBytes pair reuses the original payload
+    /// group persisted at first send (one row per attachment index).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retry_attachment(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: Option<String>,
+        size_bytes: Option<u64>,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+    ) -> Result<MessageRecord, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .retry_attachment(
                 account_id,
                 target,
                 client_request_id,

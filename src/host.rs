@@ -43,14 +43,14 @@ use crate::service::{
     ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
     ConversationsGetStateParams, ConversationsListParams, ConversationsReportSpamParams,
     ConversationsSaveDraftParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetPinnedParams, ConversationsSetStateParams, GroupsApproveJoinRequestsParams,
-    GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams, GroupsCommonParams,
-    GroupsCreateParams, GroupsGetParams, GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams,
-    GroupsMigrateParams, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
-    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadParams, HistoryImportCancelParams, HistoryImportRetryParams,
-    HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
-    LinkSessionParams, LinkStartParams, MessageGetByClientRequestIdParams,
+    ConversationsSetPinnedParams, ConversationsSetStateParams, EventsListParams,
+    GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams,
+    GroupsCommonParams, GroupsCreateParams, GroupsGetParams, GroupsInviteLinkPasswordParams,
+    GroupsJoinViaLinkParams, GroupsMigrateParams, GroupsParseInviteLinkParams,
+    GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
+    GroupsUpdateParams, HistoryAttachmentDownloadParams, HistoryImportCancelParams,
+    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams,
+    IdentitiesVerifyParams, LinkSessionParams, LinkStartParams, MessageGetByClientRequestIdParams,
     MessageGetReceiptsParams, MessageGetTextParams, MessageRequestParams,
     MessagesAdjacentMediaParams, MessagesAroundParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams,
@@ -1310,6 +1310,15 @@ fn spawn_metrics_log(runtime: std::sync::Weak<ProxyGroupRuntime>) {
             ticker.tick().await;
             metrics::log_snapshot();
             if let Some(runtime) = runtime.upgrade() {
+                // Contract revision 1.282 (§4.266): the store's own health —
+                // schema version, gate verdict, file sizes, snapshot outcome —
+                // rides the same periodic line, so an upgrade that rolled back
+                // is visible in logs without a doctor call.
+                metrics::log_store_health(&runtime.store().health());
+                // Contract revision 1.283 (§4.267): the ledger's own series —
+                // a floor that stopped advancing, or a ledger pinned at its
+                // byte ceiling, has to be visible without a doctor call.
+                metrics::log_event_log_health(&runtime.store().event_log_health());
                 let status = runtime.status().await;
                 let samples: Vec<_> = status
                     .proxy_groups
@@ -1317,6 +1326,11 @@ fn spawn_metrics_log(runtime: std::sync::Weak<ProxyGroupRuntime>) {
                     .map(|group| (group.group_id, group.rss_bytes))
                     .collect();
                 metrics::log_engine_rss(&samples);
+                // O1: the handshake face beside the RSS sample — per engine
+                // slot: the engine's own version, the contract revision it
+                // states, and the connector's verdict.
+                let contracts = runtime.engine_contract_samples().await;
+                metrics::log_engine_contract(&contracts);
             }
         }
     });
@@ -1586,28 +1600,25 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                 "this method requires empty params",
             ),
         ),
-        // B: durable event_log cursor read face. afterSeq is the subscriber's
-        // last applied seq; the answer is strictly ascending and bounded.
-        "events.list" => {
-            let after_seq = request
-                .params
-                .get("afterSeq")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let limit = request
-                .params
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(100)
-                .clamp(1, 500) as u32;
-            match runtime.events_since(after_seq, limit).await {
-                Ok(events) => HostResponse::success(
+        // events.list (contract 1.283, §4.267): the durable change ledger's
+        // read face. The caller presents {afterSeq?, token?, limit?} and gets
+        // back one token-stamped page plus the reset verdict; a reset carries
+        // no events and points at the floor. Params are a strict struct, so an
+        // unknown key, a negative cursor or an out-of-range limit fails closed
+        // here instead of being silently dropped.
+        "events.list" => match serde_json::from_value::<EventsListParams>(request.params) {
+            Ok(params) => match runtime.events_page(params).await {
+                Ok(page) => HostResponse::success(
                     request_id,
-                    serde_json::to_value(events).unwrap_or(Value::Null),
+                    serde_json::to_value(page).unwrap_or(Value::Null),
                 ),
                 Err(error) => HostResponse::failure(request_id, error.into_api()),
-            }
-        }
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                reject_probe("events.list", "params", "invalid events.list params"),
+            ),
+        },
         "accounts.list" if empty_params(&request.params) => match runtime.list_accounts().await {
             Ok(accounts) => HostResponse::success(
                 request_id,
@@ -2916,6 +2927,102 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                         "messages.attachments.send",
                         "params",
                         "invalid messages.attachments.send params",
+                    ),
+                ),
+            }
+        }
+        // §4.262 (contract revision 1.278) + §4.263 (contract 1.279) + §4.264
+        // (contract 1.280): the in-place attachment retry — the SAME row
+        // re-sent, never a new message beside it, in the shape the original
+        // used. Params shape takes the singular messages.attachments.send form
+        // (same addressing rules); the plural §4.59 array is rejected outright
+        // rather than silently taking its first entry (the row itself decides
+        // whether the retry re-sends one attachment or its whole persisted
+        // group). dataBase64/sizeBytes are optional together — omitted, the
+        // connector reuses the original payload group persisted at first send
+        // (refresh-safe, plural included); supplied, they serve a singular row
+        // and replace its index-0 payload.
+        "messages.attachments.retry" => {
+            match serde_json::from_value::<MessagesSendAttachmentParams>(request.params) {
+                Ok(params) => {
+                    let target = match (
+                        params.conversation_id,
+                        params.kind,
+                        params.peer_key,
+                        params.peer_title,
+                    ) {
+                        (Some(conversation_id), None, None, None) => {
+                            Ok(SendTarget::Conversation(conversation_id))
+                        }
+                        (None, Some(kind), Some(peer_key), peer_title) => Ok(SendTarget::Peer {
+                            kind,
+                            peer_key,
+                            peer_title,
+                        }),
+                        _ => Err(reject_probe(
+                            "messages.attachments.retry",
+                            "conversationId,kind,peerKey",
+                            "exactly one of conversationId or kind+peerKey must be provided",
+                        )),
+                    };
+                    match target {
+                        Ok(target) => {
+                            if params.attachments.is_some() {
+                                HostResponse::failure(
+                                    request_id,
+                                    reject_probe(
+                                        "messages.attachments.retry",
+                                        "attachments",
+                                        "the retry face takes the singular attachment form and never the attachments array",
+                                    ),
+                                )
+                            } else if params.data_base64.is_some() != params.size_bytes.is_some() {
+                                HostResponse::failure(
+                                    request_id,
+                                    reject_probe(
+                                        "messages.attachments.retry",
+                                        "dataBase64,sizeBytes",
+                                        "dataBase64 and sizeBytes must be provided together; omit both to reuse the persisted original payload",
+                                    ),
+                                )
+                            } else {
+                                match runtime
+                                    .retry_attachment(
+                                        params.account_id,
+                                        target,
+                                        params.client_request_id,
+                                        params.data_base64,
+                                        params.size_bytes,
+                                        params.filename,
+                                        params.content_type,
+                                        params.text,
+                                        params.quote_message_id,
+                                        params.voice_note,
+                                        params.view_once,
+                                        params.blur_hash,
+                                        params.gif,
+                                    )
+                                    .await
+                                {
+                                    Ok(message) => HostResponse::success(
+                                        request_id,
+                                        serde_json::to_value(message).unwrap_or(Value::Null),
+                                    ),
+                                    Err(error) => {
+                                        HostResponse::failure(request_id, error.into_api())
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => HostResponse::failure(request_id, error),
+                    }
+                }
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "messages.attachments.retry",
+                        "params",
+                        "invalid messages.attachments.retry params",
                     ),
                 ),
             }
@@ -4435,6 +4542,19 @@ fn map_start_failure(failure: StartFailure) -> ApiError {
             "engine runtime could not be started",
             true,
         ),
+        // O1: the structured fatal. `retryable: false` is the class's own
+        // assertion (the supervisor latched the fault); the three facts the
+        // launcher needs to repair ride `data`, mirrored by the byte-stable
+        // KT_FATAL line the supervisor wrote to stderr.
+        StartFailure::ContractMismatch(fault) => ApiError {
+            data: Some(fault.report_data()),
+            ..ApiError::new(
+                "ENGINE_CONTRACT_MISMATCH",
+                "engine contract mismatch: the engine states no identity, or a contract \
+                 revision outside this connector's supported range",
+                false,
+            )
+        },
     }
 }
 

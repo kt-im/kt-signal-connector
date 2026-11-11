@@ -40,15 +40,15 @@ use crate::service::{
     GroupsJoinViaLinkParams, GroupsMigrateParams, GroupsMigrateResult, GroupsParseInviteLinkParams,
     GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
     GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams,
-    IdentitiesVerifyIntent, IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome,
-    ImportGroupsSummary, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
-    MAX_STORY_RECIPIENTS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
-    MergeContactsSummary, MessageRequestOutcome, MessageRequestParams,
-    MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams, MessagesReportSpamParams,
-    MessagesSendContactParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
-    MessagesSendPollVoteParams, MessagesSendStickerParams, MessagesSendStoryParams,
-    NotificationProfileSyncs, NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
-    PeerTarget, PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
+    IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary,
+    MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS,
+    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary,
+    MessageRequestOutcome, MessageRequestParams, MessagesDeleteForMeMessagesParams,
+    MessagesDeleteForMeParams, MessagesReportSpamParams, MessagesSendContactParams,
+    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
+    MessagesSendStickerParams, MessagesSendStoryParams, NotificationProfileSyncs,
+    NotificationProfilesListParams, NotificationProfilesSetRecordsParams, PeerTarget,
+    PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
     PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
     SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
     StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
@@ -63,7 +63,8 @@ use crate::service::{
     conversation_state_from_engine, device_list_from_engine, group_create_result_from_engine,
     group_invite_join_status_from_engine, group_invite_link_parse_from_engine,
     group_invite_link_password_from_engine, group_invite_link_preview_from_engine,
-    group_migrate_result_from_engine, identity_from_engine, import_groups_summary_from_engine,
+    group_migrate_result_from_engine, identities_addressing, identities_verify_intent,
+    identity_from_engine, identity_verify_stamp_word, import_groups_summary_from_engine,
     merge_contacts_summary_from_engine, notification_profile_syncs_result,
     pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
     store_get_group_with_requesting, store_get_message_text, store_list_contacts,
@@ -75,8 +76,14 @@ use crate::store::{
     MessageRecord, Page, Store, StoreError, SyncedContact,
 };
 
-// Match link QR lifetime so a slow phone confirmation can still complete.
-const LINK_FINISH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Phone-approval wait for `finishLink`. Pinned above both deadlines it must
+/// never pre-empt: the engine's own finish dispatch budget (360 s) and the
+/// desktop's link wait (330 s). A connector that answered first would turn a
+/// link the engine may still commit into a client-side failure — and re-running
+/// `finishLink` claims a second device slot. When this budget does expire the
+/// answer is therefore the link-class unknown outcome (the desktop's adopt
+/// path), never a retryable `UPSTREAM_TIMEOUT`.
+const LINK_FINISH_TIMEOUT: Duration = Duration::from_secs(370);
 const RECEIVE_STORE_RETRY_MIN: Duration = Duration::from_millis(100);
 const RECEIVE_STORE_RETRY_MAX: Duration = Duration::from_secs(5);
 const WATCHDOG_PING_TIMEOUT: Duration = Duration::from_secs(15);
@@ -519,6 +526,23 @@ fn link_cancelled_error() -> ServiceError {
     ))
 }
 
+/// O1: dispose of an engine the contract handshake refused (or could not
+/// verify). The child is killed directly — a wedged engine (the probe-timeout
+/// case) would otherwise hold the graceful-shutdown budget for nothing, and a
+/// mismatched one has no state worth a graceful exit.
+async fn refuse_started_engine(engine: &EngineHandle, error: &EngineError) {
+    if let Err(kill_error) = engine.force_kill().await {
+        tracing::warn!(
+            error_class = ?kill_error.kind(),
+            "engine refused by the contract handshake could not be killed directly"
+        );
+    }
+    tracing::warn!(
+        error_class = error.class(),
+        "engine refused by the contract handshake; killed before any account work"
+    );
+}
+
 /// The one in-flight `link.finish` wait of this group (per-group wait lane,
 /// implementation-plan §6.1). The watch channel is the cancellation signal:
 /// `link.cancel` flips it and the finish call stops waiting at once without
@@ -546,6 +570,13 @@ pub struct RuntimeSupervisor {
     /// Exposed through the pool's per-account status face; never persisted.
     restart_count: Arc<AtomicU64>,
     engine: Mutex<Option<EngineHandle>>,
+    /// O1 engine contract handshake state: the verdict of the last engine
+    /// landing (doctor/metrics read it) plus the latched fault that refuses
+    /// every later start for the life of this process. A mismatch is never
+    /// self-healing — the same binary answers the same revision on restart —
+    /// so the latch is what keeps the watchdog and `runtime.start` from
+    /// burning the launcher's restart budget on it.
+    engine_contract: Mutex<crate::engine_contract::EngineContractState>,
     service: Arc<Mutex<ConnectorService>>,
     /// Shared store handle for the store-only paths (retention, reads) that
     /// run on the blocking pool without the service lock.
@@ -847,6 +878,7 @@ impl RuntimeSupervisor {
             preferred_account_id,
             restart_count: Arc::new(AtomicU64::new(0)),
             engine: Mutex::new(None),
+            engine_contract: Mutex::new(crate::engine_contract::EngineContractState::default()),
             service,
             store,
             media,
@@ -937,6 +969,14 @@ impl RuntimeSupervisor {
     /// lookups and account counts over the single shared store.
     pub(crate) fn service(&self) -> &Arc<Mutex<ConnectorService>> {
         &self.service
+    }
+
+    /// The shared store handle (contract revision 1.282, §4.266): the
+    /// registry keeps one for the process-wide store health face, so the
+    /// doctor and the metrics line can read schema version, integrity, file
+    /// sizes and snapshot state without going through a group engine.
+    pub(crate) fn store(&self) -> Arc<Store> {
+        Arc::clone(&self.store)
     }
 
     /// Whether the media-download capability is genuinely armed for this
@@ -1130,7 +1170,7 @@ impl RuntimeSupervisor {
                 let publisher =
                     EventPublisher::new(Arc::clone(&self.store), self.host_events.clone());
                 if let Err(error) =
-                    publisher.publish(epoch, Some(&account_id), "message.expired", "{}", event)
+                    publisher.publish(epoch, Some(&account_id), "message.expired", event)
                 {
                     tracing::warn!(?error, "durable event publish failed");
                 }
@@ -1674,10 +1714,14 @@ impl RuntimeSupervisor {
     /// settles are guarded (`WHERE status='unknown'`), so a re-run — a
     /// watchdog-recovered engine, a later start — converges to no-ops over
     /// already-settled rows and never stomps a concurrently rearmed retry.
-    fn spawn_unknown_outcome_reconcile(&self) {
-        let Ok(engine_slot) = self.engine.try_lock() else {
-            return;
-        };
+    async fn spawn_unknown_outcome_reconcile(&self) {
+        // O1 note: this used `try_lock`, so an engine mutex that happened to
+        // be held at landing time (the contacts-resync pass grabs it in the
+        // same instant) silently skipped the ONLY reconciliation arming until
+        // the next engine landing. Awaiting the lock costs nothing here — the
+        // caller has already released its own guard — and keeps the pass from
+        // being a scheduling race.
+        let engine_slot = self.engine.lock().await;
         let Some(engine) = engine_slot
             .as_ref()
             .filter(|engine| !engine.is_terminal())
@@ -2462,6 +2506,7 @@ impl RuntimeSupervisor {
             .any_signal_account_number_in_group(&self.group_id)
             .ok()
             .flatten();
+        let contract = self.engine_contract_state().await;
         let slot = self.engine.lock().await;
         let live = slot.as_ref().filter(|engine| !engine.is_terminal());
         crate::doctor::DoctorGroupFace {
@@ -2477,11 +2522,22 @@ impl RuntimeSupervisor {
                 }),
             engine: live.cloned(),
             probe_account,
+            contract,
         }
     }
 
     pub async fn start(&self) -> Result<EngineStatus, EngineError> {
         let mut slot = self.engine.lock().await;
+        if let Some(fault) = self.latched_contract_fault().await {
+            tracing::warn!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                engine_version = fault.engine_version.as_deref().unwrap_or("unknown"),
+                contract_reason = fault.reason.as_str(),
+                "engine start refused: the contract mismatch is latched for this process"
+            );
+            return Err(EngineError::ContractMismatch(fault));
+        }
         if let Some(engine) = slot.as_ref()
             && !engine.is_terminal()
         {
@@ -2493,6 +2549,13 @@ impl RuntimeSupervisor {
             self.receive_ingress.clone(),
         )
         .await?;
+        // O1: the handshake is the gate in front of every account-shaped
+        // side effect. A refused engine is killed here and never lands in the
+        // slot, so no resync/import/reconcile pass can run against it.
+        if let Err(error) = self.admit_engine(&engine).await {
+            refuse_started_engine(&engine, &error).await;
+            return Err(error);
+        }
         let status = engine.status();
         *slot = Some(engine);
         drop(slot);
@@ -2502,7 +2565,7 @@ impl RuntimeSupervisor {
             // §4.179: the engine landed — reconcile this group's unsettled
             // unknown-outcome rows against the engine's own dispatch ledger
             // (best-effort, idempotent, warn-only).
-            self.spawn_unknown_outcome_reconcile();
+            self.spawn_unknown_outcome_reconcile().await;
             // §4.190 ⑥: the engine landed — fetch each account's
             // configuration and mirror the readReceipts gate flag
             // (best-effort, idempotent, warn-only).
@@ -2580,6 +2643,103 @@ impl RuntimeSupervisor {
             .filter(|engine| !engine.is_terminal())
             .cloned()
             .ok_or(EngineError::NotRunning)
+    }
+
+    /// The latched O1 contract fault, if this slot has refused an engine.
+    pub(crate) async fn latched_contract_fault(
+        &self,
+    ) -> Option<crate::engine_contract::EngineContractFault> {
+        self.engine_contract.lock().await.fault.clone()
+    }
+
+    /// The whole handshake state (doctor/metrics): last served verdict or the
+    /// latched fault.
+    pub(crate) async fn engine_contract_state(
+        &self,
+    ) -> crate::engine_contract::EngineContractState {
+        self.engine_contract.lock().await.clone()
+    }
+
+    /// O1: run the contract handshake for a freshly spawned engine and record
+    /// its verdict. The caller owns the engine and must refuse it on error:
+    /// nothing account-shaped may run against an engine this gate did not
+    /// admit.
+    ///
+    /// Unconditional by design: there is no environment switch that skips the
+    /// gate. A production env bypass is a drift hole (the one deployment that
+    /// sets it serves an unverified engine forever), so debugging goes through
+    /// the fake engine's own fixture parameters instead.
+    async fn admit_engine(&self, engine: &EngineHandle) -> Result<(), EngineError> {
+        match crate::engine_contract::verify(engine).await {
+            Ok(report) => {
+                crate::metrics::record_engine_contract(&report);
+                if report.status == crate::engine_contract::CONTRACT_STATUS_LEGACY {
+                    tracing::warn!(
+                        account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                        group_id = %self.group_id,
+                        engine_name = %report.engine_name,
+                        engine_version = %report.engine_version,
+                        "engine contract handshake: the engine states no contract revision; served in legacy mode"
+                    );
+                } else {
+                    tracing::info!(
+                        account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                        group_id = %self.group_id,
+                        engine_name = %report.engine_name,
+                        engine_version = %report.engine_version,
+                        engine_contract_revision = report
+                            .contract_revision
+                            .as_deref()
+                            .unwrap_or("-"),
+                        "engine contract handshake: revision in range"
+                    );
+                }
+                *self.engine_contract.lock().await = crate::engine_contract::EngineContractState {
+                    report: Some(report),
+                    fault: None,
+                };
+                Ok(())
+            }
+            Err(crate::engine_contract::EngineContractError::Unavailable) => {
+                // Retryable: the engine is alive enough to have been spawned
+                // but did not answer the handshake inside the budget. This is
+                // a startup failure, not a contract refusal — the watchdog may
+                // try again.
+                crate::metrics::record_engine_contract_probe_failure();
+                tracing::warn!(
+                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                    group_id = %self.group_id,
+                    budget_ms = crate::engine_contract::ENGINE_CONTRACT_PROBE_TIMEOUT
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                    "engine contract handshake did not complete; the start stays retryable"
+                );
+                Err(EngineError::StartFailed)
+            }
+            Err(crate::engine_contract::EngineContractError::Mismatch(fault)) => {
+                crate::metrics::record_engine_contract_mismatch(&fault);
+                // The launcher's only byte-stable channel: the same fixed line
+                // shape the store's fatal classes use. Emitted once, at the
+                // moment the fault is latched.
+                let line = fault.fatal_line();
+                tracing::error!(
+                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                    group_id = %self.group_id,
+                    engine_name = fault.engine_name.as_deref().unwrap_or("unknown"),
+                    engine_version = fault.engine_version.as_deref().unwrap_or("unknown"),
+                    engine_contract_revision = fault.contract_revision.as_deref().unwrap_or("-"),
+                    contract_reason = fault.reason.as_str(),
+                    supported = crate::engine_contract::SUPPORTED_ENGINE_CONTRACT_RANGE,
+                    "engine contract mismatch; the engine is not served and the fault is latched"
+                );
+                eprintln!("{line}");
+                *self.engine_contract.lock().await = crate::engine_contract::EngineContractState {
+                    report: None,
+                    fault: Some(fault.clone()),
+                };
+                Err(EngineError::ContractMismatch(fault))
+            }
+        }
     }
 
     pub async fn list_accounts(&self) -> Result<Vec<AccountSummary>, ServiceError> {
@@ -2836,6 +2996,20 @@ impl RuntimeSupervisor {
         Ok(result)
     }
 
+    /// The answer a budget-expired `finishLink` gets: the link-class unknown
+    /// outcome, never a definite retryable timeout. The call is mutating and
+    /// was in flight when the budget expired, so the phone may already have
+    /// approved the device and the engine may have committed the link; the
+    /// remedy is the caller's adopt path (`accounts.list`), not a re-run.
+    fn link_finish_timeout_error() -> ServiceError {
+        ServiceError::Api(ApiError::new(
+            "LINK_OUTCOME_UNKNOWN",
+            "finishLink exceeded the link budget; the phone may have approved the device, \
+             so adopt from the account list instead of retrying",
+            false,
+        ))
+    }
+
     pub async fn finish_link(
         &self,
         link_session_id: String,
@@ -2869,6 +3043,21 @@ impl RuntimeSupervisor {
                 return Err(error);
             }
         };
+        // The finish budget outlives the advertised QR lifetime
+        // (`LINK_SESSION_TTL`): an approval that lands while `finishLink` is
+        // in flight must still be commitable, or the engine links a device
+        // that the commit then refuses with LINK_EXPIRED. The pin extends only
+        // the in-memory session deadline; the QR's advertised `expiresAt`
+        // stays what it was.
+        if let Err(error) = self
+            .service
+            .lock()
+            .await
+            .pin_link_for_finish(&link_session_id, LINK_FINISH_TIMEOUT)
+        {
+            self.clear_link_finish(&link_session_id).await;
+            return Err(error);
+        }
 
         // Per-engine account ceiling (M3.3): refuse before dispatching the
         // mutating finishLink, so the phone is never asked to approve a link
@@ -2909,13 +3098,13 @@ impl RuntimeSupervisor {
             // any late engine-side link surfaces through the next
             // accounts.list sync as a real link (the phone approved it).
             Ok(None) => return Err(link_cancelled_error()),
-            Err(EngineError::Timeout) => {
-                return Err(ServiceError::Api(ApiError::new(
-                    "UPSTREAM_TIMEOUT",
-                    "finishLink timed out waiting for phone approval; retry after scanning",
-                    true,
-                )));
-            }
+            // The budget expired with the mutating call still in flight: the
+            // phone may have approved the device and the engine may have
+            // committed the link. A definite timeout would invite a blind
+            // re-run (a second device slot), so the honest answer is the
+            // link-class unknown outcome — the desktop reconciles it through
+            // the account list (adopt).
+            Err(EngineError::Timeout) => return Err(Self::link_finish_timeout_error()),
             // finishLink is Mutating, so this means the call was in flight when
             // the engine died: the phone may already have linked the device.
             // Retrying would claim a second device slot, so the host has to
@@ -3042,6 +3231,16 @@ impl RuntimeSupervisor {
     /// old engine's actor is parked on receive backpressure.
     async fn restart_engine(&self) -> Result<(), EngineError> {
         let mut slot = self.engine.lock().await;
+        if let Some(fault) = self.latched_contract_fault().await {
+            tracing::warn!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                engine_version = fault.engine_version.as_deref().unwrap_or("unknown"),
+                contract_reason = fault.reason.as_str(),
+                "engine restart refused: the contract mismatch is latched for this process"
+            );
+            return Err(EngineError::ContractMismatch(fault));
+        }
         if let Some(engine) = slot.take() {
             engine.shutdown().await?;
         }
@@ -3051,6 +3250,13 @@ impl RuntimeSupervisor {
             self.receive_ingress.clone(),
         )
         .await?;
+        // O1: a watchdog recovery re-earns the handshake verdict — the engine
+        // binary may have been replaced between restarts, and a mismatch here
+        // latches exactly like a fresh start does.
+        if let Err(error) = self.admit_engine(&engine).await {
+            refuse_started_engine(&engine, &error).await;
+            return Err(error);
+        }
         let status = engine.status();
         self.restart_count.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
@@ -3071,7 +3277,7 @@ impl RuntimeSupervisor {
             // window that leaves unknown-outcome rows behind, so limiting
             // the pass to `start()` would strand them until the next manual
             // start. Best-effort, idempotent, warn-only.
-            self.spawn_unknown_outcome_reconcile();
+            self.spawn_unknown_outcome_reconcile().await;
         }
         // §4.190 ⑥: a fresh engine (watchdog recovery included) re-fetches
         // the accounts' configuration — the readReceipts gate flag converges
@@ -3397,6 +3603,27 @@ impl RuntimeSupervisor {
                                 ping_failures = 0;
                                 stderr_rx = None;
                                 stderr_pid = None;
+                            }
+                            Err(EngineError::ContractMismatch(fault)) => {
+                                // O1: not retryable by construction. Clear the
+                                // backstop instead of re-arming it — the latch
+                                // already refuses every later attempt.
+                                pending = None;
+                                tracing::error!(
+                                    reason = deferred.reason,
+                                    source = %deferred.source,
+                                    account_id = self
+                                        .preferred_account_id
+                                        .as_deref()
+                                        .unwrap_or("-"),
+                                    group_id = %self.group_id,
+                                    engine_version = fault
+                                        .engine_version
+                                        .as_deref()
+                                        .unwrap_or("unknown"),
+                                    contract_reason = fault.reason.as_str(),
+                                    "watchdog recovery refused: engine contract mismatch is not self-healing"
+                                );
                             }
                             Err(error) => {
                                 // Keep the backstop armed: dropping it here
@@ -3740,6 +3967,18 @@ impl RuntimeSupervisor {
         source: RestartSource,
         reason: &'static str,
     ) -> bool {
+        // O1: a latched contract mismatch is terminal for this process — no
+        // watchdog tick may re-spawn the same refused engine.
+        if let Some(fault) = self.latched_contract_fault().await {
+            tracing::warn!(
+                reason,
+                source = %source,
+                engine_version = fault.engine_version.as_deref().unwrap_or("unknown"),
+                contract_reason = fault.reason.as_str(),
+                "watchdog restart refused: the engine contract mismatch is latched"
+            );
+            return false;
+        }
         // A trigger-free gap longer than the anti-storm window starts a fresh
         // episode with the fast (immediate) path restored.
         if let Some(last_trigger) = episode.last_trigger
@@ -4960,6 +5199,67 @@ impl RuntimeSupervisor {
                 &attachment_target,
                 &client_request_id,
                 &data_base64,
+                size_bytes,
+                filename.as_deref(),
+                content_type.as_deref(),
+                text.as_deref(),
+                quote_message_id.as_deref(),
+                voice_note,
+                view_once,
+                blur_hash.as_deref(),
+                gif,
+            )?
+        };
+        self.dispatch_prepared(&engine, prepared).await
+    }
+
+    /// Retry one definitively-failed outgoing attachment in place (contract
+    /// revision 1.278, §4.262; bytes optional = 1.279, §4.263; plural rebuild =
+    /// 1.280, §4.264): the §4.12 settlement path unchanged — local rearm + face
+    /// rewrite under the service lock, one upstream mutating `send` call
+    /// carrying the caller's bytes when supplied (else the original payload group
+    /// persisted at first send, rebuilt entry by entry), then the shared
+    /// completion, which settles the SAME row id the desktop bubble renders. No
+    /// second row, no new clientRequestId.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retry_attachment(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: Option<String>,
+        size_bytes: Option<u64>,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+    ) -> Result<MessageRecord, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            let attachment_target = match &target {
+                SendTarget::Conversation(conversation_id) => {
+                    AttachmentSendTarget::Conversation(conversation_id)
+                }
+                SendTarget::Peer {
+                    kind,
+                    peer_key,
+                    peer_title,
+                } => AttachmentSendTarget::Peer(PeerTarget {
+                    kind,
+                    peer_key,
+                    peer_title: peer_title.as_deref(),
+                }),
+            };
+            service.prepare_retry_attachment(
+                &account_id,
+                &attachment_target,
+                &client_request_id,
+                data_base64.as_deref(),
                 size_bytes,
                 filename.as_deref(),
                 content_type.as_deref(),
@@ -6796,20 +7096,31 @@ impl RuntimeSupervisor {
         })
     }
 
-    /// identities.get (contract revision 1.68, §4.61, capability
-    /// safety-number): resolution under the service lock, then the
-    /// read-only pinned `listIdentities` call narrowed to the resolved peer
-    /// reference. The upstream answer is the JSON array of `JsonIdentity`
-    /// records; the projection is the §4.61 ladder (empty → `identity` null,
-    /// malformed record → protocol defect).
+    /// identities.get (contract revision 1.68, §4.61; peer arm added by
+    /// contract revision 1.281, §4.265, capability safety-number): addressing
+    /// decode first (`conversationId` xor `peerKey` — a params-shape gate that
+    /// must not depend on runtime state), then resolution under the service
+    /// lock, then the read-only pinned `listIdentities` call narrowed to the
+    /// addressed peer reference. The upstream answer is the JSON array of
+    /// `JsonIdentity` records; the projection is the §4.61 ladder (empty →
+    /// `identity` null, malformed record → protocol defect). The peer arm
+    /// resolves no conversation: the account identity store is read directly
+    /// by the peer reference, so a peer with no direct thread is readable.
     pub async fn get_identity(
         &self,
         params: IdentitiesGetParams,
     ) -> Result<IdentityRead, ServiceError> {
+        // 契约 §4.265：寻址形状（恰一）先于运行时状态 fail-closed——双缺 /
+        // 同置与 peerKey 词形都在任何 engine 调用之前拒。
+        let target = identities_addressing(
+            params.conversation_id.as_deref(),
+            params.peer_key.as_deref(),
+        )
+        .map_err(ServiceError::Api)?;
         let engine = self.running_engine().await?;
         let upstream = {
             let service = self.service.lock().await;
-            service.prepare_identities_get(&params.account_id, &params.conversation_id)?
+            service.prepare_identities_get_for_target(&params.account_id, &target)?
         };
         let result = engine
             .call("listIdentities", upstream, CallClass::ReadOnly)
@@ -6817,68 +7128,57 @@ impl RuntimeSupervisor {
         identity_from_engine(&result)
     }
 
-    /// identities.verify (contract revision 1.68, §4.61, capability
-    /// safety-number): resolution under the service lock, then the mutating
-    /// mutating `trust {verifiedSafetyNumber}` call — the reaction-class
-    /// discipline verbatim (an indeterminate outcome answers
-    /// SEND_OUTCOME_UNKNOWN and is never retried: the trust write may
-    /// already have landed). The engine answers an empty result object
-    /// on success (the command writes no JSON output), so the result is the
-    /// plain `{status: "verified"}` confirmation; the upstream mismatch
-    /// UserError folds into the plain UPSTREAM_ERROR like every
-    /// account-domain method.
+    /// identities.verify (contract revision 1.68, §4.61; peer arm added by
+    /// contract revision 1.281, §4.265, capability safety-number): addressing
+    /// decode, resolution under the service lock, then the mutating
+    /// `trust` call (both arms: `verifiedSafetyNumber` or the §4.223
+    /// `state` reset) — the reaction-class discipline verbatim (an
+    /// indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never
+    /// retried: the trust write may already have landed). The engine answers
+    /// an empty result object on success (the command writes no JSON output),
+    /// so the result is the plain `{status: "verified"}` confirmation; the
+    /// upstream mismatch UserError folds into the plain UPSTREAM_ERROR like
+    /// every account-domain method. The peer arm addresses the account
+    /// identity store directly — no conversation row is resolved or required,
+    /// and the write-through stamp lands on the peer's direct row when one
+    /// exists (a peer with no row simply has no local projection to stamp).
     pub async fn verify_identity(
         &self,
         params: IdentitiesVerifyParams,
     ) -> Result<IdentityVerifyOutcome, ServiceError> {
+        // 契约 §4.265：寻址两臂先解码（同读面，形状先于运行时状态）。
+        let target = identities_addressing(
+            params.conversation_id.as_deref(),
+            params.peer_key.as_deref(),
+        )
+        .map_err(ServiceError::Api)?;
+        // 契约 §4.223：两臂恰一路由（双臂/双缺 fail-closed 同 engine）。
+        // 解码与写穿词各是 service 层的单点纯函数——supervisor 只做装配，
+        // 两臂语义与单测同源。
+        let intent =
+            identities_verify_intent(params.safety_number.as_deref(), params.state.as_deref())
+                .map_err(ServiceError::Api)?;
+        // Contract 1.260 (§4.244): the write-through stamp word — the
+        // official `#_setVerified` arm writes the protocol store AND lands
+        // the record (`DataWriter.updateConversation`), so the projection
+        // the render reads is the deterministic post-image of the write.
+        // Verified arm → TRUSTED_VERIFIED (the engine trust
+        // verifiedSafetyNumber post-image); trust-reset arm (state "default",
+        // the official DEFAULT write) → TRUSTED_UNVERIFIED (first-use trust
+        // restored, the word the next `listIdentities` read answers).
+        let stamp_word = identity_verify_stamp_word(&intent);
         let engine = self.running_engine().await?;
-        let (upstream, stamp_word) = {
+        let upstream = {
             let service = self.service.lock().await;
-            // 契约 §4.223：两臂恰一路由（双臂/双缺 fail-closed 同 engine）。
-            let intent = match (params.safety_number.as_deref(), params.state.as_deref()) {
-                (Some(code), None) => IdentitiesVerifyIntent::Verified {
-                    safety_number: code.to_string(),
-                },
-                (None, Some("default")) => IdentitiesVerifyIntent::TrustDefault,
-                _ => {
-                    return Err(ServiceError::Api(ApiError::new(
-                        "INVALID_REQUEST",
-                        "exactly one of safetyNumber or state=\"default\" is required",
-                        false,
-                    )));
-                }
-            };
-            // Contract 1.260 (§4.244): the write-through stamp word — the
-            // official `#_setVerified` arm writes the protocol store AND
-            // lands the record (`DataWriter.updateConversation`), so the
-            // projection the render reads is the deterministic post-image of
-            // the write. Verified arm → TRUSTED_VERIFIED (the engine trust
-            // verifiedSafetyNumber post-image); trust-reset arm (state
-            // "default", the official DEFAULT write) → TRUSTED_UNVERIFIED
-            // (first-use trust restored, the word the next `listIdentities`
-            // read answers).
-            let stamp_word = match intent {
-                IdentitiesVerifyIntent::Verified { .. } => "TRUSTED_VERIFIED",
-                IdentitiesVerifyIntent::TrustDefault => "TRUSTED_UNVERIFIED",
-            };
-            (
-                service.prepare_identities_verify(
-                    &params.account_id,
-                    &params.conversation_id,
-                    &intent,
-                )?,
-                stamp_word,
-            )
+            service.prepare_identities_verify_for_target(&params.account_id, &target, &intent)?
         };
         match engine.call("trust", upstream, CallClass::Mutating).await {
             Ok(_) => {
-                let _ = self
-                    .store
-                    .set_conversation_identity_verified_for_conversation(
-                        &params.account_id,
-                        &params.conversation_id,
-                        stamp_word,
-                    );
+                {
+                    let service = self.service.lock().await;
+                    let _ =
+                        service.stamp_identity_verified(&params.account_id, &target, stamp_word);
+                }
                 Ok(IdentityVerifyOutcome { status: "verified" })
             }
             Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
@@ -11559,7 +11859,6 @@ async fn engine_event_watch_loop(
                     epoch,
                     Some(&account),
                     "connection.stateChanged",
-                    "{}",
                     HostSideEvent::ConnectionStateChanged {
                         account_id: account.clone(),
                         state,
@@ -11831,7 +12130,6 @@ async fn receive_persistence_loop(
                                 epoch,
                                 Some(&account.id),
                                 "account.changed",
-                                "{}",
                                 event.clone(),
                             ) {
                                 tracing::warn!(?error, "durable account.changed failed");
@@ -12416,6 +12714,43 @@ mod tests {
             state_revision: 0,
             engine_epoch: 0,
         }
+    }
+
+    /// The link-finish budget is the last of three deadlines: the engine's own
+    /// finish dispatch budget is 360 s and the desktop's link wait is 330 s, so
+    /// the connector must never be the first party to give up. Answering first
+    /// would turn a link the engine may still commit into a client-side
+    /// failure, and a re-run of `finishLink` claims a second device slot.
+    #[test]
+    fn link_finish_budget_outranks_the_engine_and_desktop_deadlines() {
+        assert_eq!(super::LINK_FINISH_TIMEOUT, Duration::from_secs(370));
+        assert!(
+            super::LINK_FINISH_TIMEOUT > Duration::from_secs(360),
+            "the engine's own 360 s finish budget must expire first"
+        );
+        assert!(
+            super::LINK_FINISH_TIMEOUT > Duration::from_secs(330),
+            "the desktop's 330 s link wait must expire first"
+        );
+    }
+
+    /// A budget-expired `finishLink` is the link-class unknown outcome, never
+    /// the definite retryable `UPSTREAM_TIMEOUT`: the mutating call was in
+    /// flight, so "definitely failed" is a lie the desktop would act on by
+    /// re-running the finish.
+    #[test]
+    fn a_link_finish_timeout_answers_the_link_class_unknown_outcome() {
+        let error = super::RuntimeSupervisor::link_finish_timeout_error();
+        let api = match error {
+            crate::service::ServiceError::Api(api) => api,
+            other => panic!("a finish timeout must answer the host api face, got {other:?}"),
+        };
+        assert_eq!(api.code, "LINK_OUTCOME_UNKNOWN");
+        assert!(
+            !api.retryable,
+            "an unknown link outcome must never be retried automatically"
+        );
+        assert_ne!(api.code, "UPSTREAM_TIMEOUT");
     }
 
     #[test]
