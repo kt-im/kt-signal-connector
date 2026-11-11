@@ -108,9 +108,14 @@ enum CliCommand {
         expire_sweep_interval_ms: u64,
         /// Per-account engine pool (engine-pool design S1, launcher input, env:
         /// KT_SIGNAL_PER_ACCOUNT_ENGINES). Default off: the pre-pool runtime is
-        /// byte-identical. When on, every NEW link provisions its own engine
-        /// under `<signal-data>/engines/<accountId>`; existing accounts stay
-        /// on their legacy proxy-group engine (mixed mode).
+        /// byte-identical. When on, this data directory serves the per-account
+        /// pool only — one engine per account under
+        /// `<signal-data>/engines/<accountId>` — never a mix of both layouts.
+        /// A pure legacy layout is migrated automatically at startup; review it
+        /// with `migrate-pool --dry-run` and back up the signal-data and state
+        /// directories first, because the move is one-way. A directory where
+        /// the legacy and pooled copies both still hold credentials is refused
+        /// (EnginePoolInvalid) rather than guessed.
         #[arg(long, env = "KT_SIGNAL_PER_ACCOUNT_ENGINES", default_value_t = false)]
         per_account_engines: bool,
         #[arg(long)]
@@ -126,8 +131,12 @@ enum CliCommand {
     /// Migrate legacy per-group engine data directories to the per-account
     /// pool layout (`<signal-data>/engines/<accountId>/`). Idempotent and
     /// journaled under `<signal-data>/migration/`; `--dry-run` validates and
-    /// prints the plan without touching the filesystem. Requires exclusive
-    /// occupancy of the data directory (no connector may be running).
+    /// prints the plan without touching the filesystem: it reads an existing
+    /// store read-only (an absent `--state-dir` stays absent, no directory, no
+    /// database, no lock file) and refuses a store whose WAL still holds
+    /// un-checkpointed commits, or whose schema was written by a newer
+    /// connector (the applied pass refuses that store the same way). Requires
+    /// exclusive occupancy of the data directory (no connector may be running).
     MigratePool {
         #[arg(long)]
         signal_data_dir: PathBuf,
@@ -281,6 +290,9 @@ fn init_tracing() {
         .unwrap_or(tracing::Level::INFO);
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        // Launcher-captured logs are pipes: plain text keeps the structured
+        // `key=value` fields machine-readable (and byte-stable in tests).
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_max_level(level)
         .try_init();
 }
@@ -404,6 +416,24 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
     if cfg!(windows) && parent_pid.is_none() {
         return Err("Windows requires the parent process monitor".into());
     }
+    // P1 runtime isolation (contract revision 1.288, §4.274): the
+    // single-account guard is a topology promise the legacy layout cannot
+    // keep — one proxy-group engine serves every account in its group from a
+    // single process. Refuse the launch here, before a data directory, an
+    // occupancy lock, a bootstrap secret, or a listening endpoint is touched:
+    // the mismatch is the connector's own CLI diagnostic (exit 1), not a
+    // runtime-open failure after `listening` was already announced on stdout.
+    // The registry keeps the same refusal for embedders (defence in depth).
+    if kt_signal_connector::pool::single_account_guard_from_env() && !per_account_engines {
+        return Err(concat!(
+            "KT_ENGINE_SINGLE_ACCOUNT=1 requires --per-account-engines: the ",
+            "single-account guard allows one account per engine process, while a legacy ",
+            "proxy-group engine serves every account of its group from one process, so ",
+            "the guard cannot hold. Start with --per-account-engines (full pooling) or ",
+            "unset KT_ENGINE_SINGLE_ACCOUNT."
+        )
+        .into());
+    }
     // Proxy-group configuration is validated before anything else touches
     // the filesystem or the bootstrap payload: a malformed spec must fail the
     // launch without leaking any endpoint into diagnostics (ADR 0001 R10).
@@ -505,6 +535,11 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
             } else {
                 EnginePoolPolicy::default()
             },
+            // P1 runtime isolation (§4.274): the launcher's single-account
+            // guard is read once here and handed down to every pooled engine
+            // child. A legacy topology refuses to start with it armed
+            // (registry::open_group_runtime_with_options).
+            single_account_guard: kt_signal_connector::pool::single_account_guard_from_env(),
             ..RuntimeOptions::default()
         },
     )?;
@@ -622,7 +657,15 @@ fn migrate_pool_command(
     dry_run: bool,
     bootstrap_secret_file: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _lock = datalock::DataDirLock::acquire("default", signal_data_dir)?;
+    // Dry-run is a read-only inspection (contract revision 1.288, §4.274):
+    // the quiescent probe opens the kernel lock only when a lock file already
+    // exists, so it neither creates the data directory, nor the lock file, nor
+    // rewrites the holder pid the way the serving acquire does.
+    let _lock = if dry_run {
+        datalock::DataDirLock::acquire_quiescent("default", signal_data_dir)?
+    } else {
+        Some(datalock::DataDirLock::acquire("default", signal_data_dir)?)
+    };
     let key = match store_key_from_env()? {
         Some(key) => Some(key),
         // Read line 2 without the launcher's read-and-destroy loader: the
@@ -632,14 +675,104 @@ fn migrate_pool_command(
             None => None,
         },
     };
-    // The store error is deliberately not flattened: a newer-schema refusal is
-    // a launcher-visible class, and its fixed fatal line needs the numbers
-    // (contract revision 1.284, §4.268).
+    let resident_cap = EnginePoolPolicy::from_env().max_resident;
+    // Dry-run reads, never opens: "without touching the filesystem" is the
+    // CLI's own promise, and `Store::open` would break it before the plan
+    // exists — it creates the state directory, chmods it 0700, creates
+    // `connector.sqlite3`, runs the schema ladder (DDL, snapshot) and sweeps
+    // stale pending sends. The probe opens an existing store read-only and an
+    // absent one is simply the empty account set (contract revision 1.288,
+    // §4.274). A newer-schema refusal and a rejected key keep their exact
+    // launcher-visible classes: the probe never flattens them (contract
+    // revision 1.284, §4.268).
+    if dry_run {
+        let rows = match kt_signal_connector::store::probe_account_rows(state_dir, key) {
+            Ok(rows) => rows.unwrap_or_default(),
+            // Contract revision 1.284 (§4.268) at the dry-run face: the applied
+            // pass refuses a store written by a newer connector at
+            // `Store::open`, so a dry run must refuse it identically instead of
+            // answering a plan that cannot be applied. The blocked report keeps
+            // the one schema a launcher parses, and its steps never point at the
+            // applied pass — that pass fails on the same store.
+            Err(kt_signal_connector::store::StoreError::SchemaNewer { current, supported }) => {
+                return dry_run_newer_schema(signal_data_dir, resident_cap, current, supported);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        return dry_run_plan(&rows, signal_data_dir, state_dir, resident_cap);
+    }
     let store = kt_signal_connector::store::Store::open(state_dir, key)?;
-    let report = kt_signal_connector::migrate::run(&store, signal_data_dir, state_dir, dry_run)?;
+    let report =
+        kt_signal_connector::migrate::run(&store, signal_data_dir, state_dir, false, resident_cap)?;
     let rendered = serde_json::to_string_pretty(&report)?;
     println!("{rendered}");
     Ok(())
+}
+
+/// The dry-run face: the plan is the deliverable even when the pass refuses to
+/// migrate, so a blocked state prints the same report shape (layout, account
+/// count, blocker, expected exit code) and still exits 1. Every input here is
+/// read-only, which is what lets `--dry-run` stay a filesystem no-op.
+fn dry_run_plan(
+    rows: &[kt_signal_connector::store::AccountRow],
+    signal_data_dir: &std::path::Path,
+    state_dir: &std::path::Path,
+    resident_cap: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let plan = kt_signal_connector::migrate::run_for_rows(
+        rows,
+        signal_data_dir,
+        state_dir,
+        true,
+        resident_cap,
+    );
+    match plan {
+        Ok(report) => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Err(error) => {
+            let layout = kt_signal_connector::migrate::scan_engine_layout(signal_data_dir)
+                .map(|layout| layout.kind())
+                .unwrap_or(kt_signal_connector::migrate::EngineLayoutKind::Empty);
+            let report = kt_signal_connector::migrate::MigrationReport::blocked(
+                layout,
+                rows.len(),
+                resident_cap,
+                error.to_string(),
+            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Err(error.into())
+        }
+    }
+}
+
+/// A dry run over a store stamped with a schema newer than this build: the
+/// probe refuses before it reads a row, exactly like the applied pass refuses
+/// the same store at `Store::open` (contract revision 1.284, §4.268). The plan
+/// still prints — a launcher parses one report shape — with `expectedExitCode=1`
+/// and both texts the applied pass emits, so either face gives one verdict.
+/// Nothing suggests dropping `--dry-run`: the applied pass cannot succeed
+/// against this store either, and only a newer connector can read it.
+fn dry_run_newer_schema(
+    signal_data_dir: &std::path::Path,
+    resident_cap: usize,
+    current: i64,
+    supported: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let layout = kt_signal_connector::migrate::scan_engine_layout(signal_data_dir)
+        .map(|layout| layout.kind())
+        .unwrap_or(kt_signal_connector::migrate::EngineLayoutKind::Empty);
+    let report = kt_signal_connector::migrate::MigrationReport::blocked_newer_schema(
+        layout,
+        resident_cap,
+        current,
+        supported,
+    );
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    // Same class the applied pass returns, so the launcher's fixed
+    // `STORE_SCHEMA_NEWER` line and the exit code match it byte for byte.
+    Err(kt_signal_connector::store::StoreError::SchemaNewer { current, supported }.into())
 }
 
 /// Read the store key (payload line 2) without consuming the launcher's

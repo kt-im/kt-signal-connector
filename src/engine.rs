@@ -124,6 +124,12 @@ pub struct EngineConfig {
     /// demand); unarmed keeps the pre-ingest shape and every media method
     /// answers `CAPABILITY_UNAVAILABLE`.
     pub media_ingest: bool,
+    /// Pin `KT_ENGINE_SINGLE_ACCOUNT=1` on this child (pooled slots only; see
+    /// crate::pool::SINGLE_ACCOUNT_ENV and the engine's own read point,
+    /// `kt-signal-engine/src/main.rs:416-446`). Set explicitly instead of inherited:
+    /// the connector's own environment is never the child's authority on which
+    /// topology it serves.
+    pub single_account_guard: bool,
     pub line_limit: usize,
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -162,6 +168,7 @@ impl EngineConfig {
             executable,
             data_dir,
             media_ingest: false,
+            single_account_guard: false,
             line_limit: DEFAULT_UPSTREAM_LINE_LIMIT,
             history_cdn_base: None,
             request_timeout: Duration::from_secs(15),
@@ -2888,6 +2895,15 @@ impl EngineHandle {
             // environment (Phase 3: keys travel the bootstrap channel only).
             .env_remove(crate::store::STORE_KEY_ENV)
             .kill_on_drop(true);
+        // The single-account guard is a connector decision, never something the
+        // child inherits (P1 runtime isolation, contract revision 1.288
+        // §4.274): armed pooled slots pin `=1`, every other engine removes the
+        // variable so an exported dev/test env cannot silently change topology.
+        if config.single_account_guard {
+            command.env(crate::pool::SINGLE_ACCOUNT_ENV, "1");
+        } else {
+            command.env_remove(crate::pool::SINGLE_ACCOUNT_ENV);
+        }
         let mut child = command.spawn().map_err(|_| EngineError::StartFailed)?;
 
         let pid = child.id().ok_or(EngineError::StartFailed)?;

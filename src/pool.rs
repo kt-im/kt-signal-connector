@@ -83,6 +83,27 @@ pub const POOL_MAX_RESIDENT_ENV: &str = "KT_SIGNAL_POOL_MAX_RESIDENT";
 /// engine (design §3.3).
 pub const ENGINE_SLOT_SUBDIR: &str = "engines";
 
+/// The engine's own single-account guard (engine
+/// `kt-signal-engine/src/main.rs:416-446`, `KT_ENGINE_SINGLE_ACCOUNT`, P1
+/// runtime isolation §4.274). Only an explicit
+/// trimmed `"1"` turns it on — the same strict reading as
+/// `KT_ENGINE_FAKE_SERVICE` — and the connector hands the decision to every
+/// per-account engine child explicitly (never by inheritance), so a child can
+/// never carry a guard the connector did not reason about.
+pub const SINGLE_ACCOUNT_ENV: &str = "KT_ENGINE_SINGLE_ACCOUNT";
+
+/// Pure parse: exactly `"1"` after trimming turns the guard on; every other
+/// value (including unset) leaves it off and preserves the multi-account
+/// compatibility path.
+pub fn single_account_guard_enabled(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("1")
+}
+
+/// Read the launcher's guard decision once at startup.
+pub fn single_account_guard_from_env() -> bool {
+    single_account_guard_enabled(std::env::var(SINGLE_ACCOUNT_ENV).ok().as_deref())
+}
+
 /// Connector-state subdirectory holding the provisioning sidecars
 /// `<state-dir>/engines/<accountId>.json`. A sidecar is the crash-window
 /// recovery record between "the engine wrote the account into its own
@@ -176,6 +197,10 @@ pub struct EnginePoolConfig {
     pub media_handles: Option<Arc<crate::media::MediaHandleTable>>,
     pub backup_handles: Option<Arc<crate::backup_export::BackupFileHandleTable>>,
     pub policy: EnginePoolPolicy,
+    /// Hand `KT_ENGINE_SINGLE_ACCOUNT=1` to every account engine child (P1
+    /// runtime isolation, §4.274). The pool already owns one account per
+    /// process; the guard makes that invariant the engine's own contract.
+    pub single_account_guard: bool,
     /// Watchdog cadence override (tests); `None` keeps the production 30 s.
     pub watchdog_interval: Option<Duration>,
 }
@@ -824,6 +849,7 @@ fn build_slot(
 ) -> Arc<AccountSlot> {
     let mut engine_config = EngineConfig::new(config.engine_bin.clone(), data_dir.clone());
     engine_config.media_ingest = config.media_ingest;
+    engine_config.single_account_guard = config.single_account_guard;
     engine_config.expire_sweep_interval = config.expire_sweep_interval;
     if let Some(interval) = config.watchdog_interval {
         engine_config.watchdog_interval = interval;
@@ -1058,6 +1084,7 @@ mod tests {
             media_handles: media_ingest.then(|| Arc::new(crate::media::MediaHandleTable::new())),
             backup_handles: None,
             policy: EnginePoolPolicy::default(),
+            single_account_guard: false,
             watchdog_interval: None,
         }
     }

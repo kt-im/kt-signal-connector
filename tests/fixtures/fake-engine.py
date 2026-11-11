@@ -394,6 +394,18 @@ def argument_value(name):
 SIGNAL_DATA_DIR = Path(argument_value("--data-dir") or "/tmp/kt-signal-fixture")
 SIGNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# P1 runtime isolation fixture (contract revision 1.288, §4.274): record the
+# single-account guard the connector handed this engine. The connector sets or
+# removes the variable explicitly per child; the test reads this probe to pin
+# that a pooled engine is never launched without it (and a legacy engine never
+# carries one).
+try:
+    (SIGNAL_DATA_DIR / ".fixture-env.json").write_text(
+        json.dumps({"KT_ENGINE_SINGLE_ACCOUNT": os.environ.get("KT_ENGINE_SINGLE_ACCOUNT")})
+    )
+except OSError:
+    pass
+
 
 def log_pid_line():
     logs_dir = SIGNAL_DATA_DIR / "logs"

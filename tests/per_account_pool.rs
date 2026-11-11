@@ -117,6 +117,7 @@ fn pool_options(
 ) -> RuntimeOptions {
     RuntimeOptions {
         per_account_engines: true,
+        single_account_guard: false,
         pool_policy: EnginePoolPolicy {
             max_engines: 8,
             max_resident,
@@ -328,6 +329,16 @@ async fn linked_accounts_get_their_own_engine_dirs_pids_logs_and_traffic() {
 
     let status = runtime.status().await;
     assert_eq!(status.engines.len(), 2);
+    // N accounts -> N entries under the always-present `engines` key.
+    let engines_wire = serde_json::to_value(&status).unwrap();
+    let engines = engines_wire["engines"]
+        .as_array()
+        .expect("a pooled answer always names engines");
+    assert_eq!(engines.len(), 2, "{engines_wire}");
+    assert!(
+        engines.iter().all(|engine| engine["accountId"].is_string()),
+        "{engines_wire}"
+    );
     assert_eq!(status.aggregate.state, EngineState::Running);
     assert!(
         !status.aggregate.degraded,
@@ -581,6 +592,7 @@ async fn production_budgets_hold_for_the_full_eight_engine_pool() {
         &temp,
         RuntimeOptions {
             per_account_engines: true,
+            single_account_guard: false,
             pool_policy: EnginePoolPolicy {
                 max_engines: 8,
                 max_resident: 8,
@@ -796,6 +808,7 @@ async fn eight_linked_accounts_all_stay_hot_and_receive() {
         &temp,
         RuntimeOptions {
             per_account_engines: true,
+            single_account_guard: false,
             pool_policy: EnginePoolPolicy {
                 // Even the old demotion threshold is irrelevant with the
                 // default window: it must not fire.
@@ -895,6 +908,7 @@ async fn pool_max_resident_env_restores_the_opt_in_window() {
         &temp,
         RuntimeOptions {
             per_account_engines: true,
+            single_account_guard: false,
             pool_policy: policy,
             watchdog_interval: Some(Duration::from_millis(50)),
         },
@@ -942,6 +956,7 @@ async fn opted_in_window_demotes_an_idle_resident() {
         &temp,
         RuntimeOptions {
             per_account_engines: true,
+            single_account_guard: false,
             pool_policy: EnginePoolPolicy {
                 max_engines: 8,
                 max_resident: 5,
@@ -1080,5 +1095,70 @@ async fn a_pooled_link_attempt_rotates_on_its_own_slot_and_commits_once() {
     assert_eq!(replay.id, summary.id);
     assert_eq!(runtime.status().await.engines.len(), provisioned);
 
+    runtime.shutdown().await.unwrap();
+}
+
+/// Legacy (group-engine) runtime over the same fixture. Nothing is started,
+/// so the answer under test is the pure wire shape.
+fn open_legacy(temp: &TempDir) -> Arc<ProxyGroupRuntime> {
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    let plan = groups::build_group_plan(&[], None, None, &signal_data).unwrap();
+    open_group_runtime_with_options(
+        plan,
+        fixture(),
+        &temp.path().join("state"),
+        None,
+        Some(key()),
+        false,
+        Duration::from_millis(30),
+        RuntimeOptions::default(),
+    )
+    .unwrap()
+}
+
+/// A pooled `runtime.status` always names `engines`: an empty pool answers
+/// `[]`, the desktop's only way to tell "no accounts linked yet" from a
+/// pre-pool connector that never had the key at all.
+#[tokio::test]
+async fn a_pooled_status_names_engines_even_when_the_pool_is_empty() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    let runtime = open_pool(
+        &temp,
+        pool_options(5, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    let status = runtime.status().await;
+    assert!(
+        status.engines.is_empty(),
+        "an empty pool provisions no slots"
+    );
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(
+        wire.get("engines"),
+        Some(&json!([])),
+        "a pooled answer with no accounts must still name engines: {wire}"
+    );
+    assert!(wire.get("degraded").is_none(), "{wire}");
+    runtime.shutdown().await.unwrap();
+}
+
+/// The rollback shape: a legacy `runtime.status` keeps `engines` absent, so the
+/// pre-pool bytes are unchanged — the desktop reads a missing key as "old
+/// connector", never as an empty pool.
+#[tokio::test]
+async fn a_legacy_status_keeps_the_engines_key_absent() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let runtime = open_legacy(&temp);
+    let status = runtime.status().await;
+    assert!(status.engines.is_empty());
+    let wire = serde_json::to_value(&status).unwrap();
+    assert!(
+        wire.get("engines").is_none(),
+        "the legacy shape must stay pre-pool: {wire}"
+    );
+    assert!(wire.get("degraded").is_none(), "{wire}");
     runtime.shutdown().await.unwrap();
 }

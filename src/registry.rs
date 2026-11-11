@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use futures_util::future::join_all;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
@@ -154,17 +154,51 @@ pub struct ProxyGroupStatus {
 
 /// Result of `runtime.status` / `runtime.start` / `runtime.stop`: the pinned
 /// top-level aggregate plus the additive group array.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug)]
 pub struct RuntimeStatusResult {
-    #[serde(flatten)]
     pub aggregate: AggregateEngineStatus,
     pub proxy_groups: Vec<ProxyGroupStatus>,
     /// Engine-pool design §7.3 (additive): one entry per dynamically
-    /// provisioned account engine. Empty on the pre-pool path and therefore
-    /// omitted, keeping that wire shape byte-identical.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// provisioned account engine.
+    ///
+    /// Pooled mode always emits the key — an empty pool answers `[]` — which
+    /// is what lets the desktop tell "no accounts yet" from a pre-pool
+    /// connector that never had the field. The pre-pool path omits the key
+    /// entirely, so that wire shape stays byte-identical.
     pub engines: Vec<crate::pool::AccountEngineStatus>,
+    /// Whether this answer was produced by the pooled runtime; it selects the
+    /// `engines` wire shape above (the mode cannot be re-derived here: an empty
+    /// pool and an empty legacy group list look alike).
+    engines_pooled: bool,
+}
+
+impl Serialize for RuntimeStatusResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // `Some(&[])` still serializes as `"engines": []`; `None` drops the
+        // key. That single choice is the whole pooled/legacy split.
+        RuntimeStatusWire {
+            aggregate: &self.aggregate,
+            proxy_groups: &self.proxy_groups,
+            engines: self.engines_pooled.then_some(self.engines.as_slice()),
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Wire projection of [`RuntimeStatusResult`]: the flatten rule for the pinned
+/// aggregate is unchanged, and `engines` is present exactly when the answer
+/// comes from the pooled runtime.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeStatusWire<'a> {
+    #[serde(flatten)]
+    aggregate: &'a AggregateEngineStatus,
+    proxy_groups: &'a [ProxyGroupStatus],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engines: Option<&'a [crate::pool::AccountEngineStatus]>,
 }
 
 /// Which supervisor owns a link session: a launcher-planned proxy group or a
@@ -885,6 +919,9 @@ impl ProxyGroupRuntime {
             aggregate: Self::aggregate_from(&statuses, pid, self.pool.is_some()),
             proxy_groups,
             engines,
+            // Pooled mode always names the key (an empty pool answers `[]`);
+            // the legacy path omits it and keeps the pre-pool byte shape.
+            engines_pooled: self.pool.is_some(),
         }
     }
 
@@ -3285,6 +3322,12 @@ pub struct RuntimeOptions {
     /// mixed mode: the legacy path exists only as the rollback shape.
     pub per_account_engines: bool,
     pub pool_policy: crate::pool::EnginePoolPolicy,
+    /// The launcher's single-account guard (`KT_ENGINE_SINGLE_ACCOUNT=1`,
+    /// read once at startup and handed to every per-account engine child
+    /// verbatim). Full legacy shares one engine process across a group's
+    /// accounts, so the guard and full legacy are mutually exclusive: the open
+    /// fails closed instead of silently dropping the guard.
+    pub single_account_guard: bool,
     /// Watchdog cadence override (tests / operational diagnostics). Defaults
     /// to the production 30 s when absent. Applies to both runtime modes.
     pub watchdog_interval: Option<Duration>,
@@ -3330,6 +3373,18 @@ pub fn open_group_runtime_with_options(
         tracing::warn!("--java-home is ignored: the kt engine runs without a JVM");
     }
     let media_ingest = effective_media_ingest(media_ingest);
+    // Contract revision 1.288 (§4.274): the single-account guard is a
+    // launcher-level promise ("one account per engine process"). The legacy
+    // topology cannot keep it — a proxy-group engine serves every account of
+    // its group from one process — so the mismatch fails the launch before
+    // anything is opened. Silently ignoring the env would degrade the isolation
+    // the operator asked for without telling anyone.
+    if options.single_account_guard && !options.per_account_engines {
+        return Err(StoreError::EnginePoolInvalid(
+            "KT_ENGINE_SINGLE_ACCOUNT=1 requires --per-account-engines: a legacy proxy-group engine serves several accounts from one process, so the guard cannot hold. Start with --per-account-engines (full pooling) or unset the guard."
+                .to_string(),
+        ));
+    }
     let store = Arc::new(Store::open(state_dir, store_key)?);
     let media_handles = std::sync::Arc::new(crate::media::MediaHandleTable::new());
     // §4.46: one process-wide backup file-handle table for every group —
@@ -3348,7 +3403,25 @@ pub fn open_group_runtime_with_options(
         // Full pooling (S1 switch on). Migration and consistency run BEFORE
         // any engine exists: a state that cannot be proven complete aborts
         // startup, never a half-migrated serve (requirement 3).
-        let report = crate::migrate::run(&store, &signal_data_dir, state_dir, false)?;
+        //
+        // Contract revision 1.288 (§4.274): both layouts holding credentials
+        // is the one state the connector refuses to resolve by itself. Running
+        // the automatic pass there would have to guess which copy is
+        // authoritative; the operator gets the `migrate-pool` command instead,
+        // which reports the same layout and refuses the same ambiguity with a
+        // plan. A pure legacy layout still migrates automatically (there is
+        // exactly one candidate), and a pure pooled one is a no-op.
+        let layout = crate::migrate::scan_engine_layout(&signal_data_dir)?;
+        if layout.is_mixed() {
+            return Err(StoreError::EnginePoolInvalid(mixed_layout_message(&layout)));
+        }
+        let report = crate::migrate::run(
+            &store,
+            &signal_data_dir,
+            state_dir,
+            false,
+            options.pool_policy.max_resident,
+        )?;
         tracing::info!(
             migrated = report.migrated,
             already_migrated = report.already_migrated,
@@ -3367,6 +3440,20 @@ pub fn open_group_runtime_with_options(
                 rows.len()
             )));
         }
+        // The guard is checked against the post-migration layout: every slot
+        // must name exactly one account. The engine enforces the same rule at
+        // its own startup (engine `main.rs`, `KT_ENGINE_SINGLE_ACCOUNT`, exit 1
+        // with `SingleAccountRegistryViolation`); checking here makes the
+        // failure explicit and fatal for the connector instead of a child that
+        // dies in a restart loop while the account looks merely cold.
+        if options.single_account_guard {
+            let layout = crate::migrate::scan_engine_layout(&signal_data_dir)?;
+            if let Some(slot) = layout.multi_account_slot() {
+                return Err(StoreError::EnginePoolInvalid(
+                    single_account_violation_message(slot),
+                ));
+            }
+        }
         let pool = crate::pool::AccountPool::discover(crate::pool::EnginePoolConfig {
             engine_bin: engine_bin.clone(),
             signal_data_dir,
@@ -3377,6 +3464,7 @@ pub fn open_group_runtime_with_options(
             media_handles: media_ingest.then(|| media_handles.clone()),
             backup_handles: Some(backup_handles.clone()),
             policy: options.pool_policy.clone(),
+            single_account_guard: options.single_account_guard,
             watchdog_interval: options.watchdog_interval,
         });
         if pool.len() > rows.len() {
@@ -3412,6 +3500,7 @@ pub fn open_group_runtime_with_options(
                 .unwrap_or_default(),
             "connector runtime assembled (full pooling)"
         );
+        log_runtime_mode(RuntimeMode::Pooled, &options);
         return Ok(runtime);
     }
 
@@ -3422,7 +3511,7 @@ pub fn open_group_runtime_with_options(
     // remedy instead (the pool switch, or a restored pre-migration copy).
     if let Some(count) = pool_layout_accounts(&signal_data_dir) {
         return Err(StoreError::EnginePoolInvalid(format!(
-            "this data directory holds {count} per-account engine slot(s); start with --per-account-engines (the legacy group engines cannot serve the pool layout)"
+            "this data directory holds {count} per-account engine slot(s); start with --per-account-engines (the legacy group engines cannot serve the pool layout). Run `kt-signal-connector migrate-pool --signal-data-dir <dir> --state-dir <dir> --dry-run` to review the layout first: one process never serves both layouts."
         )));
     }
     let mut slots = Vec::with_capacity(plan.groups.len());
@@ -3459,7 +3548,78 @@ pub fn open_group_runtime_with_options(
         pool_enabled = false,
         "connector runtime assembled (legacy)"
     );
+    log_runtime_mode(RuntimeMode::Legacy, &options);
     Ok(runtime)
+}
+
+/// The two runtime topologies (contract revision 1.288, §4.274). The mode is
+/// chosen by the trusted launcher and never over IPC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeMode {
+    Legacy,
+    Pooled,
+}
+
+impl RuntimeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Pooled => "pooled",
+        }
+    }
+}
+
+/// The one-shot startup line: the mode, the resident cap the pool will keep
+/// (the legacy topology has no window), the hard ceiling, and whether the
+/// single-account guard is on. Account ids, numbers, and paths never ride
+/// along — the launcher reads this line to explain which topology is live.
+fn log_runtime_mode(mode: RuntimeMode, options: &RuntimeOptions) {
+    match mode {
+        RuntimeMode::Pooled => {
+            let resident_cap = options.pool_policy.max_resident.to_string();
+            tracing::info!(
+                mode = mode.as_str(),
+                resident_cap = %resident_cap,
+                pool_ceiling = options.pool_policy.max_engines,
+                single_account_guard = options.single_account_guard,
+                "connector runtime mode"
+            );
+        }
+        RuntimeMode::Legacy => {
+            // No window exists in the legacy topology: the launcher plans the
+            // group engines directly, so the cap is honestly named rather than
+            // reported as a zero that would read like "nothing may run".
+            let resident_cap = "unbounded".to_string();
+            tracing::info!(
+                mode = mode.as_str(),
+                resident_cap = %resident_cap,
+                single_account_guard = options.single_account_guard,
+                "connector runtime mode"
+            );
+        }
+    }
+}
+
+/// Both layouts hold credentials: the automatic pass cannot tell which copy is
+/// authoritative, so the operator gets the explicit migration face instead of a
+/// guess. The message names counts and the exact command, never a path,
+/// number, or key material.
+fn mixed_layout_message(layout: &crate::migrate::EngineLayout) -> String {
+    format!(
+        "this data directory mixes engine layouts: {} account(s) still sit in the legacy proxy-group directories and {} account(s) already sit in per-account engine slots; refusing to guess which copy to serve. Stop every connector, run `kt-signal-connector migrate-pool --signal-data-dir <dir> --state-dir <dir> --dry-run` to review the move, re-run it without --dry-run, then start with --per-account-engines.",
+        layout.legacy_accounts,
+        layout.pooled_accounts()
+    )
+}
+
+/// Under the guard one engine process may name one account. A slot whose own
+/// registry lists more is a hand-built or copied directory, and the engine
+/// would exit 1 on it; the connector stops before the spawn.
+fn single_account_violation_message(slot: &crate::migrate::SlotLayout) -> String {
+    format!(
+        "engine slot {} names {} accounts but KT_ENGINE_SINGLE_ACCOUNT=1 allows exactly one account per engine process; refusing to start instead of serving a shared process. Give each account its own slot (migrate-pool) or unset the guard.",
+        slot.account_id, slot.registry_accounts
+    )
 }
 
 /// The slot table the P0 orphan sweep classifies against: every account slot
@@ -3603,6 +3763,7 @@ mod tests {
             media_handles: None,
             backup_handles: None,
             policy: crate::pool::EnginePoolPolicy::default(),
+            single_account_guard: false,
             watchdog_interval: None,
         });
         let slot = pool.provision_slot(DEFAULT_PROXY_GROUP_ID).unwrap();
@@ -3786,17 +3947,270 @@ mod tests {
         assert_eq!(pool_layout_accounts(&temp.path().join("elsewhere")), None);
     }
 
-    /// The empty `engines[]` array is omitted, so a legacy `runtime.status`
-    /// answer is byte-identical to the pre-pool build.
+    /// Helper: one account row plus one slot holding `accounts` accounts, the
+    /// first of which is the row's own number and has a present store. Returns
+    /// the slot directory. The pooled open must fail before any engine starts.
+    fn seed_slot_with_accounts(
+        signal_data: &Path,
+        state_dir: &Path,
+        account_id: &str,
+        number: &str,
+        extra_numbers: &[&str],
+    ) {
+        let store = Store::open(state_dir, Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
+        store
+            .upsert_account_from_signal_with_id(
+                number,
+                Some(1),
+                DEFAULT_PROXY_GROUP_ID,
+                Some(account_id),
+            )
+            .unwrap();
+        let slot = signal_data.join("engines").join(account_id);
+        let mut registry = Vec::new();
+        let mut numbers = vec![number];
+        numbers.extend_from_slice(extra_numbers);
+        for (index, value) in numbers.iter().enumerate() {
+            let store_name = format!("lk-slot-{index}");
+            std::fs::create_dir_all(slot.join("accounts").join(&store_name)).unwrap();
+            std::fs::write(
+                slot.join("accounts").join(&store_name).join("store.db"),
+                b"store",
+            )
+            .unwrap();
+            registry.push(json!({"number": value, "dir": format!("accounts/{store_name}")}));
+        }
+        std::fs::write(
+            slot.join("engine-state.json"),
+            serde_json::to_vec(&json!({"version": 2, "accounts": registry})).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// P1 runtime isolation (§4.274): the guard and full legacy are mutually
+    /// exclusive, and the mismatch fails the launch instead of being dropped.
     #[test]
-    fn empty_pool_engine_list_is_omitted_from_the_status_shape() {
-        let result = RuntimeStatusResult {
+    fn the_single_account_guard_requires_full_pooling() {
+        let temp = TempDir::new().unwrap();
+        let signal_data = temp.path().join("signal-data");
+        let plan = crate::groups::build_group_plan(&[], None, None, &signal_data).unwrap();
+        let error = open_group_runtime_with_options(
+            plan,
+            PathBuf::from("unused-engine"),
+            &temp.path().join("state"),
+            None,
+            Some(StoreKey::from_bytes([0x5A; 32])),
+            false,
+            Duration::from_secs(30),
+            RuntimeOptions {
+                per_account_engines: false,
+                single_account_guard: true,
+                ..RuntimeOptions::default()
+            },
+        )
+        .err()
+        .expect("legacy topology cannot keep the single-account guard");
+        let message = error.to_string();
+        assert!(
+            matches!(error, StoreError::EnginePoolInvalid(_)),
+            "{message}"
+        );
+        assert!(message.contains("KT_ENGINE_SINGLE_ACCOUNT=1"), "{message}");
+        assert!(message.contains("--per-account-engines"), "{message}");
+    }
+
+    /// P1 runtime isolation (§4.274): a slot whose own engine registry names a
+    /// second account is an explicit startup failure, not a cold account that
+    /// silently never starts. The engine enforces the same rule at exit-1
+    /// (`SingleAccountRegistryViolation`); this check lands before the spawn.
+    #[test]
+    fn the_single_account_guard_refuses_a_second_account_in_one_slot() {
+        let temp = TempDir::new().unwrap();
+        let signal_data = temp.path().join("signal-data");
+        let state_dir = temp.path().join("state");
+        let id = "0123456789abcdef0123456789abcdef";
+        seed_slot_with_accounts(
+            &signal_data,
+            &state_dir,
+            id,
+            "+15555550100",
+            &["+15555550101"],
+        );
+        let plan = crate::groups::build_group_plan(&[], None, None, &signal_data).unwrap();
+        let error = open_group_runtime_with_options(
+            plan,
+            PathBuf::from("unused-engine"),
+            &state_dir,
+            None,
+            Some(StoreKey::from_bytes([0x5A; 32])),
+            false,
+            Duration::from_secs(30),
+            RuntimeOptions {
+                per_account_engines: true,
+                single_account_guard: true,
+                ..RuntimeOptions::default()
+            },
+        )
+        .err()
+        .expect("two accounts in one engine process are refused");
+        let message = error.to_string();
+        assert!(
+            matches!(error, StoreError::EnginePoolInvalid(_)),
+            "{message}"
+        );
+        assert!(message.contains(id), "{message}");
+        assert!(message.contains("KT_ENGINE_SINGLE_ACCOUNT=1"), "{message}");
+        assert!(message.contains("names 2 accounts"), "{message}");
+    }
+
+    /// P1 runtime isolation (§4.274): both layouts holding credentials is the
+    /// one state the connector refuses to resolve by itself — pooled mode would
+    /// have to guess which copy is authoritative. The refusal names the
+    /// migration command; legacy mode refuses the pool layout for the same
+    /// reason (it cannot serve accounts whose stores moved).
+    #[test]
+    fn mixed_layouts_fail_closed_with_migration_instructions() {
+        let temp = TempDir::new().unwrap();
+        let signal_data = temp.path().join("signal-data");
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir_all(&signal_data).unwrap();
+        let store = Store::open(&state_dir, Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
+        let legacy_id = "11111111111111111111111111111111";
+        store
+            .upsert_account_from_signal_with_id(
+                "+15555550110",
+                Some(1),
+                DEFAULT_PROXY_GROUP_ID,
+                Some(legacy_id),
+            )
+            .unwrap();
+        drop(store);
+        std::fs::create_dir_all(signal_data.join("accounts/lk-legacy")).unwrap();
+        std::fs::write(signal_data.join("accounts/lk-legacy/store.db"), b"legacy").unwrap();
+        std::fs::write(
+            signal_data.join("engine-state.json"),
+            serde_json::to_vec(&json!({
+                "version": 2,
+                "accounts": [{"number": "+15555550110", "dir": "accounts/lk-legacy"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        seed_slot_with_accounts(
+            &signal_data,
+            &state_dir,
+            "22222222222222222222222222222222",
+            "+15555550111",
+            &[],
+        );
+
+        let plan = crate::groups::build_group_plan(&[], None, None, &signal_data).unwrap();
+        let pooled = open_group_runtime_with_options(
+            plan,
+            PathBuf::from("unused-engine"),
+            &state_dir,
+            None,
+            Some(StoreKey::from_bytes([0x5A; 32])),
+            false,
+            Duration::from_secs(30),
+            RuntimeOptions {
+                per_account_engines: true,
+                ..RuntimeOptions::default()
+            },
+        )
+        .err()
+        .expect("a mixed layout is never resolved by guessing");
+        let message = pooled.to_string();
+        assert!(
+            matches!(pooled, StoreError::EnginePoolInvalid(_)),
+            "{message}"
+        );
+        assert!(message.contains("mixes engine layouts"), "{message}");
+        assert!(message.contains("migrate-pool"), "{message}");
+        assert!(message.contains("--per-account-engines"), "{message}");
+
+        let plan = crate::groups::build_group_plan(&[], None, None, &signal_data).unwrap();
+        let legacy = open_group_runtime_with_options(
+            plan,
+            PathBuf::from("unused-engine"),
+            &state_dir,
+            None,
+            Some(StoreKey::from_bytes([0x5A; 32])),
+            false,
+            Duration::from_secs(30),
+            RuntimeOptions::default(),
+        )
+        .err()
+        .expect("legacy mode cannot serve the pool layout");
+        let message = legacy.to_string();
+        assert!(
+            matches!(legacy, StoreError::EnginePoolInvalid(_)),
+            "{message}"
+        );
+        assert!(message.contains("per-account engine slot"), "{message}");
+        assert!(message.contains("migrate-pool"), "{message}");
+    }
+
+    fn account_engine(account_id: &str) -> crate::pool::AccountEngineStatus {
+        crate::pool::AccountEngineStatus {
+            account_id: account_id.to_string(),
+            proxy_group: Some(DEFAULT_PROXY_GROUP_ID.to_string()),
+            state: EngineState::Running,
+            pid: Some(1),
+            rss_bytes: Some(1),
+            resource_pressure: false,
+            resident: true,
+            restarts: 0,
+        }
+    }
+
+    /// `engines` is a **mode marker**, not a list-length signal: the pooled
+    /// answer always names it — an empty pool answers `[]`, which is exactly
+    /// what lets the desktop tell "no accounts yet" from a pre-pool connector
+    /// — while the legacy shape keeps the key absent and byte-identical to the
+    /// pre-pool build.
+    #[test]
+    fn engines_is_present_exactly_on_the_pooled_status_shape() {
+        let legacy = RuntimeStatusResult {
             aggregate: ProxyGroupRuntime::aggregate_from(&[running()], Some(1), false),
             proxy_groups: Vec::new(),
             engines: Vec::new(),
+            engines_pooled: false,
         };
-        let wire = serde_json::to_value(result).unwrap();
-        assert!(wire.get("engines").is_none());
+        let wire = serde_json::to_value(legacy).unwrap();
+        assert!(
+            wire.get("engines").is_none(),
+            "a legacy answer must not gain the key: {wire}"
+        );
         assert!(wire.get("degraded").is_none());
+
+        let empty_pool = RuntimeStatusResult {
+            aggregate: ProxyGroupRuntime::aggregate_from(&[], None, true),
+            proxy_groups: Vec::new(),
+            engines: Vec::new(),
+            engines_pooled: true,
+        };
+        let wire = serde_json::to_value(empty_pool).unwrap();
+        assert_eq!(
+            wire.get("engines"),
+            Some(&json!([])),
+            "a pooled answer with no accounts must still name engines as []: {wire}"
+        );
+
+        let sized = RuntimeStatusResult {
+            aggregate: ProxyGroupRuntime::aggregate_from(&[running(), running()], None, true),
+            proxy_groups: Vec::new(),
+            engines: vec![
+                account_engine("00000000000000000000000000000001"),
+                account_engine("00000000000000000000000000000002"),
+            ],
+            engines_pooled: true,
+        };
+        let wire = serde_json::to_value(sized).unwrap();
+        let engines = wire["engines"]
+            .as_array()
+            .expect("engines rides as an array");
+        assert_eq!(engines.len(), 2);
+        assert_eq!(engines[0]["accountId"], "00000000000000000000000000000001");
     }
 }

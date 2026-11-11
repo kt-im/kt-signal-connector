@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -821,6 +821,16 @@ pub enum StoreError {
     /// never numbers, ACIs, or paths.
     #[error("engine pool state is invalid: {0}")]
     EnginePoolInvalid(String),
+    /// The read-only probe found an un-checkpointed write-ahead log beside the
+    /// store (contract revision 1.288, §4.274). Everything the last unclean
+    /// connector commit wrote still lives in that WAL, and a side-effect-free
+    /// read cannot replay it — read-only WAL access needs a `-shm` index file,
+    /// which is a write. A plan built from the stale main file would contradict
+    /// the applied pass, so the probe refuses instead of guessing.
+    #[error(
+        "connector store has an un-checkpointed write-ahead log ({bytes} bytes) beside it; a read-only plan cannot include those commits. Start the connector once and stop it (a clean shutdown checkpoints the log), then re-run --dry-run"
+    )]
+    StoreWalPending { bytes: u64 },
 }
 
 impl StoreError {
@@ -849,6 +859,7 @@ impl StoreError {
             StoreError::StoreCorrupt(_) => "corrupt",
             StoreError::StoreIntegrity(_) => "integrity",
             StoreError::EnginePoolInvalid(_) => "engine_pool_invalid",
+            StoreError::StoreWalPending { .. } => "store_wal_pending",
         }
     }
 }
@@ -4303,23 +4314,7 @@ impl Store {
     /// host wire exposes the numbers it carries.
     pub fn list_all_account_rows(&self) -> Result<Vec<AccountRow>, StoreError> {
         let conn = self.lock_conn()?;
-        let mut statement = conn
-            .prepare("SELECT id, signal_account, proxy_group FROM accounts ORDER BY id")
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(AccountRow {
-                    id: row.get(0)?,
-                    signal_account: row.get(1)?,
-                    proxy_group: row.get(2)?,
-                })
-            })
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let mut accounts = Vec::new();
-        for row in rows {
-            accounts.push(row.map_err(|error| StoreError::Unavailable(Some(error)))?);
-        }
-        Ok(accounts)
+        read_all_account_rows(&conn)
     }
 
     pub fn list_accounts_in_group(
@@ -15073,6 +15068,140 @@ fn db_file_state(path: &Path) -> Result<DbFileState, StoreError> {
     }
 }
 
+/// Every account row on a connection, ordered by id. The serving reader and the
+/// dry-run probe ([probe_account_rows]) share this statement so a plan can
+/// never disagree with what the runtime sees.
+fn read_all_account_rows(conn: &Connection) -> Result<Vec<AccountRow>, StoreError> {
+    let mut statement = conn
+        .prepare("SELECT id, signal_account, proxy_group FROM accounts ORDER BY id")
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(AccountRow {
+                id: row.get(0)?,
+                signal_account: row.get(1)?,
+                proxy_group: row.get(2)?,
+            })
+        })
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let mut accounts = Vec::new();
+    for row in rows {
+        accounts.push(row.map_err(|error| StoreError::Unavailable(Some(error)))?);
+    }
+    Ok(accounts)
+}
+
+/// Read-only account probe for `migrate-pool --dry-run` (contract revision
+/// 1.288, §4.274).
+///
+/// The dry run promises a plan "without touching the filesystem", so it must
+/// never run [`Store::open`]: that creates the state directory, chmods it to
+/// 0700, creates `connector.sqlite3`, runs the schema ladder's DDL and pre-
+/// migration snapshot, and sweeps stale `pending` sends to `failed`. All of
+/// those are writes, and on an empty `--state-dir` they happen before the plan
+/// exists. The probe only ever reads:
+///
+/// - no store file (or a zero-length one) → `Ok(None)`: the plan's account set
+///   is empty and nothing is created;
+/// - a plaintext store → one read-only connection read unkeyed, the same
+///   classification [`Store::open`] uses (a dry run never migrates the file to
+///   SQLCipher — that is the applied pass's job);
+/// - an encrypted store → one read-only connection behind the keyed open's
+///   exact fail-closed rules (no key is `StoreKeyRequired`, a rejected key is
+///   `StoreKeyRejected`).
+///
+/// The connection is opened with `immutable=1` as well as `SQLITE_OPEN_READ_ONLY`:
+/// a plain read-only open of a WAL-mode store still creates `-shm` (and an empty
+/// `-wal`) beside it, which is exactly the side effect this probe exists to
+/// avoid. An un-checkpointed WAL is refused rather than read stale
+/// ([`StoreError::StoreWalPending`]): immutable reads cannot replay it.
+///
+/// The probe also carries the newer-schema gate the serving open enforces
+/// (contract revision 1.284, §4.268): it reads `meta.schema_version` before it
+/// reads a single account and refuses a store stamped above
+/// [`SCHEMA_VERSION`] with the same [`StoreError::SchemaNewer`] the applied
+/// pass produces, so a plan can never promise a migration that pass would
+/// refuse. The refusal does not write the serving open's
+/// `schema-newer.json` marker: recording a refusal is the applied pass's
+/// job, and a dry run must stay a filesystem no-op.
+///
+/// `PRAGMA query_only = ON` is the second rail: a caller that ever tried to
+/// write through this connection fails at the SQL layer instead of racing the
+/// connector the dry run was told may still be running.
+pub fn probe_account_rows(
+    state_dir: &Path,
+    store_key: Option<StoreKey>,
+) -> Result<Option<Vec<AccountRow>>, StoreError> {
+    let path = state_dir.join(DATABASE_FILE_NAME);
+    let file_state = db_file_state(&path)?;
+    if file_state == DbFileState::Absent {
+        return Ok(None);
+    }
+    let wal_bytes = file_bytes(&append_suffix(&path, "-wal"));
+    if wal_bytes > 0 {
+        return Err(StoreError::StoreWalPending { bytes: wal_bytes });
+    }
+    // SQLite reads the path through this URI verbatim (SQLITE_OPEN_URI), so the
+    // path component is percent-encoded and `immutable=1` states that no
+    // `-shm`/`-wal` may be created and no lock taken.
+    let uri = read_only_store_uri(&path);
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+    let conn = match file_state {
+        DbFileState::Plaintext => {
+            Connection::open_with_flags(Path::new(&uri), flags).map_err(unavailable)?
+        }
+        DbFileState::Encrypted => {
+            // Mirror the serving open: an encrypted store is unreadable without
+            // the key, and a wrong key must not look like an empty store.
+            let key = store_key.ok_or(StoreError::StoreKeyRequired)?;
+            open_encrypted_with_flags(Path::new(&uri), &key, true, flags)?
+        }
+        DbFileState::Absent => unreachable!("absent stores returned above"),
+    };
+    conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 250;")
+        .map_err(unavailable)?;
+    // The dry run reads the schema stamp before any account row: a store
+    // written by a newer connector is refused here exactly like `Store::open`
+    // refuses it (same `SchemaNewer`, so the same `STORE_SCHEMA_NEWER`
+    // launcher line), and a plan that claims otherwise would contradict the
+    // applied pass. Deliberately no `write_schema_newer` here — the marker is
+    // the applied refusal's record, and this probe writes nothing.
+    let current = current_schema_version(&conn);
+    if current > SCHEMA_VERSION {
+        return Err(StoreError::SchemaNewer {
+            current,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    Ok(Some(read_all_account_rows(&conn)?))
+}
+
+/// The SQLite URI for a store the probe opens without touching: every byte that
+/// would change the URI's meaning is percent-encoded (a path with `?`, `#`, or a
+/// space is a legal directory name), and `immutable=1` marks the file as
+/// read-only media so SQLite neither locks it nor creates `-shm`/`-wal` beside
+/// it.
+fn read_only_store_uri(path: &Path) -> String {
+    #[cfg(unix)]
+    let raw = {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let raw = path.to_string_lossy().into_owned().into_bytes();
+    let mut uri = String::from("file:");
+    for byte in raw {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' | b':' => {
+                uri.push(byte as char)
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
+}
+
 /// Open a store under SQLCipher: key first, then a forced first-page read so a
 /// wrong key or a damaged file fails closed here instead of mid-request.
 fn open_encrypted(
@@ -15080,7 +15209,20 @@ fn open_encrypted(
     key: &StoreKey,
     preexisting: bool,
 ) -> Result<Connection, StoreError> {
-    let conn = Connection::open(path).map_err(unavailable)?;
+    open_encrypted_with_flags(path, key, preexisting, OpenFlags::default())
+}
+
+/// The same keyed open over caller-chosen flags. Only the read-only probe
+/// ([probe_account_rows]) asks for anything but the serving flags, and it keeps
+/// every fail-closed rule: a wrong key or a damaged file is still refused at the
+/// forced first-page read.
+fn open_encrypted_with_flags(
+    path: &Path,
+    key: &StoreKey,
+    preexisting: bool,
+    flags: OpenFlags,
+) -> Result<Connection, StoreError> {
+    let conn = Connection::open_with_flags(path, flags).map_err(unavailable)?;
     let key_spec = key.raw_key_spec();
     let pragma = Zeroizing::new(format!("PRAGMA key = \"{}\"", key_spec.as_str()));
     drop(key_spec);
@@ -18041,6 +18183,258 @@ mod tests {
     use super::*;
     use crate::DEFAULT_PROXY_GROUP_ID;
     use tempfile::TempDir;
+
+    /// Every entry under `dir` (name + length), sorted: the read-only probe must
+    /// not add, remove, or rewrite one byte beside the store.
+    fn dir_entries(dir: &Path) -> Vec<(String, u64)> {
+        let mut entries: Vec<(String, u64)> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let len = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                (name, len)
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// The store file's bytes and permission bits: a refused probe must leave
+    /// both exactly as they were, not just leave the directory listing alone.
+    fn store_fingerprint(state_dir: &Path) -> (Vec<u8>, Option<u32>) {
+        let path = state_dir.join(DATABASE_FILE_NAME);
+        let bytes = std::fs::read(&path).unwrap();
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt as _;
+            Some(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777)
+        };
+        #[cfg(not(unix))]
+        let mode = None;
+        (bytes, mode)
+    }
+
+    /// The two files a non-immutable read would create beside a WAL-mode store.
+    fn assert_no_sidecars(state_dir: &Path) {
+        for suffix in ["-shm", "-wal"] {
+            assert!(
+                !append_suffix(&state_dir.join(DATABASE_FILE_NAME), suffix).exists(),
+                "the probe must not create {suffix} beside the store"
+            );
+        }
+    }
+
+    /// Path characters that would change a SQLite URI's meaning are escaped;
+    /// everything a normal path uses stays readable.
+    #[test]
+    fn the_read_only_probe_uri_escapes_uri_control_characters() {
+        assert_eq!(
+            read_only_store_uri(Path::new("/tmp/kt state/connector.sqlite3")),
+            "file:/tmp/kt%20state/connector.sqlite3?immutable=1"
+        );
+        assert_eq!(
+            read_only_store_uri(Path::new("/tmp/a?b#c%25/connector.sqlite3")),
+            "file:/tmp/a%3Fb%23c%2525/connector.sqlite3?immutable=1"
+        );
+    }
+
+    /// No store file is not an error: the plan's account set is empty, and the
+    /// state directory is not created by looking.
+    #[test]
+    fn the_read_only_probe_answers_an_absent_store_without_creating_it() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        assert!(
+            probe_account_rows(&state_dir, Some(test_store_key()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!state_dir.exists(), "the probe creates no state directory");
+    }
+
+    /// An existing store is read read-only: same rows the runtime sees, not one
+    /// byte more in the directory (no `-shm`, no `-wal`, no snapshot).
+    #[test]
+    fn the_read_only_probe_reads_an_existing_store_and_writes_nothing() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let store = Store::open(&state_dir, Some(test_store_key())).unwrap();
+        store
+            .upsert_account_from_signal_with_id("+15550003", Some(1), "default", Some("abc"))
+            .unwrap();
+        let expected: Vec<(String, String, String)> = store
+            .list_all_account_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row.signal_account, row.proxy_group))
+            .collect();
+        drop(store);
+        let before = dir_entries(&state_dir);
+
+        let rows = probe_account_rows(&state_dir, Some(test_store_key()))
+            .unwrap()
+            .expect("an existing store answers");
+        let got: Vec<(String, String, String)> = rows
+            .into_iter()
+            .map(|row| (row.id, row.signal_account, row.proxy_group))
+            .collect();
+        assert_eq!(got, expected);
+        assert_eq!(
+            dir_entries(&state_dir),
+            before,
+            "the probe adds no -shm/-wal/snapshot and rewrites nothing"
+        );
+    }
+
+    /// A store that an unclean shutdown left with commits in its WAL is refused:
+    /// an immutable read cannot include them, and a stale plan is worse than an
+    /// explicit answer.
+    #[test]
+    fn the_read_only_probe_refuses_an_uncheckpointed_wal() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let store = Store::open(&state_dir, Some(test_store_key())).unwrap();
+        store
+            .upsert_account_from_signal_with_id("+15550004", Some(1), "default", Some("def"))
+            .unwrap();
+        drop(store);
+        std::fs::write(state_dir.join("connector.sqlite3-wal"), b"pending").unwrap();
+        let before = dir_entries(&state_dir);
+        assert!(matches!(
+            probe_account_rows(&state_dir, Some(test_store_key())),
+            Err(StoreError::StoreWalPending { bytes: 7 })
+        ));
+        assert_eq!(
+            dir_entries(&state_dir),
+            before,
+            "the refusal writes nothing"
+        );
+    }
+
+    /// An encrypted store without a key is refused with the serving open's own
+    /// class, and the refusal is a pure read: no `-shm`, no `-wal`, and not one
+    /// byte or permission bit of the store changes.
+    #[test]
+    fn the_read_only_probe_refuses_an_encrypted_store_without_a_key() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let store = Store::open(&state_dir, Some(test_store_key())).unwrap();
+        store
+            .upsert_account_from_signal_with_id("+15550005", Some(1), "default", Some("enc"))
+            .unwrap();
+        drop(store);
+        let before = dir_entries(&state_dir);
+        let fingerprint = store_fingerprint(&state_dir);
+
+        assert!(matches!(
+            probe_account_rows(&state_dir, None),
+            Err(StoreError::StoreKeyRequired)
+        ));
+
+        assert_eq!(
+            dir_entries(&state_dir),
+            before,
+            "the refusal writes nothing"
+        );
+        assert_eq!(
+            store_fingerprint(&state_dir),
+            fingerprint,
+            "the store's bytes and permissions are untouched"
+        );
+        assert_no_sidecars(&state_dir);
+        // The right key still reads the row: the refusal damaged nothing.
+        let rows = probe_account_rows(&state_dir, Some(test_store_key()))
+            .unwrap()
+            .expect("the encrypted store still answers its key");
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// A wrong key is not an empty store: the probe keeps the keyed open's
+    /// fail-closed answer and still writes nothing beside the file.
+    #[test]
+    fn the_read_only_probe_refuses_an_encrypted_store_with_a_wrong_key() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let store = Store::open(&state_dir, Some(test_store_key())).unwrap();
+        store
+            .upsert_account_from_signal_with_id("+15550007", Some(1), "default", Some("wrong"))
+            .unwrap();
+        drop(store);
+        let before = dir_entries(&state_dir);
+        let fingerprint = store_fingerprint(&state_dir);
+
+        assert!(matches!(
+            probe_account_rows(&state_dir, Some(StoreKey::from_bytes([0x11; 32]))),
+            Err(StoreError::StoreKeyRejected)
+        ));
+
+        assert_eq!(
+            dir_entries(&state_dir),
+            before,
+            "the refusal writes nothing"
+        );
+        assert_eq!(
+            store_fingerprint(&state_dir),
+            fingerprint,
+            "the store's bytes and permissions are untouched"
+        );
+        assert_no_sidecars(&state_dir);
+        let rows = probe_account_rows(&state_dir, Some(test_store_key()))
+            .unwrap()
+            .expect("the encrypted store still answers its own key");
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// A store stamped above this build's schema is refused before any account
+    /// row is read — the same class `Store::open` returns — and the probe
+    /// leaves no marker: `schema-newer.json` is the applied refusal's record.
+    #[test]
+    fn the_read_only_probe_refuses_a_store_written_by_a_newer_connector() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let store = Store::open(&state_dir, Some(test_store_key())).unwrap();
+        store
+            .upsert_account_from_signal_with_id("+15550006", Some(1), "default", Some("newer"))
+            .unwrap();
+        let current = SCHEMA_VERSION + 1;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value=?1 WHERE key='schema_version'",
+                [current.to_string()],
+            )
+            .unwrap();
+        drop(store);
+        let before = dir_entries(&state_dir);
+        let fingerprint = store_fingerprint(&state_dir);
+
+        assert!(matches!(
+            probe_account_rows(&state_dir, Some(test_store_key())),
+            Err(StoreError::SchemaNewer {
+                current: seen,
+                supported,
+            }) if seen == current && supported == SCHEMA_VERSION
+        ));
+
+        assert_eq!(
+            dir_entries(&state_dir),
+            before,
+            "the refusal writes nothing"
+        );
+        assert_eq!(
+            store_fingerprint(&state_dir),
+            fingerprint,
+            "the newer store keeps every byte and permission bit"
+        );
+        assert_no_sidecars(&state_dir);
+        assert!(
+            !state_dir.join(SCHEMA_NEWER_FILE).exists(),
+            "a dry-run probe never records the applied pass's refusal marker"
+        );
+    }
 
     #[test]
     fn account_engine_epoch_bumps_monotonically() {

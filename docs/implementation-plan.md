@@ -64,6 +64,20 @@
   （同 `linkSessionId` 仍回同账号）；被裁掉的只是早已不在内存 attempt 表里、本来
   也只能答 `LINK_NOT_FOUND` 的遗弃 attempt。无 wire 变更，
   `ENGINE_CONTRACT_MAX_REVISION` 保持 1.286。)
+- Contract revision: 1.288 (2026-11-11; §4.274 P1 运行时隔离的 connector 半边：
+  `KT_ENGINE_SINGLE_ACCOUNT=1`（引擎读取点 `kt-signal-engine/src/main.rs:416-446`，
+  注册表 >1 账号即 exit 1）由 connector 逐子进程显式下发——开启时 `=1`、关闭时移除，
+  绝不靠继承；full legacy 与护栏互斥，池化槽位注册表 >1 账号在 spawn 前即
+  `EnginePoolInvalid`（不再退化成「子进程崩溃循环、账号只是看起来是冷的」）。池化与
+  legacy 布局同时持有凭据时启动 fail-closed 并给出 `migrate-pool` 命令，绝不自动挑选；
+  迁移器不再把「同一账号两份 store」当陈旧注册表自动改写。运行时就绪打且只打一行
+  `connector runtime mode`（mode / resident_cap / pool_ceiling / guard，无账号信息）。
+  `migrate-pool --dry-run` 报告扩成可执行清单（layout / accounts / residentCap /
+  residentOnStart / coldStarts / expectedExitCode / blockers / nextSteps），被挡住也出
+  报告且退出 1；dry-run 全程只读（占用检查用 `DataDirLock::acquire_quiescent`，store 用
+  `store::probe_account_rows`：immutable 只读、未 checkpoint 的 WAL 直接拒绝），不建目录/库文件/
+  锁文件、不改 pid、不 chmod。无 wire 变更，
+  `ENGINE_CONTRACT_MAX_REVISION` 保持 1.286。)
 - Contract revision: 1.283 (2026-11-10; §4.267 thin event ledger: the
   `event_log` table loses its `payload` column and becomes a five-column
   change ledger (seq/epoch/account_id/type/created_at) in schema v50 — a row
@@ -18287,7 +18301,7 @@ engines: [{ accountId, proxyGroup, state, pid?, rssBytes?,
             resourcePressure, resident, restarts }]
 ~~~
 
-`engines` 在空列表时省略，故 legacy 形状不变。聚合状态仍按
+`engines` 在池化模式下**恒出现**（空池答 `engines: []`，桌面据此区分「池里还没有账号」与从未有过该键的旧 connector）；legacy 路径仍省略该键，故 legacy 形状不变。聚合状态仍按
 running/faulted/exited/stopped 的既有规则计算，但在池化模式下
 **部分引擎非 Running 时置 `degraded: true`**（9 正常 1 崩溃不再只显示
 Running）；该字段为 false 时省略，legacy 路径逐字节不变。
@@ -18360,7 +18374,7 @@ legacy 目录只剩空 registry 空壳。
 
 **兼容与回滚。** 新错误码（`ACCOUNT_ALREADY_LINKED`、
 `ENGINE_POOL_FULL`、`ENGINE_NOT_PROVISIONED`）只在新路径出现；
-`engines[]`/`degraded` 只在池化模式出现/为真；开关关即回到 1.216 的
+`engines[]` 在池化模式恒出现（空池为 `[]`）、`degraded` 只在池化模式且部分引擎非 Running 时为真；开关关即回到 1.216 的
 单引擎形态，现有集成套件全绿。
 
 数据层面的回滚边界必须说清：迁移是 **rename**（不 copy），一旦账号的
@@ -18380,7 +18394,7 @@ Tests: `migrate::tests`（dry-run 与 apply 一致、rename 不 copy、崩溃窗
 `pool::tests`（账号 id 形状、第 9 槽拒绝与回收、discovery 绑定/store 优先、
 外名目录忽略、媒体根不在引擎目录、媒体桶互不干扰、会话归属回收、默认驻留
 窗口=上限）；
-`registry::tests`（degraded 聚合与 legacy 省略、空 engines 省略、启动上限、
+`registry::tests`（degraded 聚合与 legacy 省略、空池仍答 `engines: []` 而 legacy 无该键、启动上限、
 legacy 拒绝已迁移目录）；
 `per_account_pool` 集成（link 产生独立 data-dir/pid、accounts.list、send/
 typing/receipt 各归其引擎、双引擎日志互不穿插、kill -9 只重启该账号、
@@ -21046,3 +21060,110 @@ committed（`link.rotate` 答 `INVALID_REQUEST`）、槽 0/1/2 三码都 replay 
 刚写入的那一行调到比所有人都旧，清扫后仍是恰好 1000 行而不是 1001）、
 `link_commit_replay_still_resolves_the_same_account_after_the_sweep`（重复 finish
 刷新同一行，过期噪声被清空后同 id 仍回同账号）。
+
+## §4.274 P1 运行时隔离：单账号护栏、混合布局 fail-closed 与可操作迁移清单（契约 1.288 · 无 wire 变更）
+
+**背景**：多账号 P1 的目标是把「同进程分桶」升级为「每账号一个 engine 进程」，并让存量
+数据目录可迁移、可回滚。connector 半边此前只有池化开关和迁移器：启动器可以传
+`--per-account-engines`，但没有任何一层保证「一个引擎进程只有一个账号」；「池化与
+legacy 两种布局同时在」也没有被挡在启动前；`migrate-pool --dry-run` 只列迁移条目，
+不讲迁移之后会发生什么；而它名义上只读，却会顺手创建数据目录的锁文件并改写持有者
+pid——只读命令其实会写盘。
+
+**实现（connector 半边）**：
+
+- **默认形态与两个拓扑**：拓扑仍由可信启动器在 spawn 时选择，永不经 IPC 改变。
+  `--per-account-engines`（env `KT_SIGNAL_PER_ACCOUNT_ENGINES`）关闭 = full legacy
+  （回滚形态：每组一个多账号引擎）；打开 = full pool（每账号一个引擎、一个
+  `<signal-data>/engines/<accountId>/`、一把占用锁、一个 watchdog）。桌面 D1 把池化
+  做成新装机默认；connector **不**翻转自己的 flag 默认值，否则一个还没升级的启动器
+  会把 legacy 数据目录静默交给自动迁移。**没有混合模式**。
+- **单账号护栏（读取点确认）**：引擎侧读取点在 `kt-signal-engine/src/main.rs:416-446`：
+  `KT_ENGINE_SINGLE_ACCOUNT` 只在 trim 后恒等 `"1"` 时开启；注册表账号数 > 1 则启动
+  失败（exit 1，stderr 固定行
+  `kt-signal-engine: ERROR event=startup_failed code=SingleAccountRegistryViolation accounts=N limit=1`，
+  滚动日志落 `engine.startup` 结构化 error），判定发生在清扫与服务装配之前，不动任何
+  账号目录。connector 侧三件事：
+  1. 开关只读一次（`pool::single_account_guard_from_env`，同款严格 `"1"`），经
+     `RuntimeOptions.single_account_guard` 进入运行时；
+  2. 每个池化子进程**显式**决定这个变量：开启时 `=1`，关闭时移除——绝不靠继承，一个
+     导出的 dev/test 变量不能悄悄改变拓扑；
+  3. 池化槽位的引擎注册表若列出 > 1 个账号，启动直接失败（`EnginePoolInvalid`，消息带
+     不透明槽位 id 与账号数）；full legacy + 护栏同样启动失败（legacy 引擎一个进程服务
+     整组账号，护栏不可能成立）。失败发生在 spawn 之前，因此不会退化成「子进程反复
+     崩溃、账号只是看起来是冷的」。
+- **混合布局 fail-closed（不自动猜）**：新增只读布局扫描
+  `migrate::scan_engine_layout`：对 legacy 组目录（根 + `proxy-groups/<合法 groupId>`）
+  数「注册表指向且 `store.db` 仍在」的账号；对每个 `engines/<accountId>/` 数「注册表
+  账号数」与「store 仍在的账号数」。四种形态：
+  - 纯 legacy：池化启动仍自动迁移（只有一个候选，不是猜）；
+  - 纯 pooled：无操作；
+  - **mixed（两边都有凭据）**：启动失败，文案给出账号数与完整迁移命令，绝不挑选哪份为准；
+  - legacy 模式遇到池布局：仍然失败，文案补上 `migrate-pool --dry-run` 引导。
+  迁移器内部同一口径：目标槽位已完整、legacy 侧 `store.db` **仍在**时，不再当成「陈旧
+  注册表」自动改写，而是按「同一账号两份 store」失败；自动修复只留给了「store 已搬走、
+  只剩注册表元数据」这一种真正无害的崩溃窗口。
+- **模式日志（一次性）**：运行时装配完成时打且只打一行
+  `connector runtime mode mode="pooled" resident_cap=8 pool_ceiling=8 single_account_guard=true`
+  （legacy 形态：`mode="legacy" resident_cap=unbounded single_account_guard=false`）。
+  没有账号 id、号码、目录。非 TTY 的日志管道关闭 ANSI，字段保持 `key=value` 可解析。
+- **`migrate-pool --dry-run` 变成可操作清单**：报告新增 `layout`、`accounts`、
+  `residentCap`、`residentOnStart`、`coldStarts`、`expectedExitCode`、`blockers`、
+  `nextSteps`。`coldStarts` = 迁移后将有引擎的账号数 − 常驻窗口（下一次池化启动会冷启
+  的账号数）。计划可执行时 `expectedExitCode=0`；被 fail-closed 挡住时仍打印同形状报告
+  （`blockers` 写原因、`expectedExitCode=1`），进程退出码 1。dry-run 的两处「只读」都必须
+  名副其实：占用检查用只读探针 `DataDirLock::acquire_quiescent`（目录或锁文件不存在时直接
+  返回，不建目录、不建锁文件、不改写 pid；存在时仍拿同一把内核锁，运行中的 connector 照样
+  被拒）；store 用只读探针 `store::probe_account_rows` 取代 `Store::open`——后者会先
+  `create_dir_all` + chmod 0700、再建 `connector.sqlite3`、跑 schema 阶梯与迁移快照、把陈旧
+  `pending` 发送扫成 `failed`，全在计划出现之前写盘。探针三种情形：state-dir 或库文件不存在
+  → 空账号集（`Ok(None)`，**不建目录**）；明文库 → 不加 key 只读（与 `Store::open` 同一分类，
+  但绝不就地迁移成 SQLCipher）；加密库 → 沿用 keyed open 的 fail-closed 规则（无 key =
+  `StoreKeyRequired`，错 key = `StoreKeyRejected`）。连接以
+  `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_URI` + URI `immutable=1` 打开：普通只读打开 WAL 模式
+  库仍会在旁边建 `-shm` 与空 `-wal`，那正是这里要避免的写入；`PRAGMA query_only = ON` 是
+  第二道闸。未 checkpoint 的 WAL（上一次 connector 非正常退出）直接拒绝
+  （`StoreError::StoreWalPending`，退出 1，文案说明「启动并停一次 connector，让干净的关闭做
+  checkpoint，再跑 --dry-run」）——immutable 读不回放 WAL，宁可不给计划，也不给一份与 apply
+  不一致的计划。schema 版本也在同一道闸上：探针在读出账号前先读 `meta.schema_version`，
+  若库版本高于本二进制（存量机器先跑过一次新 connector 就会这样），dry-run 与 apply 一样
+  以 `StoreError::SchemaNewer` 拒绝——报告照旧打印，`blockers` 同时带分类文案与固定行
+  `KT_FATAL code=STORE_SCHEMA_NEWER retryable=false current=<库> supported=<本机>`，
+  `expectedExitCode=1`、进程退出码 1（`accounts` 记 0：读不了 schema 就不数账号，
+  不拿未知版本猜一个数）；`nextSteps` 只指向「升级 connector 后再看」，绝不建议去掉
+  `--dry-run`（apply 对同一个库同样拒绝，去掉只会拿到同一条错误）。探针不写
+  `schema-newer.json`：那是 apply 拒绝时的留痕，dry-run 必须零写入。一个更老的二进制
+  因此不会给出一份自己 apply 不了的计划。
+
+**升级 runbook（存量）**：
+1. 停 connector（迁移器要拿数据目录占用锁，跑着的 connector 会让它失败）；
+2. `kt-signal-connector migrate-pool --signal-data-dir <dir> --state-dir <dir> --dry-run`：
+   读 `layout` / `accounts` / `wouldMigrate` / `coldStarts` / `nextSteps`；
+3. 备份 signal-data 与 state 目录（store 迁移是同卷 `rename`，单向门）；
+4. 同一命令去掉 `--dry-run`；
+5. 以 `--per-account-engines` 启动。验收：`accounts.list` 账号数不变、每账号一个
+   engine 进程、收一条消息、`kill -9` 单个 engine 只重启该账号。
+
+**回滚**：迁移是单向门，回滚 = 恢复备份 + 以 legacy 形态启动（不带
+`--per-account-engines`，并清掉 `KT_ENGINE_SINGLE_ACCOUNT`——legacy 与护栏互斥会
+fail-closed，这是刻意的）。灰度按用户不按账号：同一台机器上两种拓扑不共存。
+
+**测试**：`tests/runtime_isolation.rs`（护栏进每个池化子进程的环境探针；一次性模式
+日志；dry-run 零写入 + 报告字段；被挡住的 dry-run 仍出计划且退出 1；空白 state-dir 的
+dry-run 之后目录仍不存在、signal-data 与 state 两棵树逐字节不变、重复 dry-run 打出同一份
+计划；未 checkpoint 的 WAL 被拒绝且一个字节都不改；新版本库上 dry-run 与 apply 同样拒绝
+（`STORE_SCHEMA_NEWER`、exit 1、blockers 文案与 apply 的 stderr 逐字一致、不留
+`schema-newer.json`）；护栏 + legacy 的 CLI 级拒绝——exit 1、stderr 含 `single-account`、
+不留目录/库/端点）、
+`tests/engine_child_env.rs`（父进程导出 `KT_ENGINE_SINGLE_ACCOUNT=1` 时，未开护栏的槽位
+仍把变量从子进程移除；单独一个测试二进制，因为 `set_var` 是进程全局的）、
+`src/registry.rs` 单测（legacy+护栏拒绝、双账号槽位拒绝、mixed 两侧 fail-closed 文案——
+`mixed_layouts_fail_closed_with_migration_instructions`）、
+`src/migrate.rs` 单测（布局四态 + 护栏计注册表而非 store 数；dry-run 报告数字与
+signal-data 字节不变）、`src/store.rs` 单测（URI 转义、缺库返回空且不建目录、只读读出与
+运行时同一批行且目录零变化、WAL 待处理拒绝、加密库无 key/错 key fail-closed 且零写入——
+无 `-shm`/`-wal`、库文件字节与权限不变、新版本库拒绝且不写 marker）。
+
+**桌面**：D1 传 `--per-account-engines` 与 `KT_ENGINE_SINGLE_ACCOUNT=1`，按
+`coldStarts` / `residentCap` 展示常驻预算；混合布局与被挡住的迁移文案直接复用本节的
+命令与字段。本仓不拥有桌面 UI，另报。
