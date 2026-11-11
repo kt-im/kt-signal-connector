@@ -60,7 +60,7 @@ fn mrr_has_spam(response_type: u8) -> bool {
 
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, random_id, stable_hash_id};
-use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
+use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, LinkSessionState, now_ms};
 use crate::media::{MEDIA_CHUNK_BYTES, MediaGovernor, MediaHandleError, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::store::{
@@ -987,6 +987,14 @@ impl ServiceError {
                     ),
                     "REPORT_SPAM_FAILED" => {
                         ApiError::new("REPORT_SPAM_FAILED", "the report was rejected", false)
+                    }
+                    // QR B1 (issue #951): the engine's provisioning channel
+                    // died after the URL handoff, so the QR can never commit.
+                    // Retryable=true is the "start a fresh link" face: the
+                    // failed QR must be cleared and a new link.start minted,
+                    // never a blind finish retry on the dead session.
+                    "LINK_LOST" => {
+                        ApiError::new("LINK_LOST", "link session was lost; start a new link", true)
                     }
                     // No data object (or an older engine face): the code still
                     // maps — retryable=true per the engine's contract note (the
@@ -2579,7 +2587,9 @@ impl ConnectorService {
     ) -> Result<Value, ServiceError> {
         validate_device_name(&device_name)?;
         if let Some(existing) = self.link.as_ref() {
-            if !existing.is_expired(now_ms()) {
+            // QR B1: a lost session is terminal, never a live occupant — a
+            // fresh QR replaces it instead of answering LINK_IN_PROGRESS.
+            if !existing.is_lost() && !existing.is_expired(now_ms()) {
                 return Err(ServiceError::Api(ApiError::new(
                     "LINK_IN_PROGRESS",
                     "a link session is already active",
@@ -2600,6 +2610,11 @@ impl ConnectorService {
 
     pub fn ensure_link_available(&mut self) -> Result<(), ServiceError> {
         if let Some(existing) = self.link.as_ref() {
+            // QR B1: a lost session does not block a fresh start; begin_link
+            // replaces it once the engine hands over the new QR.
+            if existing.is_lost() {
+                return Ok(());
+            }
             if !existing.is_expired(now_ms()) {
                 return Err(ServiceError::Api(ApiError::new(
                     "LINK_IN_PROGRESS",
@@ -2607,6 +2622,14 @@ impl ConnectorService {
                     false,
                 )));
             }
+        }
+        // Expiry keeps its pre-B1 cleanup: an expired session is consumed
+        // here so it cannot linger behind a failed startLink.
+        if self
+            .link
+            .as_ref()
+            .is_some_and(|session| session.is_expired(now_ms()))
+        {
             self.link = None;
         }
         Ok(())
@@ -2773,12 +2796,29 @@ impl ConnectorService {
         Ok(json!({}))
     }
 
-    /// True while a non-expired link session exists. Restarting signal-cli would
-    /// invalidate its deviceLinkUri, so the watchdog must not restart meanwhile.
+    /// True while a non-expired, still-pending link session exists.
+    /// Restarting signal-cli would invalidate its deviceLinkUri, so the
+    /// watchdog must not restart meanwhile. A lost session is dead — the
+    /// watchdog must not stay suppressed by it (QR B1).
     pub fn has_pending_link(&self) -> bool {
-        self.link
-            .as_ref()
-            .is_some_and(|session| !session.is_expired(now_ms()))
+        self.link.as_ref().is_some_and(|session| {
+            session.state == LinkSessionState::Pending && !session.is_expired(now_ms())
+        })
+    }
+
+    /// Mark the named session lost (QR B1). The session stays in the table so
+    /// the router can still attribute its id and finish/cancel answer the
+    /// definite LINK_LOST instead of LINK_NOT_FOUND; has_pending_link turns
+    /// false and the next begin_link replaces it. Returns false when no
+    /// session with this id is current.
+    pub fn mark_link_lost(&mut self, link_session_id: &str) -> bool {
+        match self.link.as_mut() {
+            Some(session) if session.session_id == link_session_id => {
+                session.mark_lost(now_ms());
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Runtime state authority: a 401 observed while a link/re-key owns the
@@ -2788,9 +2828,22 @@ impl ConnectorService {
         !self.has_pending_link()
     }
 
-    /// Whether this group's service owns the link session, expired or not:
+    /// Drop the named session after a pre-dispatch refusal that spends it
+    /// (the per-engine account ceiling): the QR can never commit while the
+    /// group stays full, so leaving it pending would suppress the watchdog
+    /// for the rest of its TTL and answer the next `link.start` with
+    /// LINK_IN_PROGRESS instead of a fresh QR. A session that is already
+    /// gone (a concurrent cancel, or a lost session the next begin replaced)
+    /// is left alone.
+    pub fn discard_link_session(&mut self, link_session_id: &str) {
+        if self.has_link_session(link_session_id) {
+            self.link = None;
+        }
+    }
+
+    /// Whether this group's service owns the link session, expired or lost:
     /// routing a finish/cancel to its owning group must preserve the distinct
-    /// LINK_EXPIRED answer an expired session produces at dispatch time.
+    /// LINK_EXPIRED / LINK_LOST answers those states produce at dispatch time.
     pub fn has_link_session(&self, link_session_id: &str) -> bool {
         self.link
             .as_ref()
@@ -16319,6 +16372,17 @@ impl ConnectorService {
     ) -> Result<&ActiveLinkSession, ServiceError> {
         match self.link.as_ref() {
             Some(session) if session.session_id == link_session_id => {
+                // QR B1: a lost session is addressable (so finish/cancel can
+                // answer the definite LINK_LOST) but can never commit. Unlike
+                // expiry it is not consumed here — the next begin_link takes
+                // it over.
+                if session.is_lost() {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "LINK_LOST",
+                        "link session was lost; start a new link",
+                        true,
+                    )));
+                }
                 if session.is_expired(now_ms()) {
                     self.link = None;
                     return Err(ServiceError::Api(ApiError::new(
@@ -22784,6 +22848,57 @@ mod tests {
             .expect("an expired session must not block a fresh link");
     }
 
+    /// QR B1 (issue #951): a lost session is terminal but stays addressable.
+    /// It no longer suppresses the watchdog (has_pending_link=false), a
+    /// finish for its id answers the definite LINK_LOST (retryable=true), and
+    /// the next begin_link replaces it instead of answering LINK_IN_PROGRESS.
+    #[test]
+    fn lost_link_session_is_addressable_but_never_blocks_a_fresh_link() {
+        let (_temp, mut service) = service();
+        let started = service
+            .begin_link("KT-Lost".into(), "sgnl://link?lost".into())
+            .unwrap();
+        let lost_id = started["linkSessionId"].as_str().unwrap().to_string();
+        assert!(
+            service.has_pending_link(),
+            "the live QR suppresses the watchdog"
+        );
+
+        assert!(service.mark_link_lost(&lost_id));
+        let session = service.link.as_ref().expect("the lost session stays");
+        assert_eq!(session.state, crate::link::LinkSessionState::Lost);
+        assert!(session.lost_at.is_some(), "the loss instant is recorded");
+        assert!(
+            !service.has_pending_link(),
+            "a lost session must not suppress the watchdog"
+        );
+        assert!(
+            service.has_link_session(&lost_id),
+            "router attribution must survive loss so finish answers LINK_LOST"
+        );
+
+        let error = service.peek_link_for_finish(&lost_id).unwrap_err();
+        let ServiceError::Api(api) = error else {
+            panic!("expected the definite LINK_LOST api error");
+        };
+        assert_eq!(api.code, "LINK_LOST");
+        assert!(api.retryable, "a fresh link.start is the remedy");
+
+        // The next begin replaces the lost session (ensure_link_available is
+        // the supervisor's pre-mint gate and must agree).
+        service
+            .ensure_link_available()
+            .expect("a lost session does not block the next start");
+        let next = service
+            .begin_link("KT-Next".into(), "sgnl://link?next".into())
+            .expect("a lost session must not answer LINK_IN_PROGRESS");
+        let next_id = next["linkSessionId"].as_str().unwrap().to_string();
+        assert_ne!(next_id, lost_id);
+        assert!(service.has_pending_link());
+        assert!(!service.has_link_session(&lost_id));
+        assert!(!service.mark_link_lost("no-such-session"));
+    }
+
     /// The finish budget (370 s) outlives the advertised QR lifetime (300 s),
     /// so an in-flight finish pins the session: a phone approval that lands
     /// after the QR's own lifetime must still commit — the engine already
@@ -23116,6 +23231,9 @@ mod tests {
             // §4.47: a network/download/decrypt failure may succeed on a
             // later attempt.
             "AVATAR_FETCH_FAILED",
+            // QR B1: the dead QR is repaired by a fresh link.start, never a
+            // blind finish retry; retryable=true is the start-over face.
+            "LINK_LOST",
         ];
         for code in retryable {
             let api =

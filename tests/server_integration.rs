@@ -768,6 +768,101 @@ async fn link_cancel_keeps_the_group_engine_and_other_accounts() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// QR B1 (issue #951): the engine's terminal provisioning failure surfaces as
+/// the definite LINK_LOST (not a generic upstream error), the connector keeps
+/// the lost session addressable so a repeated finish still answers LINK_LOST
+/// rather than LINK_NOT_FOUND, and the next link.start is not blocked by the
+/// dead session's LINK_IN_PROGRESS.
+#[tokio::test]
+async fn link_lost_is_definite_and_frees_the_next_link_start() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [17_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_FINISH_LINK_LOST", "1")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "b1-start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    let link = request(
+        &mut client,
+        "b1-link-start",
+        "link.start",
+        json!({ "deviceName": "KT-B1-Lost" }),
+    )
+    .await;
+    let lost_session = link["result"]["linkSessionId"]
+        .as_str()
+        .expect("the QR mints")
+        .to_string();
+
+    let lost = request(
+        &mut client,
+        "b1-link-finish",
+        "link.finish",
+        json!({ "linkSessionId": lost_session }),
+    )
+    .await;
+    assert_eq!(lost["error"]["code"], "LINK_LOST", "got {lost}");
+    assert_eq!(lost["error"]["retryable"], true);
+
+    // The lost session stays addressable: a repeated finish answers the same
+    // definite code instead of degrading to LINK_NOT_FOUND.
+    let repeated = request(
+        &mut client,
+        "b1-link-finish-again",
+        "link.finish",
+        json!({ "linkSessionId": lost_session }),
+    )
+    .await;
+    assert_eq!(repeated["error"]["code"], "LINK_LOST", "got {repeated}");
+
+    // A fresh QR replaces the dead session instead of LINK_IN_PROGRESS.
+    let fresh = request(
+        &mut client,
+        "b1-link-start-again",
+        "link.start",
+        json!({ "deviceName": "KT-B1-Fresh" }),
+    )
+    .await;
+    let fresh_session = fresh["result"]["linkSessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a lost session must not block a fresh start: {fresh}"))
+        .to_string();
+    assert_ne!(fresh_session, lost_session);
+
+    // The shared engine never restarted for the loss.
+    let status = request(&mut client, "b1-status", "runtime.status", json!({})).await;
+    assert_eq!(status["result"]["state"], "running");
+    assert_eq!(status["result"]["pid"].as_u64().unwrap() as u32, engine_pid);
+
+    let cancelled = request(
+        &mut client,
+        "b1-link-cancel",
+        "link.cancel",
+        json!({ "linkSessionId": fresh_session }),
+    )
+    .await;
+    assert!(cancelled.get("result").is_some());
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn contacts_sync_list_and_send_by_peer() {
     let temp = TempDir::new().unwrap();

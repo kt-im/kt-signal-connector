@@ -1202,6 +1202,39 @@ mod tests {
         pool.discard(second.account_id(), true).await;
     }
 
+    /// QR B1 (issue #951): a lost session remains owned by its slot for
+    /// routing (the registry asks session_owner before dispatching a finish),
+    /// while has_pending_link reads false so the abandoned-link reaper is not
+    /// suppressed by a dead QR forever.
+    #[tokio::test]
+    async fn lost_sessions_keep_their_slot_ownership_for_routing() {
+        let temp = TempDir::new().unwrap();
+        let pool = AccountPool::discover(config(&temp, false));
+        let slot = pool.provision_slot(DEFAULT_PROXY_GROUP_ID).unwrap();
+        let service = slot.supervisor().service();
+        let session = service
+            .lock()
+            .await
+            .plant_link_session_for_test("KT-Lost", Duration::from_secs(300));
+        assert!(service.lock().await.mark_link_lost(&session));
+        pool.remember_session(&session, slot.account_id());
+
+        assert_eq!(
+            pool.session_owner(&session).as_deref(),
+            Some(slot.account_id()),
+            "the pool keeps a lost session's owner for finish routing"
+        );
+        assert!(
+            service.lock().await.has_link_session(&session),
+            "the slot's service keeps the lost session addressable"
+        );
+        assert!(
+            !service.lock().await.has_pending_link(),
+            "a lost session must not suppress the abandoned-link reaper"
+        );
+        pool.discard(slot.account_id(), true).await;
+    }
+
     #[tokio::test]
     async fn session_ownership_is_forgotten_with_the_slot() {
         let temp = TempDir::new().unwrap();

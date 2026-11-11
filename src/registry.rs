@@ -1331,6 +1331,18 @@ impl ProxyGroupRuntime {
         if let Some(pool) = &self.pool
             && let Some(account_id) = pool.session_owner(link_session_id)
             && let Some(slot) = pool.get(&account_id)
+            // QR B1: pooled routing follows the same rule as the legacy
+            // group scan above — the owning service's session table is the
+            // authority, and it keeps lost sessions addressable so their
+            // finish answers LINK_LOST instead of LINK_NOT_FOUND. A stale
+            // pool map entry (the slot no longer owns that id) does not
+            // route.
+            && slot
+                .supervisor()
+                .service()
+                .lock()
+                .await
+                .has_link_session(link_session_id)
         {
             return Ok(LinkOwner::Account(slot));
         }
@@ -3487,7 +3499,80 @@ mod tests {
             runtime.resolve_link_session(&live).await.as_deref(),
             Some("team-b")
         );
+        // QR B1: a lost session is dead for the watchdog but stays
+        // attributable for the router, exactly like an expired one.
+        owner
+            .supervisor
+            .service()
+            .lock()
+            .await
+            .mark_link_lost(&live);
+        assert_eq!(
+            runtime.resolve_link_session(&live).await.as_deref(),
+            Some("team-b"),
+            "a lost session must keep its owning group"
+        );
         assert_eq!(runtime.resolve_link_session("never-started").await, None);
+    }
+
+    /// QR B1: pooled routing follows the same authority rule as the legacy
+    /// group scan — the owning slot's service session table decides. A lost
+    /// session still routes (so finish answers LINK_LOST); a stale pool map
+    /// entry with no backing service session does not.
+    #[tokio::test]
+    async fn pooled_link_sessions_route_by_the_owning_service_state() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap());
+        let pool = crate::pool::AccountPool::discover(crate::pool::EnginePoolConfig {
+            engine_bin: PathBuf::from("unused-engine"),
+            signal_data_dir: temp.path().join("signal-data"),
+            state_dir: temp.path().join("state"),
+            media_ingest: false,
+            expire_sweep_interval: Duration::from_secs(30),
+            store: Arc::clone(&store),
+            media_handles: None,
+            backup_handles: None,
+            policy: crate::pool::EnginePoolPolicy::default(),
+            watchdog_interval: None,
+        });
+        let slot = pool.provision_slot(DEFAULT_PROXY_GROUP_ID).unwrap();
+        let runtime = ProxyGroupRuntime::full_pool_with_running(
+            vec![DEFAULT_PROXY_GROUP_ID.to_string()],
+            store,
+            false,
+            Arc::clone(&pool),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        // A pool map entry without a matching service session is stale.
+        pool.remember_session("kt-stale", slot.account_id());
+        assert_eq!(
+            runtime.resolve_link_session("kt-stale").await,
+            None,
+            "a stale pool map entry must not route"
+        );
+
+        let session = slot
+            .supervisor()
+            .service()
+            .lock()
+            .await
+            .plant_link_session_for_test("KT-Lost-Pool", Duration::from_secs(300));
+        assert!(
+            slot.supervisor()
+                .service()
+                .lock()
+                .await
+                .mark_link_lost(&session)
+        );
+        pool.remember_session(&session, slot.account_id());
+        assert_eq!(
+            runtime.resolve_link_session(&session).await.as_deref(),
+            Some(DEFAULT_PROXY_GROUP_ID),
+            "a lost pooled session must keep its owning slot route"
+        );
+        std::mem::forget(temp);
     }
 
     /// The effective media-ingest decision is the launcher's decision

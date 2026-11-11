@@ -4531,6 +4531,12 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     "PHONE_INVALID",
     "PHONE_RATE_LIMITED",
     "PHONE_SERVER_FAILED",
+    // QR B1 (issue #951): the engine's provisioning channel died after the
+    // URL handoff (WS close / timeout / stream end). The engine answers
+    // -1 + LINK_LOST deterministically; the host maps it to the same-named
+    // code, retryable=true (a fresh link.start is the remedy — the dead QR
+    // can never commit).
+    "LINK_LOST",
 ];
 
 /// Extract a known structured engine error code from a JSON-RPC error object.
@@ -10510,6 +10516,19 @@ mod tests {
             .await,
             Err(EngineError::UpstreamCode {
                 code: "CONVERSATION_NOT_RESOLVED",
+                data: None,
+            })
+        );
+        // QR B1: the engine's terminal provisioning face must classify
+        // structurally, not as the generic -32603 upstream error.
+        assert_eq!(
+            classify(json!({
+                "code": -1,
+                "message": "LINK_LOST"
+            }))
+            .await,
+            Err(EngineError::UpstreamCode {
+                code: "LINK_LOST",
                 data: None,
             })
         );

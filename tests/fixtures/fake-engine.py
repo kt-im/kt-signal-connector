@@ -975,6 +975,15 @@ for line in sys.stdin:
                 },
             })
             continue
+        # QR B1 (issue #951): the engine's provisioning channel died after
+        # the URL handoff — finishLink answers the definite -1 + LINK_LOST.
+        if os.environ.get("KT_FAKE_FINISH_LINK_LOST") == "1":
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "LINK_LOST"},
+            })
+            continue
         if params.get("deviceName") == "[slow-link-test]":
             continue
         if params.get("deviceName") == "[crash-link-test]":

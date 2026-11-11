@@ -9457,6 +9457,7 @@
             "LINK_IN_PROGRESS",
             "LINK_NOT_FOUND",
             "LINK_EXPIRED",
+            "LINK_LOST",
             "LINK_CANCELLED",
             "ACCOUNT_LIMIT_REACHED",
             "ACCOUNT_ALREADY_LINKED",

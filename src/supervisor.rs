@@ -3014,7 +3014,6 @@ impl RuntimeSupervisor {
         &self,
         link_session_id: String,
     ) -> Result<AccountSummary, ServiceError> {
-        let engine = self.running_engine().await?;
         let cancel = {
             let mut active = self.active_link_finish.lock().await;
             if active.is_some() {
@@ -3031,6 +3030,11 @@ impl RuntimeSupervisor {
             });
             cancel_rx
         };
+        // Session state is judged before the engine is resolved (QR B1): a
+        // lost/expired/unknown session is a definite answer that does not
+        // depend on engine liveness, so a terminal or missing engine must not
+        // downgrade it to RUNTIME_NOT_RUNNING. Every pre-dispatch refusal
+        // below clears the finish lane it just took.
         let credentials = self
             .service
             .lock()
@@ -3043,12 +3047,66 @@ impl RuntimeSupervisor {
                 return Err(error);
             }
         };
+        // Per-engine account ceiling (M3.3): refuse before the engine is
+        // resolved and before the mutating finishLink is dispatched, so the
+        // phone is never asked to approve a link the connector would then
+        // have to reject at commit time. Session errors (LINK_LOST/
+        // LINK_NOT_FOUND/LINK_EXPIRED) keep precedence.
+        // Bind the store answer before matching: a match scrutinee's
+        // temporary guard would stay alive through the arms, and the refusal
+        // arm takes the service lock again (a same-mutex deadlock).
+        let ceiling = self
+            .service
+            .lock()
+            .await
+            .group_at_account_ceiling(&self.group_id);
+        match ceiling {
+            Ok(true) => {
+                // The refused QR can never commit while the group stays full,
+                // so the session is spent: dropping it keeps
+                // has_pending_link false (the watchdog is not suppressed for
+                // its TTL) and lets the next link.start mint a fresh QR
+                // instead of answering LINK_IN_PROGRESS. It is dropped while
+                // this lane still excludes a concurrent finish, so no one can
+                // peek the session between the drop and the lane release.
+                self.service
+                    .lock()
+                    .await
+                    .discard_link_session(&link_session_id);
+                // Clear the lane before the refusal leaves, exactly like the
+                // peek and pin arms: a lane left taken would answer every
+                // later finish with LINK_IN_PROGRESS and keep the watchdog
+                // suppressed for good.
+                self.clear_link_finish(&link_session_id).await;
+                return Err(account_limit_error(&self.group_id));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.clear_link_finish(&link_session_id).await;
+                return Err(error);
+            }
+        }
+
+        // A live engine is only needed to dispatch finishLink, so it is
+        // resolved after the session judgment (a terminal/missing engine must
+        // not downgrade a lost session's definite LINK_LOST) and after the
+        // store-only ceiling refusal. This arm clears its own lane too: the
+        // finish never started, so nothing may stay suppressed.
+        let engine = match self.running_engine().await {
+            Ok(engine) => engine,
+            Err(error) => {
+                self.clear_link_finish(&link_session_id).await;
+                return Err(error.into());
+            }
+        };
+
         // The finish budget outlives the advertised QR lifetime
         // (`LINK_SESSION_TTL`): an approval that lands while `finishLink` is
         // in flight must still be commitable, or the engine links a device
         // that the commit then refuses with LINK_EXPIRED. The pin extends only
         // the in-memory session deadline; the QR's advertised `expiresAt`
-        // stays what it was.
+        // stays what it was. It runs only once every pre-dispatch refusal is
+        // past, so a refusal never stretches a dead QR's deadline.
         if let Err(error) = self
             .service
             .lock()
@@ -3057,20 +3115,6 @@ impl RuntimeSupervisor {
         {
             self.clear_link_finish(&link_session_id).await;
             return Err(error);
-        }
-
-        // Per-engine account ceiling (M3.3): refuse before dispatching the
-        // mutating finishLink, so the phone is never asked to approve a link
-        // the connector would then have to reject at commit time. Session
-        // errors (LINK_NOT_FOUND/LINK_EXPIRED) keep precedence.
-        if self
-            .service
-            .lock()
-            .await
-            .group_at_account_ceiling(&self.group_id)?
-        {
-            self.clear_link_finish(&link_session_id).await;
-            return Err(account_limit_error(&self.group_id));
         }
 
         let upstream = engine
@@ -3115,6 +3159,29 @@ impl RuntimeSupervisor {
                     "finishLink outcome is unknown; check linked devices before retrying",
                     false,
                 )));
+            }
+            // QR B1 (issue #951): the engine's provisioning channel is dead.
+            // The finish lane was already cleared above (clear_link_finish),
+            // so mark the service session lost and keep it addressable: the
+            // next link.start replaces it, has_pending_link stops suppressing
+            // the watchdog, and any later finish for this id answers the
+            // definite LINK_LOST rather than LINK_NOT_FOUND.
+            Err(EngineError::UpstreamCode {
+                code: "LINK_LOST",
+                data,
+            }) => {
+                let marked = self.service.lock().await.mark_link_lost(&link_session_id);
+                if !marked {
+                    tracing::warn!(
+                        account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                        group_id = %self.group_id,
+                        "engine reported LINK_LOST for a session this service no longer owns"
+                    );
+                }
+                return Err(ServiceError::Engine(EngineError::UpstreamCode {
+                    code: "LINK_LOST",
+                    data,
+                }));
             }
             Err(error) => return Err(ServiceError::Engine(error)),
         };
@@ -12751,6 +12818,115 @@ mod tests {
             "an unknown link outcome must never be retried automatically"
         );
         assert_ne!(api.code, "UPSTREAM_TIMEOUT");
+    }
+
+    /// M3.3 + QR B1: the per-engine account ceiling refuses `finishLink` before
+    /// the engine is touched. The refusal must clear the finish lane it took —
+    /// a leaked lane answers every later finish with LINK_IN_PROGRESS and keeps
+    /// the watchdog suppressed for good — and drop the spent session: a QR that
+    /// can never commit must not keep `has_pending_link` true for its TTL.
+    #[tokio::test]
+    async fn a_ceiling_refused_finish_clears_its_lane_and_spends_the_session() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(test_store(temp.path()));
+        for index in 0..super::MAX_ACCOUNTS_PER_ENGINE {
+            store
+                .upsert_account_from_signal(
+                    &format!("+1555555{index:04}"),
+                    Some(1),
+                    DEFAULT_PROXY_GROUP_ID,
+                )
+                .unwrap();
+        }
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            EngineConfig::new(
+                temp.path().join("unused-engine"),
+                temp.path().join("unused-signal-data"),
+            ),
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        let link_session_id = supervisor
+            .service
+            .lock()
+            .await
+            .plant_link_session_for_test("KT-Ceiling", crate::link::LINK_SESSION_TTL);
+        assert!(supervisor.has_pending_link().await);
+
+        let refused = match supervisor.finish_link(link_session_id.clone()).await {
+            Err(crate::service::ServiceError::Api(error)) => error,
+            other => panic!("a full group must refuse the finish, got {other:?}"),
+        };
+        assert_eq!(refused.code, "ACCOUNT_LIMIT_REACHED");
+        assert!(
+            !supervisor.link_flow_active().await,
+            "a refused finish must leave neither its lane nor a pending session behind"
+        );
+        assert!(
+            !supervisor.has_pending_link().await,
+            "the spent QR must not keep the watchdog suppressed"
+        );
+
+        // The next finish reaches the session judgment instead of a leaked
+        // lane, and the session answers for its (spent) state.
+        let again = match supervisor.finish_link(link_session_id).await {
+            Err(crate::service::ServiceError::Api(error)) => error,
+            other => panic!("a spent session must answer a definite code, got {other:?}"),
+        };
+        assert_eq!(again.code, "LINK_NOT_FOUND");
+        assert_ne!(again.code, "LINK_IN_PROGRESS");
+        assert!(!supervisor.link_flow_active().await);
+    }
+
+    /// QR B1: session state outranks engine liveness. A lost session's finish
+    /// must still answer the definite LINK_LOST when the engine is terminal or
+    /// missing — RUNTIME_NOT_RUNNING would report the runtime instead of the
+    /// dead QR, and the desktop would not restart the link.
+    #[tokio::test]
+    async fn a_lost_session_finish_answers_link_lost_without_a_running_engine() {
+        let temp = TempDir::new().unwrap();
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            EngineConfig::new(
+                temp.path().join("unused-engine"),
+                temp.path().join("unused-signal-data"),
+            ),
+            Arc::new(test_store(temp.path())),
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        // No start(): the slot holds no engine at all, so running_engine()
+        // answers NotRunning.
+        let link_session_id = supervisor
+            .service
+            .lock()
+            .await
+            .plant_link_session_for_test("KT-Lost", crate::link::LINK_SESSION_TTL);
+        assert!(
+            supervisor
+                .service
+                .lock()
+                .await
+                .mark_link_lost(&link_session_id)
+        );
+
+        for attempt in 0..2 {
+            let error = match supervisor.finish_link(link_session_id.clone()).await {
+                Err(crate::service::ServiceError::Api(error)) => error,
+                other => {
+                    panic!("attempt {attempt}: a lost session must answer LINK_LOST, got {other:?}")
+                }
+            };
+            assert_eq!(error.code, "LINK_LOST", "attempt {attempt}");
+            assert!(
+                error.retryable,
+                "the remedy is a fresh link.start, so LINK_LOST stays retryable"
+            );
+        }
+        assert!(
+            !supervisor.link_flow_active().await,
+            "each refusal clears the lane it took"
+        );
     }
 
     #[test]

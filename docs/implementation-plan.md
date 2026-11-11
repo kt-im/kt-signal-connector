@@ -20838,3 +20838,70 @@ unknown 臂消费（与崩溃臂一致），既防止盲目 re-finish，也让�
 
 **桌面**：`LINK_OUTCOME_UNKNOWN` 走 adopt（`accounts.list` 后对账），绝不自动重跑
 `finishLink`；文案不再说"重试扫描"。本仓不拥有桌面 UI，另报。
+
+## §4.270 QR B1 link-lost state（契约 1.285 同版修订 · wire 增 `LINK_LOST`）
+
+**背景（issue #951 B1）**：engine 的 provisioning 通道在 URL 交付后关闭/超时/流结束，
+QR 必死。旧行为把该终局吞成 `-32603`，connector 只能报泛化 `UPSTREAM_ERROR`，
+桌面无法区分"码死了"与"引擎内部错误"；同时 connector 的 `ActiveLinkSession`
+仍把死会话当 pending，导致 `link.start` 答 `LINK_IN_PROGRESS`、watchdog 被死会话
+永久抑制。
+
+**实现（connector 半边）**：
+- `src/link.rs`：`ActiveLinkSession` 增加 `state`（`Pending` / `Lost`）与
+  `lost_at`（首次观察到 lost 的 epoch ms）。`mark_lost` 幂等，并 zeroize 已死的
+  QR URI；会话本身保留在表里供路由归因。
+- `src/engine.rs`：结构化错误码 allowlist 增加 `LINK_LOST`（engine 以
+  `-1 + LINK_LOST` 应答，不是 `-32603`）。
+- `src/service.rs`：`UpstreamCode::LINK_LOST` 映射为宿主 `LINK_LOST`
+  （`retryable=true`：补救是重新 `link.start`，不是对死会话盲重试 finish）；
+  `begin_link` / `ensure_link_available` 对自身 lost 直接放行；
+  `has_pending_link` 对 lost 返回 false（watchdog 不再被死会话抑制）；
+  `require_active_link` 对 lost 答 `LINK_LOST`；`has_link_session` 仍为 true
+  （router 仍能按 id 找到 lost 会话，finish/cancel 得到确定答案而非
+  `LINK_NOT_FOUND`）。
+- `src/supervisor.rs`：`finish_link` 收到 engine `LINK_LOST` 时先清
+  `active_link_finish`（既有 `clear_link_finish` 顺序），再把 service session
+  标 lost 并保留，最后返回 `LINK_LOST`。
+- `src/registry.rs`：池化 `session_owner` 路由同口径——除 pool 映射外还要求
+  所属 slot 的 service `has_link_session` 为真（lost 亦然），stale 映射不路由。
+
+**测试**：`link_lost_is_definite_and_frees_the_next_link_start`（fake engine
+`KT_FAKE_FINISH_LINK_LOST=1` → finish 得 `LINK_LOST`/true、重复 finish 仍
+`LINK_LOST`、新 `link.start` 不被 `LINK_IN_PROGRESS` 挡）；service
+`lost_link_session_is_addressable_but_never_blocks_a_fresh_link`
+（`has_pending_link=false`、`require_active_link` 答 `LINK_LOST`、begin 放行）；
+registry lost 路由（expired 同测）；pool lost session_owner 归属；engine
+结构化分类与 service 映射 totality/retryable。
+
+## §4.271 finish 派发前的拒绝阶梯（无 wire 变更 · 契约 1.285 同版）
+
+**背景（QR B1 审计两项必须项）**：§4.270 让 lost 会话保持可寻址以后，`finish_link`
+里两个既有顺序问题才成为可观测的错答——(a) M3.3 的 `group_at_account_ceiling(...)?`
+在 `active_link_finish` 置位之后用 `?` 提前返回，lane 没清，该组此后每次 finish 都答
+`LINK_IN_PROGRESS`、watchdog 永久被 `link_flow_active` 抑制；(b) `running_engine()`
+排在会话判定之前，引擎 terminal/缺失时 lost 会话的 finish 答 `RUNTIME_NOT_RUNNING`
+而不是 `LINK_LOST`，桌面看不出码已死。
+
+**实现（`src/supervisor.rs` `finish_link`）**：派发前的顺序固定为
+① 取 `active_link_finish` lane（并发 finish 仍答 `LINK_IN_PROGRESS`）→
+② `peek_link_for_finish`（会话判定：`LINK_LOST` / `LINK_EXPIRED` /
+`LINK_NOT_FOUND`，优先于任何运行时状态）→ ③ 每组账户上限
+（`group_at_account_ceiling`）→ ④ `running_engine()`（`RUNTIME_NOT_RUNNING`）→
+⑤ `pin_link_for_finish`（只在所有拒绝都过去之后才延长 QR 寿命，拒绝不再拉长死码的
+deadline）→ ⑥ 派发 `finishLink`。
+
+纪律：**②③④⑤ 的每一条拒绝分支都先 `clear_link_finish` 再返回**（与既有 peek/pin
+臂一致）；②的错误、③的 store 错误、④的引擎错误都不得留下 lane。③命中上限时，
+除清 lane 外还 `discard_link_session` 丢弃这张被判死的 QR：它在该组腾出名额前永不
+可提交，留着只会让 `has_pending_link` 为真整个 TTL（watchdog 继续被抑制），并让下一次
+`link.start` 答 `LINK_IN_PROGRESS`；丢弃后 `has_pending_link=false`、下一次
+`link.start` 立即铸新码，重复 finish 得确定的 `LINK_NOT_FOUND`（而不是
+`LINK_IN_PROGRESS`）。
+
+**测试**：`a_ceiling_refused_finish_clears_its_lane_and_spends_the_session`
+（8 账户上限 → finish 得 `ACCOUNT_LIMIT_REACHED`、`link_flow_active=false`、
+`has_pending_link=false`、再次 finish 得 `LINK_NOT_FOUND` 而非
+`LINK_IN_PROGRESS`）；`a_lost_session_finish_answers_link_lost_without_a_running_engine`
+（无引擎的 slot 上 lost 会话连测两次均答 `LINK_LOST`/`retryable=true`，第二次证明
+lane 已清）。
