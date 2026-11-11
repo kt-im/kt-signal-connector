@@ -111,6 +111,19 @@ const MAX_SCHEMA_NEWER_BYTES: u64 = 8 * 1024;
 /// never replaying last week's rows.
 const RECEIPT_RECENCY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
+/// 契约 1.287（§4.273）：link.finish 提交回执（`link_commits`）的保留窗。
+/// replay 要覆盖的只是一次 link attempt 的生命周期——引擎的扫码 attempt TTL 是
+/// 5 分钟量级，进程重启 / 桌面重连 / 用户在同一个码上再点一次「完成」都落在
+/// 这个量级里。7 天是安全余量：桌面离线一夜、跨时区时钟漂移、连点多次之后重放
+/// 同一个 linkSessionId 仍然回同一个账号，而不是又去问一次手机；再往前的行只
+/// 可能是被遗弃的 attempt，留着只是无界增长。
+pub const LINK_COMMIT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+/// 回执行的表上限（契约 1.287，§4.273）：一次 link attempt 一行，真实并发远
+/// 小于这个数。1000 是给「committed_at 被写坏 / 系统时钟回拨」这类时间戳不可信
+/// 情况的硬兜底——不管时间怎么跳，这张表都有界。本次刚写入的那一行永远不参与
+/// 淘汰，并且它**算在这 1000 行里**：表的总行数上限恰好是 1000，不是 1001。
+pub const LINK_COMMIT_MAX_ROWS: i64 = 1_000;
+
 /// 契约 1.283（§4.267）：事件账本的头部保留窗。三条上限任一触发就从头裁剪：
 /// 7 天、20000 行、64 MiB（按 EVENT_ROW_BYTES_SQL 的行成本估算）。7 天对齐
 /// 桌面「离线一周回来仍能靠事件补齐」的重连预期；20000 行是一条事件流的有界
@@ -3787,13 +3800,26 @@ impl Store {
     /// Persist the link.finish transaction receipt (contract 1.276, §4.260).
     /// A repeated finish with the same linkSessionId returns the committed
     /// account instead of asking the phone again or minting a second binding.
+    ///
+    /// 契约 1.287（§4.273）：回执行和它的保留清扫走**同一个事务**——插入成功就
+    /// 一定带着一次裁剪落库，所以「只增不减」在结构上不再可能。裁剪永远排除本
+    /// 次写入的 linkSessionId（见 `prune_link_commits`），replay 查询面因此逐字节
+    /// 不变：同一个 id 仍然回同一个账号。
     pub fn record_link_commit(
         &self,
         link_session_id: &str,
         account_id: &str,
         aci: Option<&str>,
     ) -> Result<(), StoreError> {
-        self.lock_conn()?
+        // One transaction for the row and its sweep: a crash between the two
+        // would leave an expired receipt behind, and a replay landing in that
+        // window would read a table the policy already considered stale.
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let committed_at = now_ms() as i64;
+        transaction
             .execute(
                 "INSERT INTO link_commits(link_session_id, account_id, aci, committed_at)
                  VALUES(?1, ?2, ?3, ?4)
@@ -3801,8 +3827,12 @@ impl Store {
                    account_id=excluded.account_id,
                    aci=excluded.aci,
                    committed_at=excluded.committed_at",
-                params![link_session_id, account_id, aci, now_ms() as i64],
+                params![link_session_id, account_id, aci, committed_at],
             )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        prune_link_commits(&transaction, link_session_id, committed_at)?;
+        transaction
+            .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(())
     }
@@ -14739,6 +14769,56 @@ fn prune_account_delete_receipts(
                LIMIT ?1
              )",
             params![MAX_ACCOUNT_DELETE_RECEIPTS],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(())
+}
+
+/// 契约 1.287（§4.273）：`link_commits` 的保留策略，永远在插入它的那个事务里
+/// 跑（`record_link_commit`）。两条规则，缺一不可：
+///
+/// 1. **过期**：`committed_at` 早于「本次写入时刻 − `LINK_COMMIT_RETENTION_MS`」
+///    的行一律走。replay 只覆盖一次 attempt 的生命周期，7 天是安全余量。
+/// 2. **行数兜底**：超出 `LINK_COMMIT_MAX_ROWS` 的最旧行走。只靠时间会漏掉时钟
+///    回拨 / 时间戳写坏——那时所有行都「看起来还在窗内」，表就重新变成无界。
+///
+/// `keep_session` 是本事务刚写入（或刚被重复 finish 刷新）的 linkSessionId，两条
+/// 规则都显式排除它：这一行的去留不能由别人的时间戳决定。这也是「同毫秒写入的
+/// 一批行里 rowid 更小的那一行」不会被行数规则淘汰的原因——刚确认的 attempt 必须
+/// 还能 replay 回它自己的账号。行数规则为它留出位置（其余行只保留
+/// `LINK_COMMIT_MAX_ROWS - 1` 行），所以清扫后表**恰好**是 1000 行，哪怕刚写的那
+/// 一行是整张表里最旧的。
+///
+/// 表本身被上限压在千行量级，两条 DELETE 都是这张小表的有界扫描；不为
+/// `committed_at` 加索引——那会把一次 link 换来的收益再交还给写放大。
+fn prune_link_commits(
+    transaction: &rusqlite::Transaction<'_>,
+    keep_session: &str,
+    committed_at: i64,
+) -> Result<(), StoreError> {
+    let expired_before = committed_at.saturating_sub(LINK_COMMIT_RETENTION_MS);
+    transaction
+        .execute(
+            "DELETE FROM link_commits
+              WHERE link_session_id <> ?2 AND committed_at < ?1",
+            params![expired_before, keep_session],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    transaction
+        .execute(
+            // 行数规则：本次写入的那一行不参与这次排名，其余行按
+            // (committed_at, rowid) 倒序取前 `LINK_COMMIT_MAX_ROWS - 1` 行留下
+            // ——加上刚写的那一行正好是 1000，不是 1001。同一毫秒里的并列由
+            // rowid 定序，结果确定。
+            "DELETE FROM link_commits
+              WHERE link_session_id <> ?2
+                AND link_session_id NOT IN (
+                  SELECT link_session_id FROM link_commits
+                   WHERE link_session_id <> ?2
+                   ORDER BY committed_at DESC, rowid DESC
+                   LIMIT ?1
+                )",
+            params![LINK_COMMIT_MAX_ROWS - 1, keep_session],
         )
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
     Ok(())
@@ -37727,5 +37807,274 @@ mod tests {
         let again = Store::open(&state_dir, Some(test_store_key())).unwrap();
         assert_eq!(again.health().snapshots.count, 0);
         assert!(!state_dir.join(SNAPSHOT_DIR).exists());
+    }
+
+    /// 契约 1.287（§4.273）：回执行的保留清扫。`record_link_commit` 永远盖真实
+    /// 时钟，测试没法等 7 天，所以直接改写 committed_at——那正是过期规则读的那一列。
+    fn backdate_link_commit(store: &Store, link_session_id: &str, committed_at: i64) {
+        let updated = store
+            .conn()
+            .execute(
+                "UPDATE link_commits SET committed_at=?2 WHERE link_session_id=?1",
+                params![link_session_id, committed_at],
+            )
+            .unwrap();
+        assert_eq!(updated, 1, "the row has to exist before it can be aged");
+    }
+
+    fn stored_link_sessions(store: &Store) -> Vec<String> {
+        let conn = store.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT link_session_id FROM link_commits ORDER BY committed_at, link_session_id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn count_link_commits(store: &Store) -> i64 {
+        store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM link_commits", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// 契约 1.287（§4.273）：过期的提交回执在下一次插入的同一个事务里离开，
+    /// 保留期内的行原样留下——「只增不减」的前提正是这条清扫。
+    #[test]
+    fn link_commit_sweep_drops_rows_past_the_retention_window() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let now = crate::link::now_ms() as i64;
+        let day = 24 * 60 * 60 * 1_000;
+        store
+            .record_link_commit("attempt-stale", "acct-stale", Some("aci-stale"))
+            .unwrap();
+        store
+            .record_link_commit("attempt-live", "acct-live", None)
+            .unwrap();
+        backdate_link_commit(&store, "attempt-stale", now - 30 * day);
+
+        // No separate sweep pass: the insert carries it.
+        store
+            .record_link_commit("attempt-new", "acct-new", None)
+            .unwrap();
+
+        assert_eq!(
+            stored_link_sessions(&store),
+            vec!["attempt-live".to_string(), "attempt-new".to_string()],
+            "the abandoned receipt is gone and the live ones stay"
+        );
+        assert_eq!(store.link_commit("attempt-stale").unwrap(), None);
+        assert_eq!(
+            store.link_commit("attempt-live").unwrap(),
+            Some(("acct-live".to_string(), None))
+        );
+    }
+
+    /// 契约 1.287（§4.273）：保留窗的两条边都是确定的——`committed_at` 正好等于
+    /// 截止时刻的行留下，早一毫秒的走。同时钉住「不删刚插入的行」：本次写入的
+    /// linkSessionId 即使时间戳最旧（时钟被回拨的极端情形）也不参与淘汰。
+    #[test]
+    fn link_commit_sweep_keeps_the_window_edge_and_never_drops_the_row_it_wrote() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000_i64;
+        let hour = 60 * 60 * 1_000_i64;
+        let seeded = [
+            ("attempt-edge", "acct-edge", LINK_COMMIT_RETENTION_MS),
+            ("attempt-past", "acct-past", LINK_COMMIT_RETENTION_MS + 1),
+            ("attempt-hour", "acct-hour", hour),
+            ("attempt-writing", "acct-writing", 30 * 24 * hour),
+        ];
+        // Insert first, age afterwards: the insert path sweeps with the real
+        // clock, so a row backdated before the next insert is already stale.
+        for (session, account, _) in seeded {
+            store.record_link_commit(session, account, None).unwrap();
+        }
+        for (session, _, age) in seeded {
+            backdate_link_commit(&store, session, now - age);
+        }
+
+        // A fixed clock keeps the boundary deterministic; the insert path passes
+        // the very same pair (its own id, its own stamp) in production.
+        {
+            let conn = store.conn();
+            let transaction = conn.unchecked_transaction().unwrap();
+            prune_link_commits(&transaction, "attempt-writing", now).unwrap();
+            transaction.commit().unwrap();
+        }
+
+        assert_eq!(
+            stored_link_sessions(&store),
+            vec![
+                "attempt-writing".to_string(),
+                "attempt-edge".to_string(),
+                "attempt-hour".to_string(),
+            ],
+            "one millisecond past the window leaves, the edge and everything newer stay,
+             and the row this call wrote survives its own sweep"
+        );
+        assert_eq!(
+            store.link_commit("attempt-writing").unwrap(),
+            Some(("acct-writing".to_string(), None))
+        );
+    }
+
+    /// 契约 1.287（§4.273）：时间戳不可信时（时钟回拨、committed_at 被写坏），
+    /// 行数上限是第二道闸——保留最近 1000 行，超出部分按最旧先走。
+    #[test]
+    fn link_commit_sweep_caps_the_table_at_the_newest_rows() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let now = crate::link::now_ms() as i64;
+        // Every seeded row sits inside the retention window, so only the row cap
+        // can act on it. One batch, not a thousand commits.
+        let seeded = LINK_COMMIT_MAX_ROWS + 5;
+        {
+            let conn = store.conn();
+            let transaction = conn.unchecked_transaction().unwrap();
+            for index in 0..seeded {
+                transaction
+                    .execute(
+                        "INSERT INTO link_commits(link_session_id, account_id, aci, committed_at)
+                         VALUES(?1, 'acct-seeded', NULL, ?2)",
+                        params![format!("seeded-{index:04}"), now - 10_000 + index],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        assert_eq!(count_link_commits(&store), seeded);
+
+        // The fresh commit is the newest row: it survives, the six oldest
+        // seeded receipts leave to make room.
+        store
+            .record_link_commit("attempt-fresh", "acct-fresh", None)
+            .unwrap();
+
+        assert_eq!(count_link_commits(&store), LINK_COMMIT_MAX_ROWS);
+        assert_eq!(store.link_commit("seeded-0000").unwrap(), None);
+        assert_eq!(store.link_commit("seeded-0005").unwrap(), None);
+        assert_eq!(
+            store.link_commit("seeded-0006").unwrap(),
+            Some(("acct-seeded".to_string(), None)),
+            "the cap evicts the oldest rows, not an arbitrary window"
+        );
+        assert_eq!(
+            store
+                .link_commit(&format!("seeded-{:04}", seeded - 1))
+                .unwrap(),
+            Some(("acct-seeded".to_string(), None)),
+            "the newest seeded receipt stays"
+        );
+        assert_eq!(
+            store.link_commit("attempt-fresh").unwrap(),
+            Some(("acct-fresh".to_string(), None))
+        );
+        let sessions = stored_link_sessions(&store);
+        assert_eq!(sessions.first().map(String::as_str), Some("seeded-0006"));
+        assert_eq!(sessions.last().map(String::as_str), Some("attempt-fresh"));
+
+        // The cap is 1000 rows *including* the row just written, so the aged keep
+        // row cannot push the table to 1001: it takes one of the 1000 slots, and
+        // the six oldest others leave instead.
+        let day = 24 * 60 * 60 * 1_000;
+        {
+            let conn = store.conn();
+            let transaction = conn.unchecked_transaction().unwrap();
+            for index in 0..5 {
+                transaction
+                    .execute(
+                        "INSERT INTO link_commits(link_session_id, account_id, aci, committed_at)
+                         VALUES(?1, 'acct-seeded', NULL, ?2)",
+                        params![format!("cap-extra-{index}"), now - 20_000 - index],
+                    )
+                    .unwrap();
+            }
+            // The row this sweep is about to write, aged past every other row.
+            transaction
+                .execute(
+                    "INSERT INTO link_commits(link_session_id, account_id, aci, committed_at)
+                     VALUES('attempt-aged', 'acct-aged', NULL, ?1)",
+                    params![now - 30 * day],
+                )
+                .unwrap();
+            // Counted through the held transaction: `count_link_commits` takes the
+            // store mutex this block already owns.
+            let over_cap: i64 = transaction
+                .query_row("SELECT COUNT(*) FROM link_commits", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                over_cap,
+                LINK_COMMIT_MAX_ROWS + 6,
+                "six rows over the cap: five inside the window plus the aged row this sweep wrote and protects"
+            );
+            prune_link_commits(&transaction, "attempt-aged", now).unwrap();
+            transaction.commit().unwrap();
+        }
+
+        assert_eq!(
+            count_link_commits(&store),
+            LINK_COMMIT_MAX_ROWS,
+            "the table lands on exactly 1000 rows, not 1001"
+        );
+        assert_eq!(
+            store.link_commit("attempt-aged").unwrap(),
+            Some(("acct-aged".to_string(), None)),
+            "the oldest row survives because it is the one this sweep wrote"
+        );
+        for index in 0..5 {
+            assert_eq!(
+                store.link_commit(&format!("cap-extra-{index}")).unwrap(),
+                None,
+                "the overflow leaves oldest first"
+            );
+        }
+        assert_eq!(store.link_commit("seeded-0006").unwrap(), None);
+        assert_eq!(
+            store.link_commit("seeded-0007").unwrap(),
+            Some(("acct-seeded".to_string(), None))
+        );
+    }
+
+    /// 契约 1.287（§4.273）：清扫不改变 replay 语义。重复 finish 刷新同一行而不是
+    /// 再记一条，所以一次成功的提交永远不会被自己的保留策略追平；同 linkSessionId
+    /// 仍回同账号，被扫走的只是别人的旧行。
+    #[test]
+    fn link_commit_replay_still_resolves_the_same_account_after_the_sweep() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let now = crate::link::now_ms() as i64;
+        let day = 24 * 60 * 60 * 1_000;
+        store
+            .record_link_commit("attempt-a", "acct-a", Some("aci-a"))
+            .unwrap();
+        for index in 0..16 {
+            let noise = format!("attempt-noise-{index}");
+            store
+                .record_link_commit(&noise, "acct-noise", None)
+                .unwrap();
+            backdate_link_commit(&store, &noise, now - 30 * day);
+        }
+        // The repeated finish: same id, same account, still one row.
+        store
+            .record_link_commit("attempt-a", "acct-a", Some("aci-a"))
+            .unwrap();
+
+        assert_eq!(
+            store.link_commit("attempt-a").unwrap(),
+            Some(("acct-a".to_string(), Some("aci-a".to_string()))),
+            "the replay face answers the committed account unchanged"
+        );
+        assert_eq!(
+            count_link_commits(&store),
+            1,
+            "the expired noise is gone and the replayed commit is still a single row"
+        );
+        assert_eq!(store.link_commit("attempt-noise-0").unwrap(), None);
     }
 }

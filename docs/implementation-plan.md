@@ -56,6 +56,14 @@
   内任一槽，提交 attempt 级单飞（成功后 retire 其余槽，任一码 replay 同一账号）。
   wire 增 `NOT_SUPPORTED`（引擎无 rotate 面）与 `LINK_ATTEMPT_NOT_FOUND`。没有
   rotate 时行为与单槽旧端逐字节相同；旧宿主忽略三个新成员即可。)
+- Contract revision: 1.287 (2026-11-11; §4.273 link 提交回执的保留策略：`link_commits`
+  不再只增不减——`record_link_commit` 在插入的**同一个事务**里按两条规则裁剪：
+  `committed_at` 早于「写入时刻 − 7 天」的行，以及超出 1000 行上限的最旧行；
+  本次写入（或被重复 finish 刷新）的 `linkSessionId` 两条规则都排除，所以表在任何
+  时刻都 ≤ 1000 行（含刚写的那一行），刚确认的回执一定还在。replay 语义逐字节不变
+  （同 `linkSessionId` 仍回同账号）；被裁掉的只是早已不在内存 attempt 表里、本来
+  也只能答 `LINK_NOT_FOUND` 的遗弃 attempt。无 wire 变更，
+  `ENGINE_CONTRACT_MAX_REVISION` 保持 1.286。)
 - Contract revision: 1.283 (2026-11-10; §4.267 thin event ledger: the
   `event_log` table loses its `payload` column and becomes a five-column
   change ledger (seq/epoch/account_id/type/created_at) in schema v50 — a row
@@ -20416,6 +20424,8 @@ live 只信权威 origin；schema additive 序列化。全量 lib 892 绿（含 
   命中就直接返回同一 account summary，不再消费 session、不再打上游。
 - 成功提交后写 journal；写失败只 warn，不把已经真实成功的 finish 变成失败。
 - 不自动删除任何账号/绑定；journal 只做 replay 证据。
+- 契约 1.287（§4.273）给这张表加了保留窗：插入的同一事务里裁掉过期行与超出 1000 行的
+  最旧行，replay 语义与查询面不变。
 
 **测试**：同 `linkSessionId` 连续两次 finish 返回同一 account id，账号行仍为 1；
 全量 lib 891 绿。
@@ -20999,3 +21009,40 @@ committed（`link.rotate` 答 `INVALID_REQUEST`）、槽 0/1/2 三码都 replay 
 `tests/per_account_pool.rs`
 （池化 attempt 在原引擎槽上 rotate，不新增 account/engine，rotated 槽经池路由完成提交）。
 
+## §4.273 link 提交回执的保留策略（契约 1.287 · 无 wire 变更）
+
+**问题**：§4.260 的 `link_commits` 只增不减。一次 link attempt 写一行（双槽时每个槽
+一行，§4.272），换号、重装、每次被放弃的扫码都会留下新行；这张表没有任何删除路径，
+多年以后既是无界增长，也让「replay 证据」这个定位失真——真正需要 replay 的只是刚刚
+发生的那一次 finish。
+
+**实现（`src/store.rs`）**：
+- 两个常量，都是产品决定：`LINK_COMMIT_RETENTION_MS` = 7 天、
+  `LINK_COMMIT_MAX_ROWS` = 1000。replay 需要覆盖的只是一次 attempt 的生命周期
+  ——引擎的扫码 attempt TTL 是 5 分钟量级，进程重启 / 桌面重连 / 用户在同一个码上再点
+  一次「完成」都落在这个量级里；7 天是安全余量（桌面离线一夜、跨时区时钟漂移之后，
+  重放同一个 `linkSessionId` 仍回同一个账号）。1000 行是给「时间戳不可信」的硬兜底：
+  只按时间裁剪时，时钟回拨或被写坏的 `committed_at` 会让行永远「看起来还在窗内」，
+  表重新变成无界。
+- `record_link_commit` 把插入与裁剪放进**同一个事务**：INSERT（`ON CONFLICT` 刷新
+  同一行）→ 过期删除（`committed_at` < 写入时刻 − 保留期）→ 行数兜底（本次写入的行
+  不参与排名，其余行按 `(committed_at, rowid)` 倒序保留 `LINK_COMMIT_MAX_ROWS - 1`
+  行，最旧的删）。所以表在任何时刻都 ≤ 1000 行（**含**刚写的那一行），且刚写入的回执
+  永远不会被自己的清扫删掉——即使它的时间戳是整张表里最旧的。
+- 两条 DELETE 都是这张千行小表内的有界扫描；**不**给 `committed_at` 加索引：那会把
+  一次 link 换来的收益再交还给写放大。
+- replay 查询面（`link_commit`）逐字节不变：同 `linkSessionId` 仍回同账号；重复
+  finish 刷新同一行而不是再记一条，所以一次成功的提交不会被自己的保留策略追平。被裁掉
+  的只是早已不在内存 attempt 表里、本来也只能答 `LINK_NOT_FOUND` 的遗弃 attempt。
+- 无 wire 变更：`link_commits` 的列与 `link_commit` 的查询都不变，
+  `ENGINE_CONTRACT_MAX_REVISION` 保持 1.286。
+
+**测试（`src/store.rs`）**：`link_commit_sweep_drops_rows_past_the_retention_window`
+（过期行在下一次插入的同一事务里离开，窗内行留下）、
+`link_commit_sweep_keeps_the_window_edge_and_never_drops_the_row_it_wrote`
+（`committed_at` 正好等于截止时刻的行留下、早 1 ms 的走；本次写入的 id 即使时间戳
+最旧也不参与淘汰）、`link_commit_sweep_caps_the_table_at_the_newest_rows`（窗内
+1005 行时插入后恰好 1000 行，最旧的 6 行离开，边界行 / 最新行 / 刚写入行都在；再把
+刚写入的那一行调到比所有人都旧，清扫后仍是恰好 1000 行而不是 1001）、
+`link_commit_replay_still_resolves_the_same_account_after_the_sweep`（重复 finish
+刷新同一行，过期噪声被清空后同 id 仍回同账号）。
