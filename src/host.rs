@@ -4569,6 +4569,15 @@ fn map_start_failure(failure: StartFailure) -> ApiError {
             data: Some(json!({ "storeMigrationCode": code })),
             ..ApiError::new("STORE_MIGRATION_BLOCKED", message, false)
         },
+        // Contract 1.275: every pooled slot is parked because the account
+        // holder unlinked the device. Terminal by construction - no retry can
+        // revive a revoked credential - and the same code/sentence the
+        // mutating gate already answers for this state.
+        StartFailure::AccountUnlinked => ApiError::new(
+            "ACCOUNT_UNLINKED",
+            "device was unlinked by the account holder",
+            false,
+        ),
         // O1: the structured fatal. `retryable: false` is the class's own
         // assertion (the supervisor latched the fault); the three facts the
         // launcher needs to repair ride `data`, mirrored by the byte-stable

@@ -260,6 +260,11 @@ pub enum StartFailure {
     /// fault is latched on the supervisor and the same binary answers the same
     /// revision on every restart.
     ContractMismatch(crate::engine_contract::EngineContractFault),
+    /// Contract 1.275: every pooled slot is parked in the terminal
+    /// `device_unlinked` state. No retry can revive a dead credential, so the
+    /// answer is the terminal ACCOUNT_UNLINKED face, never a retryable start
+    /// failure that would invite one more doomed spawn.
+    AccountUnlinked,
 }
 
 /// Why `runtime.stop` failed.
@@ -1033,6 +1038,12 @@ impl ProxyGroupRuntime {
             // desktop still gets an honest stopped aggregate); only a pool
             // whose slots all failed answers RUNTIME_START_FAILED.
             if !any_running && !pool.is_empty() {
+                // Contract 1.275: a pool whose every account was unlinked by
+                // the holder has a terminal answer of its own. Retrying the same
+                // runtime.start cannot heal a dead credential.
+                if pool.every_slot_device_unlinked() {
+                    return Err(StartFailure::AccountUnlinked);
+                }
                 // A terminal store refusal is not a retryable start failure: it
                 // already names the account-level reason a human has to act on.
                 if let Some(block) = start_block {
@@ -1345,6 +1356,13 @@ impl ProxyGroupRuntime {
         }
         let _admission = pool.lock_admission().await;
         let account = pool.provision_slot(&group_id)?;
+        // Contract 1.275: a fresh link is the one human intent that may replace
+        // a terminal `device_unlinked` verdict, so the slot's latch is cleared
+        // before its QR engine is woken. Without this a re-link could only ever
+        // answer ACCOUNT_UNLINKED and the account would stay unrecoverable. The
+        // store row keeps its terminal state until link.finish commits the new
+        // device (contract 1.275 owns that write).
+        account.supervisor().clear_device_unlinked();
         self.spawn_account_forwarders(&account);
         self.ensure_history_retention(account.supervisor());
         // Start the account's engine before the QR mint (a fresh slot has no
@@ -1504,6 +1522,10 @@ impl ProxyGroupRuntime {
                 let summary = slot.supervisor().finish_link(link_session_id.clone()).await;
                 match summary {
                     Ok(summary) if summary.id == slot.account_id() => {
+                        // Contract 1.275: the commit cleared the store's
+                        // terminal state, so the slot's own latch follows - a
+                        // device that just re-linked may serve again.
+                        slot.supervisor().clear_device_unlinked();
                         if let Some(pool) = &self.pool {
                             pool.mark_provisioned(&slot);
                             pool.forget_session(&link_session_id);
@@ -1810,10 +1832,22 @@ impl ProxyGroupRuntime {
                     // local data and link it again"), so the delete takes the
                     // engine-free path instead of being vetoed by a gate that
                     // is about serving traffic.
-                    Err(refusal) if refusal.is_migration_gate() => {
+                    //
+                    // Contract 1.275: the same rule covers the terminal
+                    // `device_unlinked` slot. Its engine is stopped and its
+                    // credential is dead, so an engine would only answer 401 -
+                    // and the delete is exactly the remedy its own state names.
+                    // Refusing it here would make the account undeletable and
+                    // therefore unlinkable forever (the permanent-hang shape).
+                    Err(refusal) if refusal.permits_engine_free_flow() => {
                         tracing::warn!(
                             account = %crate::pool::account_fingerprint(&account_id),
-                            "the store migration refuses this slot an engine; deleting the local data without one"
+                            reason = if refusal.is_migration_gate() {
+                                "storeMigration"
+                            } else {
+                                "deviceUnlinked"
+                            },
+                            "this slot cannot be served by an engine; deleting the local data without one"
                         );
                         return self
                             .delete_account_without_engine(&account_id, operation_id)
@@ -4375,6 +4409,7 @@ mod tests {
             resident: true,
             restarts: 0,
             store_migration: None,
+            needs_relink: false,
         }
     }
 

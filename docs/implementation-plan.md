@@ -21607,3 +21607,84 @@ src/store_preflight.rs 单测。
 - legacy 组引擎拓扑仍不迁移（没有账号级 key）：skipped → CAPABILITY_MISSING，起引擎照旧。
 - 迁移在飞时来一次 delete：wake_slot_waiting 会等这一趟；等不到仍是 SlotWakeRefusal::MigrationGate，
   delete 走 §4.276 的纯 store 出口，两条路共用同一份 receipt。
+
+## §4.278 device_unlinked 终态：停槽、needs-relink 与闸下沉（契约 1.292 · wire 增 engines[].needsRelink）
+
+§4.259（契约 1.275）确立了「账号状态权威」：401 → accountUnbound → connector 把该号写
+`device_unlinked`、发 `account.changed`，并让后续 mutating 调用在 host 闸口直接答
+ACCOUNT_UNLINKED。**但状态写完之后没有任何人处置槽**：engine 进程照常常驻，槽仍然 resident，
+bindings 仍然 active；watchdog 看到 engine 的 `listAccounts` 不再列这个号，就把它塞进
+`engine_absent` 并从心跳候选里**静默排除**——于是「引擎进程 + 槽」永久挂着，直到进程重启。
+冷启动那条路同样漏：`ensure_resident` / `runtime.start` 只问 store-migration 闸，会为一个已经死掉的
+凭据再拉起一个只可能回 401 的引擎。
+
+本节把终态处理落到**槽**这一层，五处一起收：
+
+### 1) AccountUnauthorized 分支：标记成功后按终态处置槽（停进程 + needs-relink）
+
+- `RuntimeSupervisor` 新增账号级终态锁存 `device_unlinked`（仅 per-account 槽；legacy 组引擎
+  一个进程服务整组账号，为一个死凭据停掉它会连带打死健康账号，故 legacy 永不锁存）。
+- 池子为每个槽起一个 `spawn_device_unlink_guard`：它只消费**写入成功之后**才发出的
+  `account.changed`（link 窗口里被推迟的写入不发事件，因此不会被误停），命中
+  `state == "device_unlinked"` 且 `id == slot.accountId` 时：先停 watchdog 重启车道，再
+  `retire_device_unlinked()` —— 锁存 + `shutdown_within(None)` 停进程，槽留在注册表里等 re-link。
+- 幂等：`retire_device_unlinked` 无引擎时 shutdown 是 no-op，第二条路径（watchdog 自己的观察、
+  唤醒路径的发现）落到同一不变量：**没有引擎能活过死凭据**。
+
+### 2) watchdog 不再静默排除 device_unlinked
+
+- `watchdog_ping_plan` 里 `engine_absent` 的插入点前加判定：只有当 store 里这行**不是**
+  `device_unlinked` 时才允许静默排除；是终态则本槽 `retire_device_unlinked()` 并回报
+  `reason = "deviceUnlinked"` 的 NoTarget（不再是一条看不见的 `engineAbsent`）。
+  store 读只在「本来就要排除」的分支发生，健康引擎的心跳路径零额外读。
+- 心跳自己撞上 401 的分支（`WatchdogPingOutcome::Unauthorized`）也从「只清失败计数」改成
+  「顺手把槽按终态停掉」：这是 `account.changed` 车道丢失（连接器重启、接收端 lag）时唯一的兜底。
+- `watchdog_request_restart` 与 `restart_engine` 都在最前面做终态判定：死凭据不是 liveness 故障，
+  任何触发源都不许再 spawn。
+
+### 3) ensure_resident / runtime.start 直接答终态
+
+- `AccountPool::wake_slot_with` 在最前面（早于 EngineState::Running 判定）判
+  `account_is_device_unlinked`：命中即停 watchdog、停引擎、清 resident，返回
+  `SlotWakeRefusal::DeviceUnlinked` → `into_service_error` = ACCOUNT_UNLINKED retryable=false。
+  判定同时看**进程内锁存**与**store 行**，所以连接器重启后冷发现的槽答同一句话。
+- `start_or_schedule` 对终态槽直接跳过（不排迁移、不起引擎），
+  `runtime.start` 在「全部槽都是终态」时走 `StartFailure::AccountUnlinked` →
+  `ACCOUNT_UNLINKED, retryable=false`，而不是可重试的 RUNTIME_START_FAILED。
+- `accounts.deleteLocalData` 是这条终态唯一允许的补救动作（"delete its local data and link it again"）：
+  `SlotWakeRefusal::permits_engine_free_flow()`（迁移闸 + 终态）让它走 §4.276 的纯 store 出口，
+  否则死引擎会把删除也拒掉，账号从此既删不掉也链不回来。
+
+### 4) link.start / link.finish 成功后清除终态
+
+- `link.start`（人类显式重链意图）在 provision 之后立刻 `clear_device_unlinked()`：清槽锁存并
+  重挂 watchdog。store 行仍保持 `device_unlinked`，直到 `link.finish` 按契约 1.275
+  `mark_account_ready_by_id(id, "engine")` 落定——两处各管一层，谁都不越权。
+- `link.finish` 提交成功的同一分支也清槽锁存，于是「同一个槽」恢复服务。
+
+### 5) wire 增量
+
+`runtime.status` 的 `engines[]` 每项新增**可选** `needsRelink: true`（false 时整键缺席，
+其余状态下 status 面逐字节不变）：这是「槽已按终态停掉、需要重新 link」的机器可读一半，
+桌面据此渲染重链引导而不是"正在连接"。
+
+### 边界（如实记档）
+
+- legacy 组引擎拓扑不锁存、不停引擎：一个引擎服务整组账号，停它等于把健康账号一起打死；
+  该拓扑下 `engines[]` 不存在，`device_unlinked` 仍只走 §4.259 的 host 闸口。
+- 终态只由 `link.*` 清除：inventory 的 `listAccounts` 同步（`upsert_account_from_signal_*`）按
+  §4.259 保留 `device_unlinked`，看一眼引擎列表不能复活一个死凭据。
+- 槽本身不删除（数据目录、媒体、凭据都留给用户删除或重链），所以 `needsRelink` 的语义是
+  「停在那儿等 re-link」，不是「已清理」。
+
+### 测试
+
+`tests/per_account_pool.rs` 五条（每条对应上面一条修法，均配变异验证）：
+
+| 用例 | 钉住的行为 |
+|---|---|
+| device_unlinked_stops_the_slot_engine_and_parks_the_slot | 401 后引擎进程消失、status 报 stopped/pid 缺省/needsRelink=true/resident=false、store 行 device_unlinked |
+| device_unlinked_account_is_not_silently_excluded_by_the_watchdog | store 已终态但 `account.changed` 丢失、引擎不再列该号：watchdog 自己停槽，之后多拍不再重启 |
+| device_unlinked_account_answers_a_terminal_wake | 账号寻址调用答 ACCOUNT_UNLINKED 且 retryable=false，且不留下引擎 |
+| runtime_start_answers_terminal_when_every_account_is_unlinked | 全槽终态时 runtime.start 答 StartFailure::AccountUnlinked（wire 为 ACCOUNT_UNLINKED/retryable=false）且不 spawn |
+| relink_clears_the_terminal_unlink_and_the_slot_runs_again | link.start 清锁存 + link.finish 落 ready 后，同一槽引擎重新起来，needsRelink 键缺席 |

@@ -27,7 +27,7 @@ use kt_signal_connector::engine::EngineState;
 use kt_signal_connector::groups;
 use kt_signal_connector::pool::EnginePoolPolicy;
 use kt_signal_connector::registry::{
-    ProxyGroupRuntime, RuntimeOptions, open_group_runtime_with_options,
+    ProxyGroupRuntime, RuntimeOptions, StartFailure, open_group_runtime_with_options,
 };
 use kt_signal_connector::service::{
     MessagesMarkReadParams, PresenceSetTypingMessageParams, SendTarget,
@@ -1160,5 +1160,320 @@ async fn a_legacy_status_keeps_the_engines_key_absent() {
         "the legacy shape must stay pre-pool: {wire}"
     );
     assert!(wire.get("degraded").is_none(), "{wire}");
+    runtime.shutdown().await.unwrap();
+}
+
+/// Contract 1.275 (root fix): the engine classifies the upstream 401, the
+/// account-unlink watcher persists `device_unlinked`, and the slot must go
+/// terminal — its engine process stops and the slot is marked needs-relink.
+/// The pre-fix shape wrote the store row and left engine + slot resident
+/// forever.
+#[tokio::test]
+async fn device_unlinked_stops_the_slot_engine_and_parks_the_slot() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let accounts = seed_accounts(&temp, 1);
+    let (id, number) = accounts[0].clone();
+    let runtime = open_pool(
+        &temp,
+        pool_options(1, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    runtime.start().await.unwrap();
+    let pid = runtime.status().await.engines[0].pid.unwrap();
+    assert_eq!(engine_processes(&data_dir(&temp, &id)), 1);
+
+    // The upstream answers the watchdog's getUserStatus with the contract
+    // 1.21 authorization-failure face.
+    fs::write(
+        data_dir(&temp, &id).join(".fixture-auth-failed-user-status"),
+        b"",
+    )
+    .unwrap();
+
+    // The engine process must not outlive the dead credential.
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if engine_processes(&data_dir(&temp, &id)) == 0 && !process_alive(pid) {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the slot's engine must stop when the device was unlinked");
+
+    let status = runtime.status().await;
+    let slot = status
+        .engines
+        .iter()
+        .find(|engine| engine.account_id == id)
+        .expect("the slot stays registered after the terminal unlink");
+    assert_eq!(slot.state, EngineState::Stopped);
+    assert!(slot.pid.is_none(), "the stopped engine owns no pid");
+    assert!(
+        slot.needs_relink,
+        "the slot must be parked for a re-link: {slot:?}"
+    );
+    assert!(!slot.resident, "a parked slot is not resident");
+    let wire = serde_json::to_value(&status).unwrap();
+    let parked = wire["engines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|engine| engine["accountId"] == json!(id))
+        .unwrap();
+    assert_eq!(parked["needsRelink"], json!(true), "{wire}");
+
+    let store = store_for(&temp);
+    let account = store.account_summary(&id).unwrap().expect("account row");
+    assert_eq!(account.state, "device_unlinked");
+    assert_eq!(account.state_evidence.as_deref(), Some("upstream"));
+    // The row is the terminal write of this same incident: the number and the
+    // row agree, so nothing invented a second account.
+    let by_number = store.account_by_signal(&number).unwrap().expect("row");
+    assert_eq!(by_number.id, id);
+    let _ = runtime.stop().await;
+    runtime.shutdown().await.unwrap();
+}
+
+/// Contract 1.275 (requirement 2): the watchdog must never treat a
+/// `device_unlinked` account as a silent `engineAbsent` exclusion. That was
+/// the permanent-hang shape: the engine stops listing the account after the
+/// 401, the watchdog excluded the row from liveness for the life of the
+/// engine instance, and neither the process nor the slot was ever retired.
+#[tokio::test]
+async fn device_unlinked_account_is_not_silently_excluded_by_the_watchdog() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let accounts = seed_accounts(&temp, 1);
+    let (id, number) = accounts[0].clone();
+    let runtime = open_pool(
+        &temp,
+        pool_options(1, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    runtime.start().await.unwrap();
+    let pid = runtime.status().await.engines[0].pid.unwrap();
+
+    // The terminal write landed (the accountUnbound lane persisted it) but the
+    // account.changed lane is gone — a connector restart mid-unlink. Only the
+    // watchdog's own observation is left.
+    store_for(&temp)
+        .mark_account_device_unlinked(&number)
+        .unwrap()
+        .expect("account row");
+    // The engine no longer lists the account: the exact moment the pre-fix
+    // watchdog inserted it into `engine_absent` and stopped looking.
+    fs::write(
+        data_dir(&temp, &id).join("engine-state.json"),
+        serde_json::to_vec_pretty(&json!({ "version": 2, "accounts": [] })).unwrap(),
+    )
+    .unwrap();
+
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if engine_processes(&data_dir(&temp, &id)) == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the watchdog must retire a device_unlinked slot instead of excluding it");
+
+    // Several more watchdog ticks: no restart may follow the terminal retire.
+    sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        engine_processes(&data_dir(&temp, &id)),
+        0,
+        "a dead credential must never earn a fresh engine process"
+    );
+    assert_eq!(
+        engine_log_pids(&data_dir(&temp, &id)),
+        vec![pid],
+        "the watchdog must not restart the engine of an unlinked device"
+    );
+    let status = runtime.status().await;
+    assert!(
+        status.engines[0].needs_relink,
+        "the watchdog retire parks the slot for a re-link"
+    );
+    let _ = runtime.stop().await;
+    runtime.shutdown().await.unwrap();
+}
+
+/// Contract 1.275 (requirement 3a): `ensure_resident` answers the terminal
+/// face — ACCOUNT_UNLINKED with retryable=false — instead of spawning an engine
+/// that can only answer 401 again. This is the first request after the unlink
+/// (and the same answer a cold connector gives after a restart, because the
+/// store is the authority).
+#[tokio::test]
+async fn device_unlinked_account_answers_a_terminal_wake() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let accounts = seed_accounts(&temp, 1);
+    let (id, number) = accounts[0].clone();
+    let runtime = open_pool(
+        &temp,
+        pool_options(1, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    runtime.start().await.unwrap();
+
+    // Terminal write only (no event lane, no watchdog tick yet): the wake path
+    // itself must judge the store.
+    store_for(&temp)
+        .mark_account_device_unlinked(&number)
+        .unwrap()
+        .expect("account row");
+
+    let error = runtime
+        .list_conversations(id.clone(), 10, None)
+        .await
+        .expect_err("an unlinked device is never served by an engine");
+    let api = error.into_api();
+    assert_eq!(api.code, "ACCOUNT_UNLINKED");
+    assert!(
+        !api.retryable,
+        "a revoked credential is terminal, never retried"
+    );
+
+    // The refused wake did not spawn a second engine behind the refusal.
+    let status = runtime.status().await;
+    assert_eq!(
+        status.engines[0].pid, None,
+        "the terminal wake must not leave an engine behind"
+    );
+    assert!(status.engines[0].needs_relink);
+    let _ = runtime.stop().await;
+    runtime.shutdown().await.unwrap();
+}
+
+/// Contract 1.275 (requirement 3b): `runtime.start` on a pool whose every
+/// account was unlinked answers the terminal code (retryable=false) instead of
+/// the retryable RUNTIME_START_FAILED that invited another doomed spawn.
+#[tokio::test]
+async fn runtime_start_answers_terminal_when_every_account_is_unlinked() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let accounts = seed_accounts(&temp, 1);
+    let (id, _number) = accounts[0].clone();
+    let runtime = open_pool(
+        &temp,
+        pool_options(1, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    runtime.start().await.unwrap();
+    let pid = runtime.status().await.engines[0].pid.unwrap();
+
+    fs::write(
+        data_dir(&temp, &id).join(".fixture-auth-failed-user-status"),
+        b"",
+    )
+    .unwrap();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if engine_processes(&data_dir(&temp, &id)) == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the engine stops after the terminal unlink");
+    assert!(!process_alive(pid));
+
+    // The runtime is stopped (its slots keep their terminal state) and the
+    // next start must answer the terminal face, not a retryable failure.
+    let _ = runtime.stop().await;
+    let error = runtime
+        .start()
+        .await
+        .expect_err("a pool of unlinked accounts cannot start");
+    match error {
+        StartFailure::AccountUnlinked => {}
+        other => panic!("runtime.start must answer the terminal unlink, got {other:?}"),
+    }
+    // ...and the refusal spawned nothing.
+    assert_eq!(
+        engine_processes(&data_dir(&temp, &id)),
+        0,
+        "runtime.start must not revive a dead credential"
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+/// Contract 1.275 (requirement 4): a fresh link is the one answer that may
+/// replace a terminal unlink. `link.start` clears the slot latch and the store
+/// commit clears the row, after which the very same slot serves again — the
+/// recovery path the permanent-hang shape never reached.
+#[tokio::test]
+async fn relink_clears_the_terminal_unlink_and_the_slot_runs_again() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let accounts = seed_accounts(&temp, 1);
+    let (id, _number) = accounts[0].clone();
+    let runtime = open_pool(
+        &temp,
+        pool_options(1, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    runtime.start().await.unwrap();
+
+    fs::write(
+        data_dir(&temp, &id).join(".fixture-auth-failed-user-status"),
+        b"",
+    )
+    .unwrap();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if engine_processes(&data_dir(&temp, &id)) == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the engine stops after the terminal unlink");
+    let _ = runtime.stop().await;
+    assert!(
+        runtime.status().await.engines[0].needs_relink,
+        "the slot is parked before the re-link"
+    );
+
+    // The re-link: link.start clears the slot latch, link.finish commits the
+    // row back to ready (contract 1.275 owns the store write).
+    {
+        let pool = runtime.account_pool().expect("pooled runtime").clone();
+        let slot = pool.get(&id).expect("slot");
+        slot.supervisor().clear_device_unlinked();
+    }
+    store_for(&temp)
+        .mark_account_ready_by_id(&id, "engine")
+        .unwrap()
+        .expect("account row");
+
+    // The same slot serves again.
+    runtime.start().await.unwrap();
+    let status = runtime.status().await;
+    let slot = status
+        .engines
+        .iter()
+        .find(|engine| engine.account_id == id)
+        .expect("slot");
+    assert!(
+        slot.pid.is_some(),
+        "a re-linked account must own a live engine again: {slot:?}"
+    );
+    assert_eq!(slot.state, EngineState::Running);
+    assert!(!slot.needs_relink, "the terminal marker is gone");
+    assert_eq!(engine_processes(&data_dir(&temp, &id)), 1);
+    let wire = serde_json::to_value(&status).unwrap();
+    let parked = wire["engines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|engine| engine["accountId"] == json!(id))
+        .unwrap();
+    assert!(
+        parked.get("needsRelink").is_none(),
+        "the parked marker is additive and omitted while healed: {wire}"
+    );
     runtime.shutdown().await.unwrap();
 }

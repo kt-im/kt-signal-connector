@@ -58,7 +58,7 @@ use crate::datalock::DataDirLock;
 use crate::engine::{EngineConfig, EngineError, EngineState};
 use crate::ids::random_id;
 use crate::protocol::ApiError;
-use crate::service::ServiceError;
+use crate::service::{HostSideEvent, ServiceError};
 use crate::store::Store;
 use crate::supervisor::RuntimeSupervisor;
 
@@ -876,6 +876,31 @@ pub struct AccountEngineStatus {
     /// unarmed connector's status face stays byte-identical.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store_migration: Option<StoreMigrationStatus>,
+    /// Contract 1.275: the account holder unlinked this device, so the slot is
+    /// parked and **no** engine will start for it until a fresh link lands.
+    /// Additive and omitted while false, so every other status face stays
+    /// byte-identical; the boolean is the machine-readable half of the
+    /// `needs-relink` verdict the desktop renders.
+    #[serde(skip_serializing_if = "is_false")]
+    pub needs_relink: bool,
+}
+
+/// Serde helper: omit the key while the flag is false (additive wire shape).
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// The terminal wire answer for an account whose device the account holder
+/// unlinked (contract 1.21/1.275): the credential is dead, so no wake, no
+/// `runtime.start` and no retry can serve it. Byte-identical to the service's
+/// `EngineError::Unauthorized` mapping, which is why it uses the same code,
+/// sentence and `retryable=false`.
+pub fn account_unlinked_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "ACCOUNT_UNLINKED",
+        "device was unlinked by the account holder",
+        false,
+    ))
 }
 
 /// Why a cold wake did not end with a live engine.
@@ -890,6 +915,10 @@ pub struct AccountEngineStatus {
 pub enum SlotWakeRefusal {
     /// The store-migration gate refused this start.
     MigrationGate(StoreMigrationDecision),
+    /// The account holder unlinked this device (contract 1.275): the slot is
+    /// terminal. Retrying cannot help, and the one action its message names -
+    /// "link it again" - needs a fresh link, never a fresh engine.
+    DeviceUnlinked,
     /// Anything else: no data-directory lock, a supervisor that would not
     /// start, or an engine that exited.
     Failed(ServiceError),
@@ -901,11 +930,23 @@ impl SlotWakeRefusal {
         matches!(self, Self::MigrationGate(_))
     }
 
+    /// Whether a caller whose job is **not** to serve traffic - above all the
+    /// local-data delete - may take the engine-free path instead of being
+    /// refused. Both terminal verdicts answer a remediation ("delete its local
+    /// data and link it again") that must stay reachable: a store-migration gate
+    /// must not veto the very action its own message prescribes, and a
+    /// `device_unlinked` slot has no credential left for an engine to delete
+    /// with. Anything else keeps the pre-existing refusal.
+    pub fn permits_engine_free_flow(&self) -> bool {
+        matches!(self, Self::MigrationGate(_) | Self::DeviceUnlinked)
+    }
+
     /// The host-facing error. Byte-for-byte what `ensure_resident` answered
     /// before this split existed; the distinction is internal.
     pub fn into_service_error(self) -> ServiceError {
         match self {
             Self::MigrationGate(decision) => store_migration_refusal_error(decision),
+            Self::DeviceUnlinked => account_unlinked_error(),
             Self::Failed(error) => error,
         }
     }
@@ -1626,6 +1667,19 @@ impl AccountPool {
         self: &Arc<Self>,
         slot: &Arc<AccountSlot>,
     ) -> Option<StoreMigrationBlock> {
+        // Contract 1.275: a terminal unlink is not a start failure to retry -
+        // `runtime.start` must not spawn an engine that can only answer 401,
+        // and it must not report a retryable aggregate failure for it either
+        // (the caller sees ACCOUNT_UNLINKED from the status face's
+        // `needsRelink` and from `every_slot_device_unlinked`).
+        if slot
+            .supervisor()
+            .account_is_device_unlinked(&slot.account_id)
+        {
+            slot.supervisor().note_device_unlinked();
+            slot.set_resident(false);
+            return None;
+        }
         if slot.supervisor.status().await.state == EngineState::Running {
             slot.set_resident(true);
             return None;
@@ -2337,6 +2391,18 @@ impl AccountPool {
         self.get(account_id).and_then(|slot| slot.migration_block())
     }
 
+    /// Whether every registered slot is parked in the terminal unlink state
+    /// (contract 1.275). `runtime.start` answers that state's own code instead
+    /// of a retryable start failure: no retry can revive a dead credential.
+    pub fn every_slot_device_unlinked(&self) -> bool {
+        let slots = self.slots();
+        !slots.is_empty()
+            && slots.iter().all(|slot| {
+                slot.supervisor()
+                    .account_is_device_unlinked(&slot.account_id)
+            })
+    }
+
     /// Wake a cold slot for traffic, answering exactly the wire errors it
     /// always has: a latched block (not retryable), a retryable deferral, or the
     /// supervisor's own failure. The typed refusal stays inside
@@ -2387,6 +2453,23 @@ impl AccountPool {
         mode: SlotStartMode,
     ) -> Result<(), SlotWakeRefusal> {
         slot.touch();
+        // Contract 1.275: a device the account holder unlinked is a terminal
+        // slot. Neither a wake nor the retry behind it can revive the
+        // credential, so the answer is the terminal one (ACCOUNT_UNLINKED,
+        // retryable=false) even while a still-resident process is winding down.
+        if slot
+            .supervisor()
+            .account_is_device_unlinked(&slot.account_id)
+        {
+            // Discovering the terminal state on the request path is also where
+            // the doomed process has to go: the wake refuses *and* parks the
+            // slot (idempotent), so no engine sits resident behind a credential
+            // that can only answer 401.
+            slot.supervisor().stop_watchdog();
+            slot.supervisor().retire_device_unlinked().await;
+            slot.set_resident(false);
+            return Err(SlotWakeRefusal::DeviceUnlinked);
+        }
         if slot.supervisor.status().await.state == EngineState::Running {
             slot.set_resident(true);
             return Ok(());
@@ -2506,6 +2589,9 @@ impl AccountPool {
                 resident: slot.is_resident(),
                 restarts: slot.supervisor.restart_count(),
                 store_migration: self.store_migration_face(&slot),
+                needs_relink: slot
+                    .supervisor()
+                    .account_is_device_unlinked(&slot.account_id),
             });
         }
         statuses
@@ -2626,7 +2712,7 @@ fn build_slot(
         account_id.clone(),
         Arc::clone(&supervisor),
     ));
-    Arc::new(AccountSlot {
+    let slot = Arc::new(AccountSlot {
         account_id,
         proxy_group,
         data_dir,
@@ -2643,7 +2729,61 @@ fn build_slot(
         store_migrated: AtomicBool::new(false),
         misconfigured_log: RepeatThrottle::default(),
         backup_warn: RepeatThrottle::default(),
-    })
+    });
+    // Contract 1.275: the slot's own consumer of the terminal-unlink lane.
+    spawn_device_unlink_guard(Arc::downgrade(&slot), slot.supervisor().subscribe_host());
+    slot
+}
+
+/// The terminal-unlink guard of one per-account slot (contract 1.275).
+///
+/// The supervisor's account-unlink watcher persists `device_unlinked` and only
+/// then emits `account.changed`; this task consumes exactly that lane, so the
+/// pool acts **after** the terminal write landed (a link window that defers the
+/// write emits nothing and is left alone). Acting means: park the restart lane,
+/// stop the engine process, and leave the slot in place for a re-link - the
+/// engine must not outlive the credential, and the slot's resident bit must not
+/// keep a dead engine warm.
+///
+/// Weak on purpose: the task exits when the slot is reclaimed, and the receiver
+/// closes with the supervisor.
+fn spawn_device_unlink_guard(
+    slot: std::sync::Weak<AccountSlot>,
+    mut host_events: tokio::sync::broadcast::Receiver<HostSideEvent>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match host_events.recv().await {
+                Ok(HostSideEvent::AccountChanged(account)) => {
+                    if account.state != "device_unlinked" {
+                        continue;
+                    }
+                    let Some(slot) = slot.upgrade() else {
+                        return;
+                    };
+                    if account.id != slot.account_id {
+                        continue;
+                    }
+                    // Park the restart lane before the process goes: a watchdog
+                    // tick that raced the unlink must not re-spawn the engine
+                    // between the two lines.
+                    slot.supervisor().stop_watchdog();
+                    slot.set_resident(false);
+                    slot.supervisor().retire_device_unlinked().await;
+                    tracing::warn!(
+                        account_id = %slot.account_id,
+                        group_id = %slot.proxy_group,
+                        "per-account slot parked: the device was unlinked upstream and needs a re-link"
+                    );
+                }
+                Ok(_) => {}
+                // A slow consumer skips what it missed; the state is read from
+                // the store again on the next event and by every start face.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
 }
 
 /// Account-id grammar: exactly 32 lowercase hex characters — the

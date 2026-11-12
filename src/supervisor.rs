@@ -585,6 +585,17 @@ pub struct RuntimeSupervisor {
     /// Successful engine restarts since process start (watchdog recoveries).
     /// Exposed through the pool's per-account status face; never persisted.
     restart_count: Arc<AtomicU64>,
+    /// Contract 1.275/1.292: the terminal unlink latch of a **per-account**
+    /// engine slot. The account holder unlinked this device upstream (the
+    /// engine classified the 401 and the account-unlink watcher persisted
+    /// `device_unlinked`): the credential is permanently dead, so the slot's
+    /// engine is stopped, no watchdog restart may re-spawn it, and no wake or
+    /// `runtime.start` may start it. Only a fresh link clears it.
+    ///
+    /// A legacy group supervisor never latches: its engine serves every account
+    /// of the group, so stopping it for one dead credential would take the
+    /// healthy accounts down with it (`note_device_unlinked` is a no-op there).
+    device_unlinked: AtomicBool,
     engine: Mutex<Option<EngineHandle>>,
     /// O1 engine contract handshake state: the verdict of the last engine
     /// landing (doctor/metrics read it) plus the latched fault that refuses
@@ -910,6 +921,7 @@ impl RuntimeSupervisor {
             group_id,
             preferred_account_id,
             restart_count: Arc::new(AtomicU64::new(0)),
+            device_unlinked: AtomicBool::new(false),
             engine: Mutex::new(None),
             engine_contract: Mutex::new(crate::engine_contract::EngineContractState::default()),
             service,
@@ -985,6 +997,128 @@ impl RuntimeSupervisor {
     /// start. The per-account status face exposes it as `restarts`.
     pub fn restart_count(&self) -> u64 {
         self.restart_count.load(Ordering::Relaxed)
+    }
+
+    /// Whether this slot sits in the terminal "the account holder unlinked
+    /// this device" state (contract 1.275/1.292). Always `false` for a legacy
+    /// group supervisor: the group engine is shared, so one dead account's
+    /// terminal state is not a slot state there.
+    pub fn is_device_unlinked(&self) -> bool {
+        self.preferred_account_id.is_some() && self.device_unlinked.load(Ordering::Acquire)
+    }
+
+    /// Latch the terminal unlink without touching the engine: every start face
+    /// answers `ACCOUNT_UNLINKED` (retryable=false) from here on. Returns true
+    /// when this call latched it. A legacy group supervisor is never latched.
+    pub fn note_device_unlinked(&self) -> bool {
+        if self.preferred_account_id.is_none() {
+            return false;
+        }
+        let fresh = !self.device_unlinked.swap(true, Ordering::AcqRel);
+        if fresh {
+            tracing::warn!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                "account device was unlinked upstream; this slot is parked until a re-link"
+            );
+        }
+        fresh
+    }
+
+    /// The terminal handling of an observed unlink: latch the state and stop
+    /// the engine process. Idempotent by construction (the shutdown is a no-op
+    /// with no engine), so every caller that discovers the terminal state -
+    /// the account.changed lane, the watchdog, a wake - enforces the same
+    /// invariant: no engine outlives a dead credential. Returns `true` when the
+    /// slot is terminal, `false` for a legacy group supervisor, which is never
+    /// retired.
+    pub async fn retire_device_unlinked(&self) -> bool {
+        if self.preferred_account_id.is_none() {
+            return false;
+        }
+        self.note_device_unlinked();
+        // The engine process must not outlive the dead credential: nothing it
+        // could still do is attributable to a linked device, and leaving it
+        // resident is exactly the "engine and slot hang forever" shape. With no
+        // engine there is nothing to stop (and nothing to log): the latch alone
+        // keeps every later start refused.
+        if self.engine.lock().await.is_none() {
+            return true;
+        }
+        match self.shutdown_within(None).await {
+            Ok(()) => tracing::warn!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                "account engine stopped: the device was unlinked upstream and cannot be revived by a restart"
+            ),
+            Err(error) => tracing::warn!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                error_class = error.class(),
+                "account engine did not stop cleanly after the terminal unlink"
+            ),
+        }
+        true
+    }
+
+    /// Clear the terminal unlink latch: a fresh link (or its commit) is the one
+    /// answer that may replace a terminal unlink (contract 1.275). The engine
+    /// stays cold; the ordinary wake path starts it again.
+    pub fn clear_device_unlinked(self: &Arc<Self>) {
+        if !self.device_unlinked.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        tracing::info!(
+            account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+            group_id = %self.group_id,
+            "terminal device unlink cleared: a fresh link owns this slot again"
+        );
+        // The watchdog owns the restart lane; a terminal retire parked it, so a
+        // slot that may serve traffic again gets its liveness loop back.
+        self.spawn_watchdog();
+    }
+
+    /// Abort this slot's watchdog task (idempotent). The terminal unlink parks
+    /// the restart lane from another task; `clear_device_unlinked` respawns it.
+    pub fn stop_watchdog(&self) {
+        if let Ok(mut slot) = self.watchdog.lock()
+            && let Some(handle) = slot.take()
+        {
+            handle.abort();
+        }
+    }
+
+    /// The engine-start refusal for a terminal unlink. Consulted by every start
+    /// face **before** any other gate, so a device the holder already unlinked
+    /// never spawns an engine that can only answer 401.
+    fn terminal_unlink_guard(&self) -> Result<(), EngineError> {
+        let Some(account_id) = self.preferred_account_id.as_deref() else {
+            return Ok(());
+        };
+        if !self.account_is_device_unlinked(account_id) {
+            return Ok(());
+        }
+        self.note_device_unlinked();
+        tracing::warn!(
+            account_id = %account_id,
+            group_id = %self.group_id,
+            "engine start refused: the account holder unlinked this device; the slot needs a re-link"
+        );
+        Err(EngineError::Unauthorized)
+    }
+
+    /// Whether the shared store's row for `account_id` carries the terminal
+    /// `device_unlinked` state. The store is the authority across connector
+    /// restarts (the in-memory latch is not): a fresh process rediscovers the
+    /// slot cold and must answer the same terminal refusal.
+    pub(crate) fn account_is_device_unlinked(&self, account_id: &str) -> bool {
+        self.is_device_unlinked()
+            || self
+                .store
+                .account_summary(account_id)
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.state == "device_unlinked")
     }
 
     /// The media namespace root this supervisor writes under, when the media
@@ -2597,8 +2731,11 @@ impl RuntimeSupervisor {
         }
     }
 
-    /// Start this slot's engine, consulting the pool's store gate first.
+    /// Start this slot's engine, consulting the pool's store gate first. The
+    /// terminal unlink is judged **before** every other gate (contract 1.275):
+    /// a store migration is never run for a device that cannot be served.
     pub async fn start(&self) -> Result<EngineStatus, EngineError> {
+        self.terminal_unlink_guard()?;
         self.admit_start().await?;
         self.start_after_store_gate().await
     }
@@ -2608,6 +2745,10 @@ impl RuntimeSupervisor {
     /// paths). Using this from anywhere else would re-open the bypass the gate
     /// exists to close, so it is deliberately a separate, named entry point.
     pub async fn start_after_store_gate(&self) -> Result<EngineStatus, EngineError> {
+        // A caller that cleared the store gate itself (the pool's wake and
+        // migration pass) still may not revive a credential the account holder
+        // already unlinked: the slot is terminal until a fresh link lands.
+        self.terminal_unlink_guard()?;
         let mut slot = self.engine.lock().await;
         if let Some(fault) = self.latched_contract_fault().await {
             tracing::warn!(
@@ -3515,6 +3656,10 @@ impl RuntimeSupervisor {
     /// direct child kill), so a watchdog restart cannot hang here even when the
     /// old engine's actor is parked on receive backpressure.
     async fn restart_engine(&self) -> Result<(), EngineError> {
+        // Contract 1.275: a terminal unlink is not a crash. No restart can
+        // revive a credential the account holder revoked, so the watchdog lane
+        // stops here instead of re-spawning an engine whose only answer is 401.
+        self.terminal_unlink_guard()?;
         // Contract 1.291 (§4.277 C): the watchdog recovers an engine without
         // the pool asking, so this is where a crash restart could open a store
         // the migrator still owns. Ask the gate **before** the old handle is
@@ -3818,6 +3963,16 @@ impl RuntimeSupervisor {
                     }
                 }
                 _ = ticker.tick() => {
+                    // Contract 1.275: a terminal unlink is not a liveness fault
+                    // and nothing about it is retryable. The slot is parked
+                    // (engine stopped, every start face answers ACCOUNT_UNLINKED)
+                    // until a fresh link clears it, so this tick judges nothing
+                    // and must not arm a restart of a dead credential.
+                    if self.is_device_unlinked() {
+                        pending = None;
+                        ping_failures = 0;
+                        continue;
+                    }
                     // Receive-path survival evidence cancels a pending
                     // restart: an envelope actually delivered over the
                     // engine's receive lane proves the WebSocket is alive,
@@ -4047,6 +4202,18 @@ impl RuntimeSupervisor {
                             // the account. Counting this as a ping failure
                             // would only churn bounded restarts forever.
                             ping_failures = 0;
+                            // Contract 1.275: the credential is dead, so the
+                            // slot parks itself from the ping lane as well (a
+                            // no-op for a legacy group engine). This is the
+                            // backstop for a slot whose account.changed lane
+                            // was missed (a connector restart, a lagged
+                            // receiver): without it the engine would sit
+                            // resident forever behind a dead credential.
+                            if self.preferred_account_id.is_some() {
+                                self.retire_device_unlinked().await;
+                                stderr_rx = None;
+                                stderr_pid = None;
+                            }
                         }
                         WatchdogPingOutcome::Failed
                             if !refused.is_empty() && refused.len() == targets.len() =>
@@ -4172,8 +4339,48 @@ impl RuntimeSupervisor {
         let mut excluded_accounts = 0usize;
         let mut confirmed_accounts = 0usize;
         for row in &rows {
-            if let Some(numbers) = &verified {
-                if !numbers.contains(&row.signal_account) {
+            // Contract 1.275: `device_unlinked` is a terminal verdict, never a
+            // silent `engineAbsent` exclusion. The pre-fix shape read "the
+            // engine no longer lists it" as "nothing to ping" and left the
+            // engine process and the slot resident forever. The terminal state
+            // is judged exactly where an exclusion would happen, so a healthy
+            // engine's ping path costs no extra store read: a slot whose own
+            // account is terminal is retired here (a legacy group engine keeps
+            // serving its healthy accounts, so it is only named, never stopped).
+            let absent = match &verified {
+                Some(numbers) => !numbers.contains(&row.signal_account),
+                None => verdicts.engine_absent.contains(&row.id),
+            };
+            if absent && self.account_is_device_unlinked(&row.id) {
+                if self.preferred_account_id.as_deref() == Some(row.id.as_str()) {
+                    // A per-account slot serves exactly this account: terminal
+                    // means the whole slot is terminal, so it is retired and
+                    // this tick has nothing left to probe.
+                    self.retire_device_unlinked().await;
+                    return WatchdogPingPlan::NoTarget(WatchdogPingSkip {
+                        reason: "deviceUnlinked",
+                        known_accounts: rows.len(),
+                        excluded_accounts: rows.len(),
+                        engine_verified: verified.is_some(),
+                    });
+                }
+                // Legacy group engine: one dead account never stops the engine
+                // its healthy siblings share. The exclusion is *named* here
+                // instead of hiding behind `engineAbsent`, and the row stays out
+                // of the probe set for this engine instance.
+                if verdicts.engine_absent.insert(row.id.clone()) {
+                    crate::metrics::record_watchdog_ping_target_skipped();
+                    tracing::info!(
+                        account_id = %row.id,
+                        reason = "deviceUnlinked",
+                        "watchdog ping target excluded: the account holder unlinked this device"
+                    );
+                }
+                excluded_accounts += 1;
+                continue;
+            }
+            if verified.is_some() {
+                if absent {
                     // Record once per engine instance; the exclusion itself
                     // applies on every later tick.
                     if verdicts.engine_absent.insert(row.id.clone()) {
@@ -4257,6 +4464,30 @@ impl RuntimeSupervisor {
         source: RestartSource,
         reason: &'static str,
     ) -> bool {
+        // Contract 1.275: the terminal unlink outranks every restart source. A
+        // dead credential is not a liveness fault, and the engine the watchdog
+        // would re-spawn can only answer 401 again — so the slot parks itself
+        // instead of burning the restart budget.
+        if let Some(account_id) = self.preferred_account_id.as_deref()
+            && self.account_is_device_unlinked(account_id)
+        {
+            if self.note_device_unlinked() {
+                tracing::warn!(
+                    reason,
+                    source = %source,
+                    account_id = %account_id,
+                    group_id = %self.group_id,
+                    "watchdog restart refused: the account holder unlinked this device; the slot needs a re-link"
+                );
+            }
+            // Any deferred restart of the dead credential is dropped, not
+            // re-armed: nothing about this account is retryable.
+            *pending = None;
+            // Park the slot as well: a dead or wedged handle must not stay as
+            // this slot's engine behind a credential nothing can serve.
+            let _ = self.retire_device_unlinked().await;
+            return false;
+        }
         // O1: a latched contract mismatch is terminal for this process — no
         // watchdog tick may re-spawn the same refused engine.
         if let Some(fault) = self.latched_contract_fault().await {
