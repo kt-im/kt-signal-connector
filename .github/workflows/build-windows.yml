@@ -10,6 +10,11 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
 
+# OIDC → 阿里云 STS 需要 id-token: write（否则拿不到 ACTIONS_ID_TOKEN_REQUEST_URL）
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   build:
     name: Build Windows x64 connector
