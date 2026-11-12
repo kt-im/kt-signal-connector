@@ -741,6 +741,23 @@ pub struct RuntimeSupervisor {
     /// the pool owns its supervisors: ownership here would be a cycle, so the
     /// pool clears it when it stops.
     sweep_owner: StdMutex<Option<Arc<crate::registry::SweepOwner>>>,
+    /// Contract 1.291 (§4.277 C): the store gate this supervisor consults
+    /// before it spawns an engine on a path the pool did not open itself -
+    /// the watchdog's crash restart, and any future start face. Installed by
+    /// the per-account pool; a legacy group supervisor has none and answers
+    /// exactly as it always has.
+    start_gate: StdMutex<Option<Arc<dyn EngineStartGate>>>,
+}
+
+/// A pre-spawn admission check owned by the engine pool (contract 1.291,
+/// §4.277 C). The gate is what stops a **crash restart** from opening a store
+/// the store migrator still owns: the watchdog recovers an engine without the
+/// pool asking, so the decision has to live at the spawn, not at the caller.
+///
+/// `Ok(())` = spawn now. `Err(code)` = not now, with a closed literal naming
+/// the lifecycle state for the caller's log and the host face.
+pub trait EngineStartGate: Send + Sync {
+    fn admit_engine_start(&self) -> futures_util::future::BoxFuture<'_, Result<(), &'static str>>;
 }
 
 /// What the watchdog's orphan-engine pass watches: one scope per process (the
@@ -933,6 +950,7 @@ impl RuntimeSupervisor {
             receipt_failures: StdMutex::new(HashMap::new()),
             group_resync_stamps: StdMutex::new(HashMap::new()),
             orphan_sweep: StdMutex::new(None),
+            start_gate: StdMutex::new(None),
             sweep_owner: StdMutex::new(None),
         }
     }
@@ -2542,7 +2560,54 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// Install the pool's admission gate (contract 1.291, §4.277 C). Every
+    /// `start` on a path the pool did not open itself - above all the watchdog's
+    /// crash restart - then asks this gate before spawning an engine.
+    pub fn set_start_gate(&self, gate: Arc<dyn EngineStartGate>) {
+        *self
+            .start_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
+    }
+
+    fn start_gate(&self) -> Option<Arc<dyn EngineStartGate>> {
+        self.start_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Refuse this spawn when the pool's gate does, and say why in the log
+    /// channel with the closed literal (never a path, never key material).
+    async fn admit_start(&self) -> Result<(), EngineError> {
+        let Some(gate) = self.start_gate() else {
+            return Ok(());
+        };
+        match gate.admit_engine_start().await {
+            Ok(()) => Ok(()),
+            Err(code) => {
+                tracing::warn!(
+                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                    group_id = %self.group_id,
+                    store_gate = code,
+                    "engine start deferred by the store gate; this account keeps no engine until the pass lands"
+                );
+                Err(EngineError::StoreDeferred { code })
+            }
+        }
+    }
+
+    /// Start this slot's engine, consulting the pool's store gate first.
     pub async fn start(&self) -> Result<EngineStatus, EngineError> {
+        self.admit_start().await?;
+        self.start_after_store_gate().await
+    }
+
+    /// Start this slot's engine for a caller that has **just cleared the store
+    /// gate itself** (the pool's migration pass, and the pool's own gated
+    /// paths). Using this from anywhere else would re-open the bypass the gate
+    /// exists to close, so it is deliberately a separate, named entry point.
+    pub async fn start_after_store_gate(&self) -> Result<EngineStatus, EngineError> {
         let mut slot = self.engine.lock().await;
         if let Some(fault) = self.latched_contract_fault().await {
             tracing::warn!(
@@ -3450,6 +3515,11 @@ impl RuntimeSupervisor {
     /// direct child kill), so a watchdog restart cannot hang here even when the
     /// old engine's actor is parked on receive backpressure.
     async fn restart_engine(&self) -> Result<(), EngineError> {
+        // Contract 1.291 (§4.277 C): the watchdog recovers an engine without
+        // the pool asking, so this is where a crash restart could open a store
+        // the migrator still owns. Ask the gate **before** the old handle is
+        // taken, so a refusal never costs a live engine.
+        self.admit_start().await?;
         let mut slot = self.engine.lock().await;
         if let Some(fault) = self.latched_contract_fault().await {
             tracing::warn!(

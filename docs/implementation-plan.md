@@ -21459,3 +21459,151 @@ src/engine.rs 单测：store_migrate_args 形状（storeMigrate 位于 --data-di
 - 引擎已经在跑的槽位本轮不迁移（M1）：它的库要等下一次冷启动（stop、idle 降级、重启进程）
   才会过闸。打开开关后想让在跑的账号立刻迁移，重启连接器是最直接的办法——这也是「不停活引擎」
   这条不变量换来的代价，写在这里免得下一个人以为是漏迁。
+
+## §4.277 迁移生命周期：移出请求路径、状态面、闸下沉与预检（契约 1.291 · wire 增 engines[].storeMigration）
+
+§4.276 把「停槽 → 迁移 → 起引擎」串在了**调用者的栈上**：常驻窗口一次 runtime.start、一次冷启动
+唤醒、一次 link，都要等整库拷贝跑完。八个账号 × 120s 的迁移预算落在一个 300s 的 dispatch 期限里，
+必然有一半迁移被超时杀掉；而 §4.276「边界」自己也记了三条洞：watchdog 崩溃重启绕开闸、锁存状态
+对 host 不可见、同一槽两条路径进闸。本节把这三条一起收掉。
+
+设计稿：engine 仓 docs/plan/engine-store-migration-design.md §2.3/§2.4/§8.2/§9（未变）；桌面侧 UX
+口径：docs/plan/store-migration-ux.md（四条，逐条落在这里与用例里）。
+
+### 四条 UX 口径的落点
+
+| UX 条目 | 落点 | 用例 |
+|---|---|---|
+| 迁移在槽启动时幂等重跑，重试不新增 IPC，靠文件头判定 | 迁移器自己按 store 文件头决定做什么；connector 不写任何状态文件，重启后重跑同一趟 | apply_mode_migrates_before_the_engine_and_hands_over_the_derived_key、concurrent_starts_schedule_one_pass |
+| failed 不自动重试，只由用户触发重跑 | admit_engine_start(slot, retry_failed)：只有 runtime.start 传 true；watchdog / 唤醒一律回上轮裁决、不排新趟 | a_failed_pass_answers_not_retryable_and_says_what_to_do |
+| blocked/failed 由 connector 判定，blocked 永不自动重试 | 判定在 pool；blocked 锁在槽上，任何入口只读锁存 | a_terminal_exit_eleven_latches_a_block_and_is_never_retried |
+| migrated 是持久状态，重启后仍为 migrated | 从 **store 文件头**重算（非进程内标记）：无 SQLite 头 = 已加密 = migrated | the_face_is_derived_from_the_store_header_not_from_memory |
+
+「持久」不等于「不再验一次」：文件头只喂**状态面**，进程内的 M4「已迁移」跳过标记仍不置位，所以
+新进程仍会跑一趟迁移器，拿到它自己的裁决（健康密文库答 noop，损坏库答终态）。否则一个坏掉的重启
+就再也没人诊断它了。
+
+### 生命周期与状态机（A）
+
+runtime.start 不再是工人，是**调度者**：apply 档下每个槽只被排一趟，runtime.start 毫秒级返回，
+迁移在自己的 task 里按迁移预算跑完并顺手起引擎。状态枚举（wire 只出现后五个字，off 档整键省略）：
+
+| state | 含义 | 允许起引擎 |
+|---|---|---|
+| off（不上 wire） | 开关 off：不读盘、不排趟、不新增字段 | 是 |
+| pending | 已排趟 / 仍欠一趟（含 dry-run 的「看过但没证明」） | 否（admit 排趟后拒绝本次 spawn） |
+| migrating | 迁移器正在跑 | 否 |
+| migrated | 本进程已知这个库是密文（文件头，或本趟 migrate/noop） | 是 |
+| blocked | 终态，永不自动重试 | 否 |
+| failed | 上一趟没落地；只由 runtime.start 重跑 | 否（回上轮裁决，不排新趟） |
+
+可重入与幂等：每槽一把单飞 CAS（migration_in_flight），第二个调用者加入在飞的那趟而不是再起一个
+迁移器；状态机的**唯一权威是磁盘上的 store 文件头**，所以崩溃可重来——进程没了、内存状态没了，
+下次启动读文件头重新判定，重跑的迁移器自己幂等。stop_all 置 stopping 标记，迁移落地时若已停服、或
+槽已被回收（still_registered），就不复活引擎，并如实记一行。
+
+### 状态面（B）
+
+runtime.status 的 engines[] 每项**新增可选** storeMigration = {state, code?}：
+
+- 开关 off → 整键缺席（未上膛的连接器 status 面与 1.290 逐字节相同）；
+- code 只在 blocked / failed 出现，且是 **connector 自己的封闭词表**，不外泄引擎码：
+  blocked = CAPABILITY_MISSING（engine build 没有 cipher、没有 storeMigrate 子模式，属部署问题）、
+  KEY_INVALID、VERIFY_FAILED、REQUIRED（仍是明文库、没人迁、而本机要求加密）；
+  failed = INTERRUPTED、IO_ERROR、LOCKED、TIMEOUT（exit 2 的混版归 CAPABILITY_MISSING：词是准的，
+  状态仍是 failed，因为换对版本即可自愈，不该锁死账号）；
+- code 按**字符**截断到 STORE_MIGRATION_CODE_MAX_CHARS（64），并被 schema 的 enum + maxLength 双约束，
+  schema_consistency 有一条用例把两侧词表钉在一起。
+
+**修掉 retryable 的假话**：1.290 把「可重试（exit 10）」一律答成 CAPABILITY_UNAVAILABLE retryable=true，
+文案写「下次启动会重试」——按 UX 第 2 条，failed 不会自动重试，这句话是假的。现在只有「迁移正在跑」
+（store_migration_in_progress）答 retryable=true；其余 failed 一律 retryable=false，文案改成
+「不会自动重试：修因后显式 runtime.start / 重启桌面」。
+
+### 闸下沉（C）
+
+§4.276 时只有 pool 的两条入口过闸；watchdog 的崩溃重启直接调 supervisor.start，link.start 也直接调，
+都是敞口。现在：
+
+- RuntimeSupervisor 拿一个 EngineStartGate（pool 装配时注入，弱引用，不成环）。start() 与
+  restart_engine() **spawn 之前**问闸；拒绝时返回 EngineError::StoreDeferred { code }，code 是封闭
+  字面量（store_migration_pending / store_migration_blocked / store_plaintext_requires_migration /
+  store_migration_misconfigured），host 面由 ServiceError::into_api 折成既有 CAPABILITY_UNAVAILABLE
+  （blocked 两支不可重试）。
+- 已清过闸的调用者走**另一个名字**的入口 start_after_store_gate()：pool 的迁移 task 和 pool 自己的
+  同步启动用它。这样「谁没过闸」在类型层面就是显式的，不靠注释约束。
+- link.start 改走 pool.wake_slot_waiting：link 是人手动作用户流，有自己预算，宁可等一趟也不回
+  「过会儿再来」，同时也就没有第二条绕过闸的 spawn 路径。
+- restart_engine 先问闸、再摘旧 handle：拒绝不该以杀掉一个活引擎为代价。
+
+判定顺序（与既有前置检查同序）：preflight → 锁存 → 在飞 → failed 策略 → 够不够条件跑趟。
+
+### 预检（D）
+
+新模块 src/store_preflight.rs，只看**文件头 16 字节**（SQLCipher 库没有 SQLite 头，因此「有 SQLite 头」
+就是「明文库」的正证据；读不到、太短、不存在都不算证据）：
+
+- 意图键 KT_ENGINE_STORE_REQUIRE_ENCRYPTED（默认 off；未设/空 = off；垃圾值 = off + warn 一次）。
+  它与 KT_ENGINE_STORE_MIGRATE 是两件事：前者是操作者的要求（明文库能否接受），后者是本机动作。
+- **四条件齐备才拒启**：池化槽（由调用点保证）+ 仍有明文库 + 迁移器 off + 意图 on。任一不满足即放行。
+  意图 on 而迁移器也 on 时不拒：这一次启动会把库迁掉。
+- 拒启的表现：不起引擎；状态面（开关 on 时）{state:"blocked", code:"REQUIRED"}；唤醒面
+  CAPABILITY_UNAVAILABLE retryable=false；文案同时点名两个 env 与「数据完好」。
+- connector.sqlite3.plaintext-backup **只 warn**（按 60s 窗口节流）：它拷贝的活库本来已加密，运行路径
+  没有东西读它，删它归 store 自己的 7 天清扫。
+- 开关 off + 意图 on 时仍然拒启（否则等于绕过），但**不新增状态字段**——「off 档零字段」按开关判定，
+  拒启本身走错误面与日志。于是 `REQUIRED` 这个 code 词在当前配置下只会出现在唤醒/启动的错误面与日志里，
+  进不了 `runtime.status`（进状态面要求开关 on）；词表里保留它是为了桌面能按同一个词表渲染这一档。
+
+### 日志纪律（不放松）
+
+迁移行仍只带 mode / 账号 8 字符指纹 / exit / code / outcome；新增的 pass 结束行用 account= 指纹而不是
+account_id= 全 id，migration_logs_* 用例把「不得出现 ≥64 位十六进制串」与「不得出现完整 accountId」
+都钉住。
+
+### 测试
+
+tests/store_migrate_orchestration.rs 原 18 条按异步语义改造（每次 start 后改用
+Harness::start_and_settle，等价于 host 等下一帧状态），新增 9 条：
+
+| 用例 | 钉住的行为 |
+|---|---|
+| runtime_start_returns_before_the_pass_finishes | start 在 900ms 内返回；迁移子进程还在跑时 0 次引擎调用；落地后才起引擎 |
+| concurrent_starts_schedule_one_pass | 两个并发 start 只产生一趟迁移（单飞） |
+| the_face_is_derived_from_the_store_header_not_from_memory | 明文库 → pending；换成密文头 → 同目录新进程报 migrated |
+| off_state_omits_the_store_migration_key_and_an_armed_one_names_it | off 档整键缺席；apply 档给 blocked + KEY_INVALID 且不含 exit |
+| a_failed_pass_answers_not_retryable_and_says_what_to_do | failed 面 retryable=false + 文案；唤醒不重跑，runtime.start 才重跑 |
+| a_crash_restart_asks_the_store_gate_before_spawning | 迁移在飞时 supervisor.start（watchdog 同一条 admit）被拒且 0 引擎调用 |
+| link_start_goes_through_the_store_gate | 锁存槽的 link.start 答不可重试 CAPABILITY_UNAVAILABLE 且不起引擎 |
+| the_preflight_refuses_only_with_all_four_conditions | 四条件齐备拒启；意图关掉即照常起 |
+| a_plaintext_backup_is_a_warning_not_a_refusal | 只有 backup 时照常起引擎 |
+
+单测：五态 × allows_start 表；off 字不进 wire 词表；code 按字符截断（含多字节）；引擎码 → 契约词映射
+（含未知终态兜底）；failed 文案不得再出现「下次启动重试」；预检文案点名两个 env；
+schema_consistency::the_store_migration_face_matches_the_code_vocabulary（词表两侧对齐）。
+
+### task-22 六必须修复（同一契约，回归实证）
+
+runtime.start 的全槽 blocked / 预检拒绝不再折成 retryable 的 RUNTIME_START_FAILED：pool 返回
+StoreMigrationBlock，registry 走 StartFailure::StoreMigrationBlocked，host 面答
+STORE_MIGRATION_BLOCKED retryable=false，data.storeMigrationCode 带原 store code。migration face 的
+持久性按磁盘头：seed 从密文头写 migrated 时同时置进程内 store_migrated；begin_store_migration 先读
+头再决定 pending，不覆盖已证明的 migrated。wake_slot_waiting 不再直接 gate_slot_start，而是走
+admit_engine_start / begin_migration_flight / record_migration_decision 的同一单飞与 failed 策略；
+link.start 成功后的 face 由这趟 pass 回写。dry-run 也移出 runtime.start 同步路径（每槽排自己的
+task），8 槽不会串行吃掉 300 s dispatch 预算。has_any_store 以「可读、非空、非符号链接」为准，
+零字节/不可读按 Absent，不 seed 成 migrated；store_preflight 全部用 symlink_metadata，符号链接记
+Unverifiable 且不跟随读取。对应 tests/store_migrate_orchestration.rs 的 8 条 task-22 回归用例及
+src/store_preflight.rs 单测。
+
+### 边界（如实记档）
+
+- **dry-run 也异步**：干跑仍要读一个安静的库，所以 runtime.start 只为每槽**排一趟** dry-run pass，
+  由 pass 自己起引擎；不再在调用栈上串行跑八个 plan。apply 与 dry-run 都不占 dispatch 预算。
+- **文件头分不清「密文」与「垃圾」**：非 SQLite 头一律读作 migrated（这就是密文的形状）。垃圾库会在
+  下一趟迁移器那里答终态 store_state_invalid → VERIFY_FAILED，状态面随之收敛：读得快不牺牲判得准。
+- **同进程两个 pool 不能开同一 data-dir**（occupancy lock），所以「重启后仍 migrated」用同目录下新建的
+  第二个 pool（锁在旧 pool 活着时拿不到，只影响能否起引擎，不影响状态面）。
+- legacy 组引擎拓扑仍不迁移（没有账号级 key）：skipped → CAPABILITY_MISSING，起引擎照旧。
+- 迁移在飞时来一次 delete：wake_slot_waiting 会等这一趟；等不到仍是 SlotWakeRefusal::MigrationGate，
+  delete 走 §4.276 的纯 store 出口，两条路共用同一份 receipt。

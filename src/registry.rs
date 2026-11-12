@@ -246,6 +246,15 @@ fn account_already_linked_error() -> ServiceError {
 pub enum StartFailure {
     AlreadyRunning,
     StartFailed,
+    /// Every slot that could start was refused by the store-migration gate
+    /// (a latched terminal block, or the plaintext preflight). This is a
+    /// terminal answer for the process: retrying the same runtime.start cannot
+    /// heal it, so the host must render the reason instead of retrying. The
+    /// store code rides along so the wire can name it.
+    StoreMigrationBlocked {
+        code: String,
+        message: String,
+    },
     /// O1: at least one engine refused the contract handshake (identity
     /// missing or revision outside the supported interval). Not retryable: the
     /// fault is latched on the supervisor and the same binary answers the same
@@ -998,7 +1007,7 @@ impl ProxyGroupRuntime {
         if let Some(pool) = &self.pool {
             // Full pooling: no group engine exists. The resident window (top-K
             // most recently used account slots) starts here.
-            pool.start_resident().await;
+            let start_block = pool.start_resident().await;
             // O1: one engine binary backs every slot, so one contract refusal
             // is a runtime-wide refusal. Stop what already started instead of
             // leaving a half-running account pipeline behind the fatal.
@@ -1014,10 +1023,24 @@ impl ProxyGroupRuntime {
                     any_running = true;
                 }
             }
+            // Contract 1.291 (§4.277 A): a slot whose migration pass is still
+            // running is *on its way up*, not failed. Counting it as a failure
+            // would turn every asynchronous start into RUNTIME_START_FAILED.
+            if pool.any_migration_in_flight() {
+                any_running = true;
+            }
             // A pool with no accounts legitimately has nothing to start (the
             // desktop still gets an honest stopped aggregate); only a pool
             // whose slots all failed answers RUNTIME_START_FAILED.
             if !any_running && !pool.is_empty() {
+                // A terminal store refusal is not a retryable start failure: it
+                // already names the account-level reason a human has to act on.
+                if let Some(block) = start_block {
+                    return Err(StartFailure::StoreMigrationBlocked {
+                        code: block.code,
+                        message: block.message,
+                    });
+                }
                 return Err(StartFailure::StartFailed);
             }
             return Ok(self.status().await);
@@ -1326,11 +1349,18 @@ impl ProxyGroupRuntime {
         self.ensure_history_retention(account.supervisor());
         // Start the account's engine before the QR mint (a fresh slot has no
         // process yet; the supervisor's engine lock keeps this single).
-        if let Err(error) = account.supervisor().start().await
-            && !matches!(error, EngineError::Backpressure)
-        {
-            self.rollback_account_slot(&account).await;
-            return Err(ServiceError::Engine(error));
+        //
+        // Contract 1.291 (§4.277 C): this used to call the supervisor directly,
+        // which was the one start face the store gate did not see. It now goes
+        // through the pool's **waiting** wake: a link is a human flow with its
+        // own budget, so it runs the migration inline instead of being told to
+        // come back, and no path can spawn this engine without the gate's word.
+        match pool.wake_slot_waiting(&account).await {
+            Ok(()) => {}
+            Err(refusal) => {
+                self.rollback_account_slot(&account).await;
+                return Err(refusal.into_service_error());
+            }
         }
         match account.supervisor().start_link(device_name).await {
             Ok(value) => {
@@ -1770,7 +1800,9 @@ impl ProxyGroupRuntime {
                 return self.delete_absent_account(&account_id, operation_id).await;
             };
             if self.running.load(Ordering::Acquire) {
-                match pool.wake_slot(&slot).await {
+                // A delete is a human flow with its own budget (contract 1.291):
+                // it waits for a migration pass rather than being answered "not yet".
+                match pool.wake_slot_waiting(&slot).await {
                     Ok(()) => {}
                     // M2 (M6 D3 review): the store-migration gate may refuse
                     // this slot an engine. It must not thereby refuse the user
@@ -4342,6 +4374,7 @@ mod tests {
             resource_pressure: false,
             resident: true,
             restarts: 0,
+            store_migration: None,
         }
     }
 

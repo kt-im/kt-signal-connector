@@ -1142,6 +1142,18 @@ impl ServiceError {
                 "engine runtime could not be started",
                 true,
             ),
+            // Contract 1.291 (§4.277 C): a spawn the store gate deferred. The
+            // payload is the closed literal for the lifecycle state; every arm
+            // is retryable except a blocked store, which is exactly the shape
+            // the wake path already answers.
+            ServiceError::Engine(EngineError::StoreDeferred { code }) => ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                crate::pool::store_gate_deferral_message(code),
+                !matches!(
+                    code,
+                    "store_migration_blocked" | "store_plaintext_requires_migration"
+                ),
+            ),
             // O1: a slot woken by an account call can hit the same contract
             // refusal `runtime.start` answers. Non-retryable by construction:
             // the fault is latched and the same engine binary cannot heal it.

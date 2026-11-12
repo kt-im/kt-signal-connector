@@ -28,6 +28,7 @@ pub mod registry;
 pub mod resource;
 pub mod service;
 pub mod store;
+pub mod store_preflight;
 pub mod supervisor;
 
 pub const API_VERSION: &str = "1.0";

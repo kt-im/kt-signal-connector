@@ -397,6 +397,13 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[
         ("/$defs/requestId", "maxLength", MAX_REQUEST_ID_BYTES as u64),
+        // Contract 1.291 (§4.277 B): the migration status code is clamped to the
+        // same bound the connector enforces before it writes the face.
+        (
+            "/$defs/storeMigration/properties/code",
+            "maxLength",
+            kt_signal_connector::pool::STORE_MIGRATION_CODE_MAX_CHARS as u64,
+        ),
         ("/$defs/opaqueId", "maxLength", MAX_OPAQUE_ID_BYTES as u64),
         (
             "/$defs/linkStartParams/properties/deviceName",
@@ -1262,5 +1269,61 @@ fn identity_faces_declare_the_addressing_one_of_and_peer_key_grammar() {
             ],
             "the peerKey grammar drifted at {pointer}"
         );
+    }
+}
+/// Contract 1.291 (§4.277 B): the status face is a closed vocabulary on both
+/// halves, and the connector's own code is the only source of it. `off` is
+/// deliberately absent from the wire enum: an unarmed connector omits the key.
+#[test]
+fn the_store_migration_face_matches_the_code_vocabulary() {
+    use kt_signal_connector::pool::{
+        STORE_CODE_CAPABILITY_MISSING, STORE_CODE_INTERRUPTED, STORE_CODE_IO_ERROR,
+        STORE_CODE_KEY_INVALID, STORE_CODE_LOCKED, STORE_CODE_REQUIRED, STORE_CODE_TIMEOUT,
+        STORE_CODE_VERIFY_FAILED, StoreMigrationState,
+    };
+    let declared = schema_enum("/$defs/storeMigrationState/enum");
+    let emitted: BTreeSet<String> = [
+        StoreMigrationState::Pending,
+        StoreMigrationState::Migrating,
+        StoreMigrationState::Migrated,
+        StoreMigrationState::Blocked,
+        StoreMigrationState::Failed,
+    ]
+    .iter()
+    .map(|state| state.label().to_string())
+    .collect();
+    assert_eq!(
+        declared, emitted,
+        "the wire enum is exactly the states the connector can report"
+    );
+    assert!(
+        !declared.contains("off"),
+        "an unarmed connector omits the key; it never sends a sixth word"
+    );
+    let codes = schema_enum("/$defs/storeMigration/properties/code/enum");
+    let known: BTreeSet<String> = [
+        STORE_CODE_CAPABILITY_MISSING,
+        STORE_CODE_KEY_INVALID,
+        STORE_CODE_VERIFY_FAILED,
+        STORE_CODE_REQUIRED,
+        STORE_CODE_INTERRUPTED,
+        STORE_CODE_IO_ERROR,
+        STORE_CODE_LOCKED,
+        STORE_CODE_TIMEOUT,
+    ]
+    .iter()
+    .map(|code| code.to_string())
+    .collect();
+    assert_eq!(codes, known, "the code face is closed and connector-owned");
+    for state in [
+        StoreMigrationState::Off,
+        StoreMigrationState::Pending,
+        StoreMigrationState::Migrating,
+        StoreMigrationState::Migrated,
+        StoreMigrationState::Blocked,
+        StoreMigrationState::Failed,
+    ] {
+        let label = state.label();
+        assert!(label.len() <= 16, "{label}");
     }
 }

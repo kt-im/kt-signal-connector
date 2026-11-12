@@ -31,10 +31,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use kt_signal_connector::engine::EngineError;
 use kt_signal_connector::groups;
 use kt_signal_connector::pool::{EnginePoolPolicy, StoreMigrationOptions, account_fingerprint};
 use kt_signal_connector::registry::{
-    ProxyGroupRuntime, RuntimeOptions, open_group_runtime_with_options,
+    ProxyGroupRuntime, RuntimeOptions, StartFailure, open_group_runtime_with_options,
 };
 use kt_signal_connector::service::{AccountsGetUsernameParams, ServiceError};
 use kt_signal_connector::store::{Store, StoreKey, derive_engine_store_key};
@@ -44,6 +45,11 @@ use tempfile::TempDir;
 const TEST_STORE_KEY: [u8; 32] = [0x5A; 32];
 const MIGRATE_ENV: &str = "KT_ENGINE_STORE_MIGRATE";
 const BUDGET_ENV: &str = "KT_ENGINE_STORE_MIGRATE_BUDGET_MS";
+const INTENT_ENV: &str = "KT_ENGINE_STORE_REQUIRE_ENCRYPTED";
+
+fn harness_account(account: &str) -> Value {
+    Value::String(account.to_string())
+}
 
 /// One migration switch per process at a time: the env is global, so the tests
 /// that set it take this lock for their whole body.
@@ -116,12 +122,9 @@ if sleep_ms:
     time.sleep(sleep_ms / 1000.0)
 dry = "--dry-run" in argv
 code = sequence.get("code") or ("store_migration_planned" if dry else ("store_migrated" if exit_code == 0 else "store_busy"))
-print(json.dumps({
-    "ok": exit_code == 0,
-    "dryRun": dry,
-    "freeBytes": 1,
-    "needBytes": 1,
-    "accounts": [{
+accounts = sequence.get("accounts")
+if accounts is None:
+    accounts = [{
         "lk": "lk-0123456789abcdef",
         "action": "dry-run" if dry else ("migrate" if exit_code == 0 else "failed"),
         "code": code,
@@ -130,7 +133,13 @@ print(json.dumps({
         "keyid": "0123456789abcdef",
         "backup": None,
         "checks": [],
-    }],
+    }]
+print(json.dumps({
+    "ok": exit_code == 0,
+    "dryRun": dry,
+    "freeBytes": 1,
+    "needBytes": 1,
+    "accounts": accounts,
     "plan": ["checkpoint", "backup", "export", "verify", "swap"],
     "did": [],
 }))
@@ -153,9 +162,12 @@ fn seed_account(temp: &TempDir, id: &str, number: &str) {
     let data_dir = temp.path().join("signal-data").join("engines").join(id);
     let relative = format!("accounts/lk-{}", &id[..16]);
     std::fs::create_dir_all(data_dir.join(&relative)).unwrap();
+    // A real plaintext SQLite store, header included: the preflight and the
+    // status face both read that header, so a fixture without it would silently
+    // exercise the "already encrypted" branch instead of the migration one.
     std::fs::write(
         data_dir.join(&relative).join("store.db"),
-        b"plaintext-store-bytes",
+        b"SQLite format 3\0plaintext-store-bytes",
     )
     .unwrap();
     std::fs::write(
@@ -263,6 +275,43 @@ impl Harness {
         runtime
     }
 
+    /// `open` with the operator's store-encryption intent armed or cleared.
+    /// The intent is read once at runtime assembly, exactly like the switch.
+    async fn open_intent(&self, mode: &str, intent: Option<&str>) -> Arc<ProxyGroupRuntime> {
+        match intent {
+            Some(value) => unsafe { std::env::set_var(INTENT_ENV, value) },
+            None => unsafe { std::env::remove_var(INTENT_ENV) },
+        }
+        let runtime = self.open(mode, None).await;
+        unsafe { std::env::remove_var(INTENT_ENV) };
+        runtime
+    }
+
+    /// Every call the stub engine logged, whatever the account directory - the
+    /// cases that provision a second (random) slot cannot use [`Self::calls`].
+    fn all_calls(&self) -> Vec<Value> {
+        let Ok(text) = std::fs::read_to_string(self.temp.path().join("calls.log")) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect()
+    }
+
+    /// This account's `engines[]` entry as the host sees it (contract 1.291).
+    async fn face(&self, runtime: &Arc<ProxyGroupRuntime>) -> Value {
+        let status = runtime.status().await;
+        let engines = serde_json::to_value(&status.engines).expect("engines serialize");
+        engines
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["accountId"] == harness_account(&self.account))
+                    .cloned()
+            })
+            .unwrap_or(Value::Null)
+    }
+
     fn calls(&self) -> Vec<Value> {
         let Ok(text) = std::fs::read_to_string(self.temp.path().join("calls.log")) else {
             return Vec::new();
@@ -308,6 +357,20 @@ impl Harness {
         Store::open(&self.temp.path().join("state"), Some(key())).unwrap()
     }
 
+    /// `runtime.start()` and then wait for this account's migration lifecycle to
+    /// stop moving.
+    ///
+    /// Contract 1.291 (§4.277 A): the start no longer runs the pass on its own
+    /// stack - it schedules it and returns - so every assertion below has to wait
+    /// for the scheduled pass exactly like a host waits for its next status frame.
+    async fn start_and_settle(&self, runtime: &Arc<ProxyGroupRuntime>) -> Result<(), ()> {
+        let started = runtime.start().await;
+        Arc::clone(&self.pool(runtime))
+            .wait_for_store_migration(&self.account, Duration::from_secs(15))
+            .await;
+        started.map(|_| ()).map_err(|_| ())
+    }
+
     /// The live engine process of this account, if it has one.
     async fn engine_pid(&self, runtime: &Arc<ProxyGroupRuntime>) -> Option<u32> {
         self.pool(runtime)
@@ -316,6 +379,21 @@ impl Harness {
             .into_iter()
             .find(|status| status.account_id == self.account)
             .and_then(|status| status.pid)
+    }
+
+    /// Wait until every scheduled migration pass has left the pool. The pass
+    /// starts its engine before clearing the in-flight bit, so a caller that
+    /// returns from here sees the engines the passes own.
+    async fn wait_for_all_migrations(&self, runtime: &Arc<ProxyGroupRuntime>) {
+        let pool = self.pool(runtime);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while pool.any_migration_in_flight() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !pool.any_migration_in_flight(),
+            "every scheduled migration must settle"
+        );
     }
 }
 
@@ -379,7 +457,7 @@ async fn off_mode_spawns_no_migrator_and_starts_the_engine() {
     let _guard = ENV_LOCK.lock().await;
     let harness = Harness::new(json!({"exits": [0]}));
     let runtime = harness.open("off", None).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     assert!(
         harness.migrate_calls().is_empty(),
         "off must not spawn the migrator at all: {:?}",
@@ -400,7 +478,7 @@ async fn apply_mode_migrates_before_the_engine_and_hands_over_the_derived_key() 
     let _guard = ENV_LOCK.lock().await;
     let harness = Harness::new(json!({"exits": [0]}));
     let runtime = harness.open("apply", None).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
 
     let calls = harness.calls();
     assert_eq!(calls.len(), 2, "one migration, one engine: {calls:?}");
@@ -443,7 +521,7 @@ async fn dry_run_only_plans_and_still_starts_the_engine() {
     let harness = Harness::new(json!({"exits": [0]}));
     let before = harness.store_bytes();
     let runtime = harness.open("dry-run", None).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
 
     let migrate = harness.migrate_calls();
     assert_eq!(migrate.len(), 1, "{migrate:?}");
@@ -468,7 +546,7 @@ async fn a_retryable_exit_ten_is_retried_within_the_pass_and_then_succeeds() {
     let _guard = ENV_LOCK.lock().await;
     let harness = Harness::new(json!({"exits": [10, 10, 0]}));
     let runtime = harness.open("apply", None).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     assert_eq!(
         harness.migrate_calls().len(),
         3,
@@ -493,7 +571,7 @@ async fn an_exhausted_retryable_failure_stays_retryable_and_never_starts_the_eng
     let _guard = ENV_LOCK.lock().await;
     let harness = Harness::new(json!({"exits": [10], "code": "store_busy"}));
     let runtime = harness.open("apply", None).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     assert_eq!(
         harness.migrate_calls().len(),
         3,
@@ -510,7 +588,7 @@ async fn an_exhausted_retryable_failure_stays_retryable_and_never_starts_the_eng
             .is_none(),
         "exit 10 is not terminal: the next start must retry"
     );
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     assert_eq!(
         harness.migrate_calls().len(),
         6,
@@ -523,7 +601,7 @@ async fn a_terminal_exit_eleven_latches_a_block_and_is_never_retried() {
     let _guard = ENV_LOCK.lock().await;
     let harness = Harness::new(json!({"exits": [11], "code": "store_key_rejected"}));
     let runtime = harness.open("apply", None).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
 
     assert_eq!(
         harness.migrate_calls().len(),
@@ -549,7 +627,7 @@ async fn a_terminal_exit_eleven_latches_a_block_and_is_never_retried() {
 
     // No restart storm: the second start answers from the latch without
     // spawning anything.
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     assert_eq!(harness.migrate_calls().len(), 1, "latched, not retried");
 
     // A wake answers the host with the same actionable sentence, not retryably.
@@ -569,7 +647,7 @@ async fn a_usage_error_exit_two_is_a_connector_bug_not_a_blocked_account() {
     let _guard = ENV_LOCK.lock().await;
     let harness = Harness::new(json!({"exits": [2]}));
     let runtime = harness.open("apply", None).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     assert_eq!(harness.migrate_calls().len(), 1, "no retry within the pass");
     assert!(
         harness.engine_calls().is_empty(),
@@ -582,7 +660,7 @@ async fn a_usage_error_exit_two_is_a_connector_bug_not_a_blocked_account() {
             .is_none(),
         "an integration bug must not latch an account as broken"
     );
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     assert_eq!(
         harness.migrate_calls().len(),
         2,
@@ -628,7 +706,7 @@ async fn a_timeout_is_not_retried_within_the_same_pass() {
     let _guard = ENV_LOCK.lock().await;
     let harness = Harness::new(json!({"exits": [0], "sleepMs": 20000}));
     let runtime = harness.open("apply", Some(1500)).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     assert_eq!(
         harness.migrate_calls().len(),
         1,
@@ -654,7 +732,7 @@ async fn a_missing_data_directory_is_not_a_terminal_failure() {
     // The slot is discovered, then its directory disappears (unprovisioned or
     // unmounted): the engine creates its own store, so this must not block.
     std::fs::remove_dir_all(harness.data_dir()).unwrap();
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     assert!(
         harness.migrate_calls().is_empty(),
         "nothing to migrate: no migrator, no terminal data_dir_missing"
@@ -679,7 +757,7 @@ async fn migration_logs_name_the_mode_the_fingerprint_and_the_exit_but_never_the
     let logs = captured_logs();
     let harness = Harness::new(json!({"exits": [0]}));
     let runtime = harness.open("apply", None).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     runtime.stop().await.unwrap();
 
     // A terminal failure must obey the same discipline: the blocked line names
@@ -687,7 +765,7 @@ async fn migration_logs_name_the_mode_the_fingerprint_and_the_exit_but_never_the
     // carries no key material.
     let blocked = Harness::new(json!({"exits": [11], "code": "store_corrupt"}));
     let blocked_runtime = blocked.open("apply", None).await;
-    let _ = blocked_runtime.start().await;
+    let _ = blocked.start_and_settle(&blocked_runtime).await;
 
     let text = String::from_utf8_lossy(&logs.lock().unwrap()).to_string();
     let lines: Vec<&str> = text
@@ -726,7 +804,7 @@ async fn migration_logs_name_the_mode_the_fingerprint_and_the_exit_but_never_the
     let skewed = Harness::new(json!({"exits": [2]}));
     let skewed_runtime = skewed.open("apply", None).await;
     for _ in 0..3 {
-        let _ = skewed_runtime.start().await;
+        let _ = skewed.start_and_settle(&skewed_runtime).await;
     }
     assert_eq!(
         skewed.migrate_calls().len(),
@@ -761,7 +839,13 @@ async fn a_second_start_leaves_the_live_engine_alone() {
     runtime
         .start()
         .await
-        .expect("the first start migrates and starts the engine");
+        .expect("the first start schedules the dry run");
+    // Dry runs now land in their own task (§4.277 A): wait for the pass that
+    // starts the engine before treating the slot as live.
+    harness
+        .pool(&runtime)
+        .wait_for_store_migration(&harness.account, Duration::from_secs(20))
+        .await;
     let pid = harness.engine_pid(&runtime).await.expect("engine is live");
     assert_eq!(harness.migrate_calls().len(), 1);
     assert_eq!(harness.engine_calls().len(), 1);
@@ -809,11 +893,17 @@ async fn a_migrated_slot_skips_the_second_migration_run() {
     let runtime = harness
         .open_with("apply", None, Some(Duration::from_secs(3600)))
         .await;
-    runtime.start().await.expect("the first start migrates");
+    harness
+        .start_and_settle(&runtime)
+        .await
+        .expect("the first start migrates");
     assert_eq!(harness.migrate_calls().len(), 1);
     runtime.stop().await.unwrap();
 
-    runtime.start().await.expect("the second start runs");
+    harness
+        .start_and_settle(&runtime)
+        .await
+        .expect("the second start runs");
     assert_eq!(
         harness.migrate_calls().len(),
         1,
@@ -838,7 +928,7 @@ async fn a_latched_slot_still_deletes_its_local_data_and_frees_the_slot() {
     // A pool whose every slot is refused answers RUNTIME_START_FAILED (there is
     // no live engine to report); the runtime is still up, which is what the
     // delete path below depends on.
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     let pool = harness.pool(&runtime);
     assert!(
         pool.migration_block(&harness.account).is_some(),
@@ -891,7 +981,7 @@ async fn a_malformed_operation_id_is_refused_on_the_engine_free_path() {
     let _guard = ENV_LOCK.lock().await;
     let harness = Harness::new(json!({"exits": [11], "code": "store_key_rejected"}));
     let runtime = harness.open("apply", None).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     let pool = harness.pool(&runtime);
     assert!(
         pool.migration_block(&harness.account).is_some(),
@@ -959,7 +1049,7 @@ async fn an_engine_free_delete_leaves_no_plaintext_export_artifacts() {
     let _guard = ENV_LOCK.lock().await;
     let harness = Harness::new(json!({"exits": [11], "code": "store_key_rejected"}));
     let runtime = harness.open("apply", None).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
     let pool = harness.pool(&runtime);
     assert!(
         pool.migration_block(&harness.account).is_some(),
@@ -1018,7 +1108,7 @@ async fn a_cipherless_engine_build_gets_the_deployment_remedy() {
     let _guard = ENV_LOCK.lock().await;
     let harness = Harness::new(json!({"exits": [11], "code": "StoreCipherUnavailable"}));
     let runtime = harness.open("apply", None).await;
-    let _ = runtime.start().await;
+    let _ = harness.start_and_settle(&runtime).await;
 
     let block = harness
         .pool(&runtime)
@@ -1076,4 +1166,662 @@ fn the_plan_says_what_a_retryable_migration_really_does() {
         section.contains("StoreCipherUnavailable"),
         "the deployment-only code is documented separately"
     );
+}
+
+// ———————————— contract 1.291 (§4.277): the migration lifecycle ————————————
+
+/// A: runtime.start must not run the pass on its own stack. A host dispatches
+/// with a deadline; a whole-store copy of eight accounts behind one start is
+/// exactly what that deadline kills.
+#[tokio::test]
+async fn runtime_start_returns_before_the_pass_finishes() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0], "sleepMs": 1500}));
+    let runtime = harness.open("apply", Some(20_000)).await;
+    let clock = std::time::Instant::now();
+    let result = runtime.start().await;
+    let elapsed = clock.elapsed();
+    assert!(result.is_ok(), "a pool on its way up is not a failed start");
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "runtime.start must return before the pass lands: {elapsed:?}"
+    );
+    assert!(
+        harness.engine_calls().is_empty(),
+        "the engine starts only after the pass: {:?}",
+        harness.all_calls()
+    );
+    let face = harness
+        .pool(&runtime)
+        .wait_for_store_migration(&harness.account, Duration::from_secs(20))
+        .await
+        .expect("the slot is still registered");
+    assert_eq!(face.state.label(), "migrated", "{face:?}");
+    assert_eq!(harness.migrate_calls().len(), 1);
+    assert_eq!(harness.engine_calls().len(), 1, "{:?}", harness.all_calls());
+    runtime.stop().await.unwrap();
+}
+
+/// A: one slot, one pass. Two starts arriving together must not put two
+/// migrator processes on one store.
+#[tokio::test]
+async fn concurrent_starts_schedule_one_pass() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0], "sleepMs": 700}));
+    let runtime = harness.open("apply", Some(20_000)).await;
+    let (first, second) = tokio::join!(runtime.start(), runtime.start());
+    assert!(first.is_ok() && second.is_ok(), "both starts answer");
+    harness
+        .pool(&runtime)
+        .wait_for_store_migration(&harness.account, Duration::from_secs(20))
+        .await;
+    assert_eq!(
+        harness.migrate_calls().len(),
+        1,
+        "single flight per slot: {:?}",
+        harness.all_calls()
+    );
+    assert_eq!(harness.engine_calls().len(), 1);
+    runtime.stop().await.unwrap();
+}
+
+/// A/UX-4: the reported face is derived from the **store header**, so a
+/// restarted process reports what is on disk instead of forgetting it.
+#[tokio::test]
+async fn the_face_is_derived_from_the_store_header_not_from_memory() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0]}));
+    let plain = harness.open("apply", None).await;
+    let face = harness.face(&plain).await;
+    assert_eq!(face["storeMigration"]["state"], "pending", "{face}");
+    let store = harness
+        .data_dir()
+        .join(format!("accounts/lk-{}", &harness.account[..16]))
+        .join("store.db");
+    std::fs::write(&store, [0x9a_u8, 0x1f, 0x00, 0x5c, 0x11, 0x7d, 0x33, 0x02]).unwrap();
+    let encrypted = harness.open("apply", None).await;
+    let face = harness.face(&encrypted).await;
+    assert_eq!(face["storeMigration"]["state"], "migrated", "{face}");
+}
+
+/// B: with the switch off the status face carries no store-migration key at
+/// all - an unarmed connector answers the pre-4.277 bytes.
+#[tokio::test]
+async fn off_state_omits_the_store_migration_key_and_an_armed_one_names_it() {
+    let _guard = ENV_LOCK.lock().await;
+    let off = Harness::new(json!({"exits": [0]}));
+    let off_runtime = off.open("off", None).await;
+    let _ = off.start_and_settle(&off_runtime).await;
+    let face = off.face(&off_runtime).await;
+    assert!(
+        face.get("storeMigration").is_none(),
+        "off adds no field: {face}"
+    );
+    off_runtime.stop().await.unwrap();
+
+    let blocked = Harness::new(json!({"exits": [11], "code": "store_key_rejected"}));
+    let blocked_runtime = blocked.open("apply", None).await;
+    let _ = blocked.start_and_settle(&blocked_runtime).await;
+    let face = blocked.face(&blocked_runtime).await;
+    assert_eq!(face["storeMigration"]["state"], "blocked", "{face}");
+    assert_eq!(
+        face["storeMigration"]["code"], "KEY_INVALID",
+        "the connector owns this vocabulary: {face}"
+    );
+    assert!(
+        face["storeMigration"].get("exit").is_none(),
+        "no engine exit code on the contract face: {face}"
+    );
+}
+
+/// B: the CAPABILITY_UNAVAILABLE face of a pass that already failed must stop
+/// promising a retry nobody will make (UX 2: only an explicit start retries).
+#[tokio::test]
+async fn a_failed_pass_answers_not_retryable_and_says_what_to_do() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [10], "code": "store_busy"}));
+    let runtime = harness.open("apply", None).await;
+    let _ = harness.start_and_settle(&runtime).await;
+    let pool = harness.pool(&runtime);
+    let face = harness.face(&runtime).await;
+    assert_eq!(face["storeMigration"]["state"], "failed", "{face}");
+    assert_eq!(face["storeMigration"]["code"], "LOCKED", "{face}");
+
+    let slot = pool.get(&harness.account).expect("slot");
+    match pool.ensure_resident(&slot).await {
+        Err(ServiceError::Api(error)) => {
+            assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
+            assert!(
+                !error.retryable,
+                "nothing retries this on its own: {error:?}"
+            );
+            assert!(error.message.contains("store_busy"), "{}", error.message);
+            assert!(
+                error.message.contains("not retried automatically"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("a failed slot answers an API error, got {other:?}"),
+    }
+    // A wake must not put a new pass on the wire. Settle first: a scheduled pass
+    // would land after the refusal and hide itself from an immediate count.
+    harness
+        .pool(&runtime)
+        .wait_for_store_migration(&harness.account, Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        harness.migrate_calls().len(),
+        3,
+        "a wake does not re-run a failed pass: {:?}",
+        harness.all_calls()
+    );
+    let _ = harness.start_and_settle(&runtime).await;
+    assert_eq!(harness.migrate_calls().len(), 6, "the user's start retries");
+}
+
+/// C: no start face may spawn an engine while a pass owns the store - the
+/// crash restart included (it shares this exact admission call).
+#[tokio::test]
+async fn a_crash_restart_asks_the_store_gate_before_spawning() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0], "sleepMs": 900}));
+    let runtime = harness.open("apply", Some(20_000)).await;
+    let _ = runtime.start().await;
+    let pool = harness.pool(&runtime);
+    let slot = pool.get(&harness.account).expect("slot");
+    assert_eq!(
+        slot.migration_state().label(),
+        "pending",
+        "the pass is scheduled, not finished"
+    );
+    match slot.supervisor().start().await {
+        Err(EngineError::StoreDeferred { code }) => {
+            assert_eq!(code, "store_migration_pending", "{code}");
+        }
+        other => panic!("a gated start must be refused with a closed code, got {other:?}"),
+    }
+    assert!(
+        harness.engine_calls().is_empty(),
+        "no engine may open a store a pass is writing: {:?}",
+        harness.all_calls()
+    );
+    harness
+        .pool(&runtime)
+        .wait_for_store_migration(&harness.account, Duration::from_secs(20))
+        .await;
+    assert_eq!(harness.engine_calls().len(), 1, "{:?}", harness.all_calls());
+    runtime.stop().await.unwrap();
+}
+
+/// C: link.start used to call the supervisor directly - the one start face the
+/// gate could not see. The fresh-link path now goes through
+/// `pool.wake_slot_waiting`, the same waiting wake a human flow uses, so a
+/// store verdict must stop that wake before any engine spawns.
+#[tokio::test]
+async fn link_start_goes_through_the_store_gate() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0]}));
+    // Intent on + migrator off: a provisioned slot with a plaintext store is
+    // exactly the store the preflight refuses. The link path's waiting wake
+    // must answer that refusal instead of spawning an engine.
+    let runtime = harness.open_intent("off", Some("on")).await;
+    let pool = harness.pool(&runtime);
+    let slot = pool
+        .provision_slot("default")
+        .expect("the slot is provisioned");
+    let account_dir = harness
+        .temp
+        .path()
+        .join("signal-data")
+        .join("engines")
+        .join(slot.account_id())
+        .join("accounts/lk-gate");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(
+        account_dir.join("store.db"),
+        b"SQLite format 3\0plaintext-store",
+    )
+    .unwrap();
+    let error = pool
+        .wake_slot_waiting(&slot)
+        .await
+        .expect_err("a plaintext store nothing will migrate must refuse the wake");
+    match error.into_service_error() {
+        ServiceError::Api(api) => {
+            assert_eq!(api.code, "CAPABILITY_UNAVAILABLE", "{api:?}");
+            assert!(
+                !api.retryable,
+                "a terminal store verdict does not retry: {api:?}"
+            );
+            assert!(
+                api.message.contains("KT_ENGINE_STORE_REQUIRE_ENCRYPTED"),
+                "{}",
+                api.message
+            );
+        }
+        other => panic!("the waiting wake answers the gate's error face, got {other:?}"),
+    }
+    assert!(
+        harness
+            .all_calls()
+            .iter()
+            .all(|call| call["mode"] != "jsonrpc"),
+        "the refused wake spawned no engine: {:?}",
+        harness.all_calls()
+    );
+    let _ = runtime.stop().await;
+}
+
+/// D: all four conditions are needed. Intent on + plaintext store + the
+/// migrator off refuses the start; the same host with the intent off starts.
+#[tokio::test]
+async fn the_preflight_refuses_only_with_all_four_conditions() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0]}));
+    let armed = harness.open_intent("off", Some("on")).await;
+    match armed.start().await {
+        Err(StartFailure::StoreMigrationBlocked { code, .. }) => {
+            assert_eq!(
+                code, "store_plaintext_requires_migration",
+                "the preflight refusal must name its store code"
+            );
+        }
+        other => panic!("a preflight refusal is a terminal start failure, got {other:?}"),
+    }
+    assert!(
+        harness.engine_calls().is_empty(),
+        "a plaintext store nothing will migrate must not start an engine: {:?}",
+        harness.all_calls()
+    );
+    let face = harness.face(&armed).await;
+    assert!(
+        face.get("storeMigration").is_none(),
+        "the switch is off, so the face stays empty (task B): {face}"
+    );
+    let slot = harness.pool(&armed).get(&harness.account).expect("slot");
+    match harness.pool(&armed).ensure_resident(&slot).await {
+        Err(ServiceError::Api(error)) => {
+            assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
+            assert!(!error.retryable, "retrying changes nothing: {error:?}");
+            assert!(
+                error.message.contains("KT_ENGINE_STORE_MIGRATE"),
+                "{}",
+                error.message
+            );
+            assert!(
+                error.message.contains("KT_ENGINE_STORE_REQUIRE_ENCRYPTED"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("the preflight answers an API error, got {other:?}"),
+    }
+    // Nothing ever started, so the runtime answers NotRunning here on purpose.
+    let _ = armed.stop().await;
+
+    // The same posture on a host whose operator never asked for encryption: the
+    // engine starts exactly as it did before this revision.
+    let quiet = Harness::new(json!({"exits": [0]}));
+    let quiet_runtime = quiet.open_intent("off", None).await;
+    let _ = quiet_runtime.start().await;
+    assert_eq!(quiet.engine_calls().len(), 1, "{:?}", quiet.all_calls());
+    quiet_runtime.stop().await.unwrap();
+}
+
+/// D: a plaintext backup beside the connector store is a warning, never a
+/// refusal - the live store it copies is already encrypted.
+#[tokio::test]
+async fn a_plaintext_backup_is_a_warning_not_a_refusal() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0]}));
+    std::fs::write(
+        harness
+            .temp
+            .path()
+            .join("state")
+            .join("connector.sqlite3.plaintext-backup"),
+        b"SQLite format 3\0",
+    )
+    .unwrap();
+    let store = harness
+        .data_dir()
+        .join(format!("accounts/lk-{}", &harness.account[..16]))
+        .join("store.db");
+    std::fs::write(&store, [0x9a_u8, 0x1f, 0x00, 0x5c]).unwrap();
+    let runtime = harness.open_intent("off", Some("on")).await;
+    let _ = runtime.start().await;
+    assert_eq!(
+        harness.engine_calls().len(),
+        1,
+        "an informational backup must not stop the account: {:?}",
+        harness.all_calls()
+    );
+    runtime.stop().await.unwrap();
+}
+
+// ————————————— task-22: six must-fix regressions —————————————
+
+/// 1: an all-blocked pool answers a terminal start failure carrying the
+/// store code, never the retryable generic RUNTIME_START_FAILED.
+#[tokio::test]
+async fn runtime_start_answers_a_terminal_store_refusal_with_the_reason_code() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [11], "code": "store_key_rejected"}));
+    let runtime = harness.open("apply", None).await;
+    let _ = harness.start_and_settle(&runtime).await;
+    let failure = runtime
+        .start()
+        .await
+        .expect_err("a latched pool cannot start on a retry");
+    match failure {
+        StartFailure::StoreMigrationBlocked { code, message } => {
+            assert_eq!(code, "store_key_rejected", "the store code rides along");
+            assert!(
+                message.contains("Re-link the account"),
+                "the terminal answer carries the actionable sentence: {message}"
+            );
+        }
+        other => panic!("expected a terminal store refusal, got {other:?}"),
+    }
+}
+
+/// 2a: a waiting wake joins the pass already in flight instead of running a
+/// second dry-run plan on the same store.
+#[tokio::test]
+async fn wake_slot_waiting_joins_the_in_flight_pass_instead_of_rerunning_it() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0], "sleepMs": 700}));
+    let runtime = harness.open("dry-run", Some(20_000)).await;
+    runtime
+        .start()
+        .await
+        .expect("the start schedules the dry run");
+    let pool = harness.pool(&runtime);
+    let slot = pool.get(&harness.account).expect("slot");
+    pool.wake_slot_waiting(&slot)
+        .await
+        .expect("the waiting wake joins the pass");
+    assert_eq!(
+        harness.migrate_calls().len(),
+        1,
+        "one slot, one pass: a waiting wake must not start a second plan: {:?}",
+        harness.all_calls()
+    );
+    assert_eq!(harness.engine_calls().len(), 1);
+    runtime.stop().await.unwrap();
+}
+
+/// 2b: a failed pass is not retried by a waiting wake - the same failed policy
+/// as every other start face, not a direct gate_slot_start bypass.
+#[tokio::test]
+async fn wake_slot_waiting_respects_the_failed_policy() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [10], "code": "store_busy"}));
+    let runtime = harness.open("apply", None).await;
+    let _ = harness.start_and_settle(&runtime).await;
+    assert_eq!(harness.migrate_calls().len(), 3);
+    let pool = harness.pool(&runtime);
+    let slot = pool.get(&harness.account).expect("slot");
+    let refusal = pool
+        .wake_slot_waiting(&slot)
+        .await
+        .expect_err("a failed store is not retried by a wake");
+    match refusal.into_service_error() {
+        ServiceError::Api(error) => {
+            assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
+            assert!(
+                !error.retryable,
+                "a failed pass never promises a retry: {error:?}"
+            );
+            assert!(error.message.contains("store_busy"), "{}", error.message);
+        }
+        other => panic!("the waiting wake answers the gate's error face, got {other:?}"),
+    }
+    assert_eq!(
+        harness.migrate_calls().len(),
+        3,
+        "the wake must not re-run the failed pass: {:?}",
+        harness.all_calls()
+    );
+}
+
+/// 2c: link.start success leaves a fresh slot with its storeMigration face
+/// visible (task-24: a true fresh slot is migrated; no pass is scheduled).
+#[tokio::test]
+async fn link_start_records_the_store_migration_face() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0]}));
+    let runtime = harness.open("apply", None).await;
+    let _ = harness.start_and_settle(&runtime).await;
+    let before: Vec<String> = runtime
+        .status()
+        .await
+        .engines
+        .iter()
+        .map(|engine| engine.account_id.clone())
+        .collect();
+    runtime
+        .start_link("test-device".to_string(), None)
+        .await
+        .expect("the fresh link starts");
+    let after = runtime.status().await;
+    let account = after
+        .engines
+        .iter()
+        .find(|engine| !before.contains(&engine.account_id))
+        .expect("the new slot appears in engines[]")
+        .account_id
+        .clone();
+    let face = harness
+        .pool(&runtime)
+        .store_migration_status(&account)
+        .expect("link.start must write the storeMigration face");
+    assert_eq!(face.state.label(), "migrated", "{face:?}");
+    runtime.stop().await.unwrap();
+}
+
+/// task-24: a truly fresh slot (the empty V2 registry + empty data dir that
+/// `link.start` provisions) has nothing to migrate. It must report
+/// `migrated` and never spawn the migrator - an empty-directory pass used to
+/// end as `completed` -> `failed`.
+#[tokio::test]
+async fn a_truly_fresh_link_slot_is_migrated_without_a_migrator_run() {
+    let _guard = ENV_LOCK.lock().await;
+    // The second migration invocation would answer exit 11: if the fresh slot
+    // ever runs a migrator, its face becomes blocked and the zero-call
+    // assertion below catches the regression.
+    let harness = Harness::new(json!({"exits": [0, 11], "code": "store_migrate_data_dir_missing"}));
+    let runtime = harness.open("apply", None).await;
+    let _ = harness.start_and_settle(&runtime).await;
+    let before: Vec<String> = runtime
+        .status()
+        .await
+        .engines
+        .iter()
+        .map(|engine| engine.account_id.clone())
+        .collect();
+    runtime
+        .start_link("fresh-device".to_string(), None)
+        .await
+        .expect("the fresh link starts");
+    let after = runtime.status().await;
+    let account = after
+        .engines
+        .iter()
+        .find(|engine| !before.contains(&engine.account_id))
+        .expect("the new slot appears in engines[]")
+        .account_id
+        .clone();
+    let face = harness
+        .pool(&runtime)
+        .store_migration_status(&account)
+        .expect("link.start must write the storeMigration face");
+    assert_eq!(
+        face.state.label(),
+        "migrated",
+        "a fresh slot has no plaintext to migrate, so its face is migrated: {face:?}"
+    );
+    let fresh_calls: Vec<Value> = harness
+        .all_calls()
+        .into_iter()
+        .filter(|call| {
+            call.get("dataDir")
+                .and_then(Value::as_str)
+                .is_some_and(|dir| dir.ends_with(account.as_str()))
+        })
+        .collect();
+    assert!(
+        fresh_calls.iter().all(|call| call["mode"] != "migrate"),
+        "a fresh slot must not spawn the migrator: {fresh_calls:?}"
+    );
+    assert!(
+        fresh_calls.iter().any(|call| call["mode"] == "jsonrpc"),
+        "the engine still starts: {fresh_calls:?}"
+    );
+    runtime.stop().await.unwrap();
+}
+
+/// task-24: the migrator's exit-0 document with `accounts: []` (an empty
+/// registry) is a no-op, not an unclassified `completed` that the face would
+/// render as `failed`.
+#[tokio::test]
+async fn an_empty_accounts_document_is_a_noop_not_failed() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0], "accounts": []}));
+    let runtime = harness.open("apply", None).await;
+    let _ = harness.start_and_settle(&runtime).await;
+    let face = harness.face(&runtime).await;
+    assert_eq!(face["storeMigration"]["state"], "migrated", "{face}");
+    assert_eq!(harness.migrate_calls().len(), 1, "the pass still ran once");
+    assert_eq!(
+        harness.engine_calls().len(),
+        1,
+        "the no-op starts the engine"
+    );
+    runtime.stop().await.unwrap();
+}
+
+/// 3: an encrypted store found at process assembly is already migrated; the
+/// first start must not re-run the whole-store verify.
+#[tokio::test]
+async fn a_seeded_encrypted_store_skips_the_first_migration_run() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0]}));
+    let store = harness
+        .data_dir()
+        .join(format!("accounts/lk-{}", &harness.account[..16]))
+        .join("store.db");
+    std::fs::write(&store, [0x9a_u8, 0x1f, 0x00, 0x5c, 0x11, 0x7d, 0x33, 0x02]).unwrap();
+    let runtime = harness.open("apply", None).await;
+    let pool = harness.pool(&runtime);
+    let slot = pool.get(&harness.account).expect("slot");
+    assert!(
+        slot.store_migrated(),
+        "the encrypted header must set the process marker at seed time"
+    );
+    let face = harness.face(&runtime).await;
+    assert_eq!(face["storeMigration"]["state"], "migrated", "{face}");
+    let _ = harness.start_and_settle(&runtime).await;
+    assert!(
+        harness.migrate_calls().is_empty(),
+        "a header-derived migrated store must not be verified again: {:?}",
+        harness.all_calls()
+    );
+    assert_eq!(harness.engine_calls().len(), 1);
+    runtime.stop().await.unwrap();
+}
+
+/// 4: runtime.start must not serially spend eight dry-run plan budgets on the
+/// caller's 300 s dispatch clock.
+#[tokio::test]
+async fn runtime_start_does_not_run_eight_dry_runs_on_the_caller_clock() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0], "sleepMs": 700}));
+    for index in 1..8_u32 {
+        let id = format!("{:032x}", index);
+        seed_account(&harness.temp, &id, &format!("+1555555{:04}", 100 + index));
+    }
+    let runtime = harness.open("dry-run", Some(120_000)).await;
+    let clock = std::time::Instant::now();
+    let started = runtime.start().await;
+    let elapsed = clock.elapsed();
+    assert!(
+        started.is_ok(),
+        "a pool on its way up is not a failed start"
+    );
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "runtime.start must return before any dry-run plan lands: {elapsed:?}"
+    );
+    assert!(
+        harness
+            .all_calls()
+            .iter()
+            .all(|call| call["mode"] != "migrate"),
+        "no dry-run may run on the start clock: {:?}",
+        harness.all_calls()
+    );
+    harness.wait_for_all_migrations(&runtime).await;
+    let migrate_calls = harness
+        .all_calls()
+        .into_iter()
+        .filter(|call| call["mode"] == "migrate")
+        .count();
+    assert_eq!(migrate_calls, 8, "all eight slots plan in their own tasks");
+    let engine_calls = harness
+        .all_calls()
+        .into_iter()
+        .filter(|call| call["mode"] == "jsonrpc")
+        .count();
+    assert_eq!(
+        engine_calls, 8,
+        "every dry-run plan still starts its engine"
+    );
+    runtime.stop().await.unwrap();
+}
+
+/// 5: a zero-byte store is Absent, not "migrated": seeding the face from it
+/// would lie to the desktop before the engine ever creates the real store.
+#[tokio::test]
+async fn a_zero_length_store_is_pending_not_seeded_migrated() {
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0]}));
+    let store = harness
+        .data_dir()
+        .join(format!("accounts/lk-{}", &harness.account[..16]))
+        .join("store.db");
+    std::fs::write(&store, b"").unwrap();
+    let runtime = harness.open("apply", None).await;
+    let face = harness.face(&runtime).await;
+    assert_eq!(
+        face["storeMigration"]["state"], "pending",
+        "zero bytes is a fresh store, never a migrated one: {face}"
+    );
+    let _ = runtime.stop().await;
+}
+
+/// 6: a symlinked store is Unverifiable and is never read through the link.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_store_is_unverifiable_and_not_seeded_migrated() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = ENV_LOCK.lock().await;
+    let harness = Harness::new(json!({"exits": [0]}));
+    let store = harness
+        .data_dir()
+        .join(format!("accounts/lk-{}", &harness.account[..16]))
+        .join("store.db");
+    std::fs::remove_file(&store).unwrap();
+    let outside = harness.temp.path().join("outside.db");
+    std::fs::write(&outside, [0x9a_u8, 0x1f, 0x00, 0x5c]).unwrap();
+    symlink(&outside, &store).unwrap();
+    let runtime = harness.open("apply", None).await;
+    let face = harness.face(&runtime).await;
+    assert_eq!(
+        face["storeMigration"]["state"], "pending",
+        "a symlink is unverifiable, never a migrated store: {face}"
+    );
+    let _ = runtime.stop().await;
 }

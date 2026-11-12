@@ -454,19 +454,25 @@ fn parse_store_migration_document(stdout: &str) -> StoreMigrationRun {
     let Some(document) = document else {
         return run;
     };
-    if let Some(account) = document
-        .get("accounts")
-        .and_then(Value::as_array)
-        .and_then(|accounts| accounts.first())
-    {
-        run.action = account
-            .get("action")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        run.code = account
-            .get("code")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+    if let Some(accounts) = document.get("accounts").and_then(Value::as_array) {
+        if let Some(account) = accounts.first() {
+            run.action = account
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            run.code = account
+                .get("code")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        } else if document.get("error").is_none() {
+            // An empty `accounts` array is the migrator's "nothing to do"
+            // shape (a fresh slot has no store). Exit 0 plus this shape is a
+            // no-op; without this label the classifier would fall back to
+            // `completed`, which the migration face renders as `failed`
+            // (task-24). A document carrying a top-level `error` keeps its
+            // action-free shape: the exit code and that code are the verdict.
+            run.action = Some("noop".to_string());
+        }
     }
     if run.code.is_none() {
         run.code = document
@@ -526,6 +532,12 @@ pub enum EngineError {
     ContractMismatch(crate::engine_contract::EngineContractFault),
     #[error("engine is not running")]
     NotRunning,
+    /// Contract 1.291 (§4.277 C): the pool's store gate refused this spawn.
+    /// The payload is a closed literal naming the lifecycle state - never
+    /// engine text, never a path, never key material - and the caller maps it
+    /// to the host face.
+    #[error("engine start deferred by the store gate")]
+    StoreDeferred { code: &'static str },
     #[error("engine request queue is full")]
     Backpressure,
     #[error("engine request timed out")]
@@ -666,6 +678,7 @@ impl EngineError {
             EngineError::StartFailed => "start_failed",
             EngineError::ContractMismatch(_) => "contract_mismatch",
             EngineError::NotRunning => "not_running",
+            EngineError::StoreDeferred { .. } => "store_deferred",
             EngineError::Backpressure => "backpressure",
             EngineError::Timeout => "timeout",
             EngineError::UnknownOutcome => "unknown_outcome",
@@ -8739,6 +8752,24 @@ mod tests {
         );
         assert_eq!(run.code.as_deref(), Some("StoreKeyRequired"));
         assert_eq!(run.action, None);
+    }
+
+    /// task-24: an empty `accounts` array is the migrator's no-op shape for a
+    /// slot with no store. Before the fix it parsed as no action at all, and
+    /// exit 0 then fell back to `completed` -> the face rendered `failed`.
+    #[test]
+    fn an_empty_accounts_array_is_a_noop_not_an_unclassified_run() {
+        let mut run = parse_store_migration_document(
+            r#"{"ok":true,"dryRun":false,"accounts":[],"plan":[],"did":[]}"#,
+        );
+        run.exit = Some(0);
+        assert_eq!(run.action.as_deref(), Some("noop"));
+        assert_eq!(run.code, None);
+        assert_eq!(
+            crate::pool::classify_store_migration(crate::pool::StoreMigrationMode::Apply, &run),
+            crate::pool::StoreMigrationDecision::Start { outcome: "noop" },
+            "an empty store list must land on migrated, never failed"
+        );
     }
 
     #[test]

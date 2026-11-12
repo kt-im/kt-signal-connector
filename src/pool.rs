@@ -183,6 +183,12 @@ impl StoreMigrationMode {
 pub struct StoreMigrationOptions {
     pub mode: StoreMigrationMode,
     pub budget: Duration,
+    /// The operator's own intent (contract 1.291, §4.277 D): this host must not
+    /// run accounts on plaintext stores. Independent of `mode` - the switch says
+    /// whether this connector migrates, the intent says whether plaintext is
+    /// acceptable at all - and off by default, so an unarmed process keeps the
+    /// pre-4.277 posture exactly.
+    pub require_encrypted: bool,
 }
 
 impl Default for StoreMigrationOptions {
@@ -190,6 +196,7 @@ impl Default for StoreMigrationOptions {
         Self {
             mode: StoreMigrationMode::Off,
             budget: STORE_MIGRATION_BUDGET,
+            require_encrypted: false,
         }
     }
 }
@@ -224,14 +231,211 @@ impl StoreMigrationOptions {
             },
             Err(_) => STORE_MIGRATION_BUDGET,
         };
-        Self { mode, budget }
+        Self {
+            mode,
+            budget,
+            require_encrypted: crate::store_preflight::intent_from_env(),
+        }
     }
 
     pub fn is_enabled(self) -> bool {
         self.mode != StoreMigrationMode::Off
     }
+
+    /// Whether this process has to look at a slot's store at all: a migration
+    /// is armed, or the operator asked for encrypted stores. False is the
+    /// zero-cost posture - no read, no lock, no log line, no new field.
+    pub fn touches_store(self) -> bool {
+        self.is_enabled() || self.require_encrypted
+    }
 }
 
+/// The lifecycle state of one slot's store migration (contract 1.291, §4.277).
+///
+/// The machine is deliberately small: a pass is **scheduled** (pending),
+/// **runs** (migrating), and lands in exactly one state for that pass
+/// (migrated / blocked / failed). Off is the posture of a connector whose
+/// switch is not armed, and it is the only state the wire face omits.
+///
+/// Re-entrancy and crash recovery: a later start may leave a failed pass behind
+/// for one more attempt (that is what "retried on the next start" means), while
+/// a blocked slot never re-enters the migrator - the latch is terminal for the
+/// life of the process. **This machine is memory, not truth**: a process
+/// restart forgets it entirely and the encrypted-store header on disk becomes
+/// the authority again, so a pass killed mid-flight is simply re-run and
+/// answers whatever the header says. That is what makes the lifecycle
+/// idempotent across a crash without a single byte of connector-written state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreMigrationState {
+    /// The switch is off: no pass was scheduled, and the status face omits the
+    /// whole storeMigration key.
+    #[default]
+    Off,
+    /// A pass is scheduled (or required) and has not landed yet.
+    Pending,
+    /// The migrator is running for this slot right now.
+    Migrating,
+    /// This process proved this slot's store is encrypted. Starts stop asking.
+    Migrated,
+    /// Terminal: a human has to act. The gate never spawns a migrator again.
+    Blocked,
+    /// The last pass did not land (retryable, usage error, timeout, or nothing
+    /// to migrate). The next start asks again.
+    Failed,
+}
+
+impl StoreMigrationState {
+    /// The wire/log label. A label only, never input for a decision.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Pending => "pending",
+            Self::Migrating => "migrating",
+            Self::Migrated => "migrated",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Whether a start handed to the gate in this state may spawn an engine
+    /// without running another pass.
+    pub fn allows_start(self) -> bool {
+        matches!(self, Self::Off | Self::Migrated)
+    }
+}
+
+/// The bound on the code a status face may carry (contract 1.291, §4.277). The
+/// engine's vocabulary is closed and short; the face is bounded anyway, so an
+/// unknown engine code can never grow the wire.
+pub const STORE_MIGRATION_CODE_MAX_CHARS: usize = 64;
+
+/// Clamp a status code to [`STORE_MIGRATION_CODE_MAX_CHARS`] **characters** (not
+/// bytes: a multi-byte code must never be split into invalid UTF-8).
+pub fn clamp_store_migration_code(code: &str) -> String {
+    code.chars().take(STORE_MIGRATION_CODE_MAX_CHARS).collect()
+}
+
+/// The closed status codes of the `blocked` state (contract 1.291, §4.277 B).
+/// The connector owns this vocabulary: the desktop renders a state and one of
+/// these words, and never has to guess from an engine's internal code.
+pub const STORE_CODE_CAPABILITY_MISSING: &str = "CAPABILITY_MISSING";
+pub const STORE_CODE_KEY_INVALID: &str = "KEY_INVALID";
+pub const STORE_CODE_VERIFY_FAILED: &str = "VERIFY_FAILED";
+pub const STORE_CODE_REQUIRED: &str = "REQUIRED";
+/// The closed status codes of the `failed` state.
+pub const STORE_CODE_INTERRUPTED: &str = "INTERRUPTED";
+pub const STORE_CODE_IO_ERROR: &str = "IO_ERROR";
+pub const STORE_CODE_LOCKED: &str = "LOCKED";
+pub const STORE_CODE_TIMEOUT: &str = "TIMEOUT";
+
+/// Map one finished pass onto the status face's code vocabulary.
+///
+/// The engine speaks its own closed vocabulary (StoreKeyRequired, store_busy,
+/// ...); the status face speaks eight words the desktop can switch on. Keeping
+/// the translation here - beside the decision the connector already makes - is
+/// what lets the contract say "the connector decides, the desktop renders".
+/// An unknown terminal code maps to VERIFY_FAILED (the closest honest word for
+/// "the store could not be proven encrypted") rather than being passed through.
+pub fn store_migration_face_code(
+    decision: &StoreMigrationDecision,
+    engine_code: Option<&str>,
+) -> &'static str {
+    match decision {
+        StoreMigrationDecision::Blocked { block }
+            if block.code == STORE_PLAINTEXT_REQUIRES_MIGRATION =>
+        {
+            STORE_CODE_REQUIRED
+        }
+        StoreMigrationDecision::Blocked { .. } => match engine_code {
+            Some("StoreCipherUnavailable" | "store_cipher_unavailable") => {
+                STORE_CODE_CAPABILITY_MISSING
+            }
+            Some(
+                "StoreKeyRequired" | "StoreKeyInvalid" | "store_key_mismatch"
+                | "store_key_rejected",
+            ) => STORE_CODE_KEY_INVALID,
+            _ => STORE_CODE_VERIFY_FAILED,
+        },
+        // Exit 2 is the connector/engine version skew: a capability problem,
+        // not an account problem, and the state stays `failed` because fixing
+        // the deployment heals it without anyone touching the account.
+        StoreMigrationDecision::Misconfigured => STORE_CODE_CAPABILITY_MISSING,
+        StoreMigrationDecision::Retry { code } => {
+            if code.contains("timeout") {
+                STORE_CODE_TIMEOUT
+            } else if code.contains("busy") || code.contains("lock") {
+                STORE_CODE_LOCKED
+            } else if code.contains("spawn") || code.contains("abandoned") {
+                STORE_CODE_INTERRUPTED
+            } else {
+                STORE_CODE_IO_ERROR
+            }
+        }
+        // A start lands `migrated` or `pending`; the only start outcome that
+        // carries a code is the one that could not migrate at all.
+        StoreMigrationDecision::Start { outcome } => {
+            if *outcome == "skipped" {
+                STORE_CODE_CAPABILITY_MISSING
+            } else {
+                STORE_CODE_IO_ERROR
+            }
+        }
+    }
+}
+/// The retryable code a caller gets while a pass is running: this account is
+/// being prepared, and a later start serves it. Kept distinct from a failed pass
+/// so a host can render "one moment" instead of "something broke".
+pub const STORE_MIGRATION_IN_PROGRESS: &str = "store_migration_in_progress";
+
+/// The code a preflight refusal carries (contract 1.291, D): a plaintext store
+/// is still on disk, nothing is armed to migrate it, and the operator asked for
+/// encrypted stores. Also the code a status face reports for that slot.
+pub const STORE_PLAINTEXT_REQUIRES_MIGRATION: &str = "store_plaintext_requires_migration";
+
+/// engines[].storeMigration (contract 1.291, §4.277): the per-slot migration
+/// lifecycle a host can render. Absent - the whole key - while the switch is
+/// off, so an unarmed connector's runtime.status stays byte-identical.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreMigrationStatus {
+    pub state: StoreMigrationState,
+    /// The engine's own closed code for the last pass, clamped. Never a key, a
+    /// path, an address, or raw engine output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+/// Whether a wake may spend the caller's clock on the store gate (contract
+/// 1.291, §4.277 A). The request path defers - it schedules the pass and answers
+/// a retryable deferral - while the two human flows (a local-data delete, a link)
+/// wait for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotStartMode {
+    /// Return as soon as a pass is scheduled: never run a whole-store copy on
+    /// the caller's budget.
+    Defer,
+    /// Run the pass inline, bounded by the migration budget.
+    Wait,
+}
+
+/// One finished store-migration pass: the classification the gate acts on, plus
+/// the engine's own evidence code for the status face. The code is carried
+/// separately because the classification owns a *different* code on exit 10/11
+/// (the engine's, passed through) than on a start (the run's `code` field).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreMigrationPass {
+    pub decision: StoreMigrationDecision,
+    pub code: Option<String>,
+}
+
+impl StoreMigrationPass {
+    fn plain(decision: StoreMigrationDecision) -> Self {
+        Self {
+            decision,
+            code: None,
+        }
+    }
+}
 /// What the gate decided for one slot start. The caller does exactly two things
 /// with it: starts the engine, or refuses to (with a reason it logs and, where
 /// a host asked, hands back).
@@ -317,10 +521,53 @@ pub fn store_migration_block_message(code: &str) -> String {
     }
 }
 
+/// The sentence a preflight refusal carries (contract 1.291, D). It names both
+/// ways out - migrate the store, or stop demanding encryption - and says plainly
+/// that nothing was touched, so nobody deletes a healthy account over it.
+pub fn store_plaintext_refusal_message() -> &'static str {
+    "this account's local store is still plaintext and this host asks for encrypted stores (KT_ENGINE_STORE_REQUIRE_ENCRYPTED), but no store migration is armed (KT_ENGINE_STORE_MIGRATE is off), so nothing would ever make it encrypted. Nothing was changed and the store is intact. Either arm the migration with KT_ENGINE_STORE_MIGRATE=apply and restart KT Desktop so this store is migrated, or turn the requirement off if a plaintext store is acceptable on this host."
+}
+
+/// The host-facing sentence for a pass that already failed (contract 1.291,
+/// B/UX 2). It says the two things a caller can act on: nothing is damaged, and
+/// the retry is the caller's explicit decision - not something a timer will do.
+pub fn store_migration_failed_message(code: &str) -> String {
+    format!(
+        "the last store migration attempt for this account did not finish ({code}). It is not \
+         retried automatically: fix the cause, then start the runtime again (or restart KT \
+         Desktop) to retry it. The plaintext store was left untouched."
+    )
+}
+
+/// The host-facing sentence for a spawn the store gate deferred (contract
+/// 1.291 C). Keyed by the closed literal the supervisor carries, so the text
+/// and the state the status face reports always tell the same story.
+pub fn store_gate_deferral_message(code: &str) -> String {
+    match code {
+        STORE_PLAINTEXT_REQUIRES_MIGRATION => store_plaintext_refusal_message().to_string(),
+        "store_migration_blocked" => {
+            "this account's store migration is in a terminal state and needs a human: re-link the account or restore the store key it was migrated with, then restart KT Desktop. No engine was started for it."
+                .to_string()
+        }
+        "store_migration_misconfigured" => store_migration_misconfigured_message().to_string(),
+        _ => store_migration_retry_message(STORE_MIGRATION_IN_PROGRESS),
+    }
+}
+
 /// The operator-facing text for a retryable/store-not-ready slot. Honest about
 /// the two things that matter: nothing was damaged, and the next start tries
 /// again.
 pub fn store_migration_retry_message(code: &str) -> String {
+    // A pass that is running right now is not a failure: the account is being
+    // prepared, and the very next start serves it. Saying "retried on the next
+    // start" would read as "something went wrong", so this arm says what is
+    // actually happening and still promises the same thing.
+    if code == STORE_MIGRATION_IN_PROGRESS {
+        return "this account is being prepared: its store is being migrated right now, so its \
+                engine is not up yet. Retry in a moment - the migration finishes on its own and \
+                the plaintext store is left untouched while it runs."
+            .to_string();
+    }
     format!(
         "the encrypted store of this account is not ready yet ({code}); its engine stays stopped \
          for now and the migration is retried on the next start. The plaintext store was left \
@@ -347,10 +594,22 @@ pub fn store_migration_misconfigured_message() -> &'static str {
 fn store_migration_refusal_error(decision: StoreMigrationDecision) -> ServiceError {
     match decision {
         StoreMigrationDecision::Blocked { block } => block.service_error(),
+        // A pass that is running right now will finish on its own, so "retry in
+        // a moment" is true. Every other retryable code means the last pass
+        // **failed**, and contract 1.291 (UX 2) says nothing retries a failed
+        // pass by itself - only an explicit runtime.start does. Answering
+        // retryable=true there would be the lie this revision removes.
+        StoreMigrationDecision::Retry { code } if code == STORE_MIGRATION_IN_PROGRESS => {
+            ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                store_migration_retry_message(&code),
+                true,
+            ))
+        }
         StoreMigrationDecision::Retry { code } => ServiceError::Api(ApiError::new(
             "CAPABILITY_UNAVAILABLE",
-            store_migration_retry_message(&code),
-            true,
+            store_migration_failed_message(&code),
+            false,
         )),
         StoreMigrationDecision::Misconfigured => ServiceError::Api(ApiError::new(
             "CAPABILITY_UNAVAILABLE",
@@ -612,6 +871,11 @@ pub struct AccountEngineStatus {
     /// cold (`false`) until their first account-addressed request wakes them.
     pub resident: bool,
     pub restarts: u64,
+    /// Contract 1.291 (§4.277 B): this slot's store-migration lifecycle.
+    /// Absent - the whole key - while the migration switch is off, so an
+    /// unarmed connector's status face stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_migration: Option<StoreMigrationStatus>,
 }
 
 /// Why a cold wake did not end with a live engine.
@@ -698,6 +962,18 @@ impl RepeatThrottle {
     }
 }
 
+/// One slot's migration bookkeeping. Held under one lock so a reader can never
+/// observe a state from one pass beside a code from another.
+#[derive(Clone, Debug, Default)]
+struct MigrationLifecycle {
+    state: StoreMigrationState,
+    code: Option<String>,
+    /// The classification of the last landed pass (the wake path re-answers it).
+    verdict: Option<StoreMigrationDecision>,
+    /// The latched terminal block (exit 11, or a preflight refusal).
+    block: Option<StoreMigrationBlock>,
+}
+
 /// One dynamically provisioned account engine: its routing handle, its own
 /// data directory, the process-lifetime occupancy lock, and the small amount
 /// of in-memory bookkeeping the pool needs.
@@ -716,11 +992,14 @@ pub struct AccountSlot {
     provisioned: AtomicBool,
     lock: StdMutex<Option<DataDirLock>>,
     last_used: StdMutex<Instant>,
-    /// Latched terminal store-migration failure (M6 D3). Set once from an
-    /// engine exit 11 and never cleared for the life of the process: the point
-    /// of the latch is that no later start, wake, or watchdog pass turns "a
-    /// human must act" into a restart loop.
-    migration_block: StdMutex<Option<StoreMigrationBlock>>,
+    /// The store-migration lifecycle of this slot (contract 1.291, §4.277):
+    /// the state a host renders, the engine code of the last pass, the last
+    /// classification (so a wake can answer the same verdict without running
+    /// the migrator again), and the latched terminal block.
+    migration: StdMutex<MigrationLifecycle>,
+    /// Single-flight for this slot's migration task: at most one pass per slot,
+    /// whatever the number of callers that ask at the same moment.
+    migration_in_flight: AtomicBool,
     /// Set once a run has left this slot's store in the encrypted format
     /// (`action: migrate`) or found it already there (`noop`) - M6 D3 review
     /// M4. The whole-store verification is the expensive half of a migration
@@ -730,6 +1009,9 @@ pub struct AccountSlot {
     store_migrated: AtomicBool,
     /// Throttle for the exit-2 line (M6 D3 review M5).
     misconfigured_log: RepeatThrottle,
+    /// Throttle for the plaintext-backup warning: one informational line per
+    /// window, never one per start.
+    backup_warn: RepeatThrottle,
 }
 
 impl AccountSlot {
@@ -753,16 +1035,126 @@ impl AccountSlot {
     /// clearing it means a new process, because the store state a human had to
     /// fix is not something a running connector may re-judge.
     pub fn migration_block(&self) -> Option<StoreMigrationBlock> {
-        self.migration_block
-            .lock()
-            .map(|block| block.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+        self.migration().block.clone()
     }
 
     fn latch_migration_block(&self, block: StoreMigrationBlock) {
-        if let Ok(mut slot) = self.migration_block.lock() {
-            *slot = Some(block);
+        self.migration().block = Some(block);
+    }
+
+    fn migration(&self) -> std::sync::MutexGuard<'_, MigrationLifecycle> {
+        self.migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The lifecycle state alone (the gate's fast input).
+    pub fn migration_state(&self) -> StoreMigrationState {
+        self.migration().state
+    }
+
+    /// The status face of this slot: the key is omitted entirely while the
+    /// switch is off (task B: an off connector adds no field and no behaviour).
+    pub fn store_migration_face(&self) -> Option<StoreMigrationStatus> {
+        let lifecycle = self.migration();
+        if lifecycle.state == StoreMigrationState::Off {
+            return None;
         }
+        Some(StoreMigrationStatus {
+            state: lifecycle.state,
+            code: lifecycle.code.clone(),
+        })
+    }
+
+    /// The classification of the last completed pass, if any: the same sentence
+    /// and the same retryable bit a wake must answer without re-running the
+    /// migrator.
+    fn last_migration_decision(&self) -> Option<StoreMigrationDecision> {
+        self.migration().verdict.clone()
+    }
+
+    fn set_migration_state(&self, state: StoreMigrationState, code: Option<&str>) {
+        let mut lifecycle = self.migration();
+        lifecycle.state = state;
+        lifecycle.code = code.map(clamp_store_migration_code);
+    }
+
+    /// Record one pass's verdict: the state a host renders, the contract code,
+    /// the classification a later wake re-answers, the terminal latch, and (for
+    /// a pass that proved the store encrypted) the in-process M4 marker.
+    fn record_migration_decision(
+        &self,
+        decision: &StoreMigrationDecision,
+        mode: StoreMigrationMode,
+        engine_code: Option<&str>,
+    ) {
+        let (state, code, latch) = match decision {
+            StoreMigrationDecision::Start { outcome } => {
+                // A dry run observes and never proves: the store is still
+                // exactly as it was, so the honest state is "a pass is still
+                // owed", never "migrated". It carries no code: nothing failed.
+                if mode == StoreMigrationMode::DryRun {
+                    (StoreMigrationState::Pending, None, None)
+                } else if matches!(*outcome, "migrated" | "noop") {
+                    self.mark_store_migrated();
+                    (StoreMigrationState::Migrated, None, None)
+                } else if *outcome == "absent" {
+                    // No store on disk yet: the engine creates the encrypted
+                    // one with its key on start. There is no plaintext to move,
+                    // so the slot is migrated - never "a pass still owed".
+                    (StoreMigrationState::Migrated, None, None)
+                } else {
+                    // completed / skipped: nothing was proven. `skipped` means
+                    // this slot cannot be migrated at all (no per-account key),
+                    // which is a capability answer, not an account one.
+                    let code = if *outcome == "skipped" {
+                        Some(STORE_CODE_CAPABILITY_MISSING)
+                    } else {
+                        None
+                    };
+                    (StoreMigrationState::Failed, code, None)
+                }
+            }
+            StoreMigrationDecision::Retry { .. } | StoreMigrationDecision::Misconfigured => {
+                let code = store_migration_face_code(decision, engine_code);
+                (StoreMigrationState::Failed, Some(code), None)
+            }
+            StoreMigrationDecision::Blocked { block } => {
+                let code = store_migration_face_code(decision, engine_code);
+                (
+                    StoreMigrationState::Blocked,
+                    Some(code),
+                    Some(block.clone()),
+                )
+            }
+        };
+        {
+            let mut lifecycle = self.migration();
+            lifecycle.state = state;
+            lifecycle.code = code.map(clamp_store_migration_code);
+            lifecycle.verdict = Some(decision.clone());
+        }
+        if let Some(block) = latch {
+            self.latch_migration_block(block);
+        }
+    }
+
+    /// Claim this slot's single-flight migration slot. False means a pass is
+    /// already running (or just finished and has not been collected), and the
+    /// caller must not start a second one.
+    fn begin_migration_flight(&self) -> bool {
+        self.migration_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn end_migration_flight(&self) {
+        self.migration_in_flight.store(false, Ordering::Release);
+    }
+
+    /// Whether a migration pass is running for this slot right now.
+    pub fn migration_in_flight(&self) -> bool {
+        self.migration_in_flight.load(Ordering::Acquire)
     }
 
     /// Whether this process has already proved this slot's store encrypted
@@ -820,6 +1212,10 @@ pub struct AccountPool {
     /// mint, never across `link.finish`'s phone-approval wait.
     link_lock: tokio::sync::Mutex<()>,
     available: bool,
+    /// Set by `stop_all` (runtime.stop) and cleared by `start_resident`: a
+    /// migration pass that lands *after* a stop must not resurrect an engine
+    /// the caller just asked to stop. Reported, never silently dropped.
+    stopping: AtomicBool,
 }
 
 impl AccountPool {
@@ -915,7 +1311,12 @@ impl AccountPool {
             sessions: StdMutex::new(HashMap::new()),
             link_lock: tokio::sync::Mutex::new(()),
             available,
+            stopping: AtomicBool::new(false),
         });
+        pool.install_start_gates();
+        for slot in pool.slots() {
+            pool.seed_store_migration_face(&slot);
+        }
         tracing::info!(accounts = count, "per-account engine pool discovered");
         pool
     }
@@ -1010,7 +1411,10 @@ impl AccountPool {
     /// the QR mint fails. A slot occupies a data directory, an occupancy lock,
     /// and a supervisor from this point on, so the capacity check and the
     /// insert share one write lock.
-    pub fn provision_slot(&self, proxy_group: &str) -> Result<Arc<AccountSlot>, ServiceError> {
+    pub fn provision_slot(
+        self: &Arc<Self>,
+        proxy_group: &str,
+    ) -> Result<Arc<AccountSlot>, ServiceError> {
         if !self.available {
             return Err(ServiceError::Api(ApiError::new(
                 "CAPABILITY_UNAVAILABLE",
@@ -1075,6 +1479,13 @@ impl AccountPool {
             lock,
         );
         slots.insert(account_id, Arc::clone(&slot));
+        self.seed_store_migration_face(&slot);
+        // The new supervisor must pass the same gate as every other start
+        // (contract 1.291 C: the link path is not allowed to bypass it).
+        slot.supervisor().set_start_gate(Arc::new(SlotStartGate {
+            slot: Arc::downgrade(&slot),
+            pool: Arc::downgrade(self),
+        }));
         tracing::info!(
             account_id = %slot.account_id,
             group_id = %slot.proxy_group,
@@ -1176,7 +1587,15 @@ impl AccountPool {
     /// Start the top-K most recently used slots (design §6.1 step ④, S1
     /// bounded form: process starts are cheap, the expensive part is the
     /// engine's own receive stream, which stays asynchronous either way).
-    pub async fn start_resident(self: &Arc<Self>) {
+    ///
+    /// Contract 1.291 (§4.277 A): with the migration switch armed this is a
+    /// **scheduler**. A slot whose store still needs a pass is scheduled and left
+    /// stopped; the pass runs in its own task under the migration budget and
+    /// starts the engine when it lands. runtime.start therefore returns in
+    /// milliseconds even when eight accounts each need a whole-store copy, so the
+    /// host's dispatch deadline can never kill a migration half-way.
+    pub async fn start_resident(self: &Arc<Self>) -> Option<StoreMigrationBlock> {
+        self.stopping.store(false, Ordering::Release);
         let mut slots = self.slots();
         slots.sort_by(|left, right| {
             right
@@ -1184,40 +1603,117 @@ impl AccountPool {
                 .cmp(&left.last_used())
                 .then_with(|| left.account_id.cmp(&right.account_id))
         });
+        let mut first_block = None;
         for slot in slots.into_iter().take(self.config.policy.max_resident) {
             if !slot.holds_lock() {
                 continue;
             }
-            // M6 D3: (stop ->) migrate -> start. The gate is a no-op unless
-            // KT_ENGINE_STORE_MIGRATE says otherwise, it leaves a live engine
-            // alone (M1), and it short-circuits a store this process already
-            // migrated (M4). When it does refuse, the slot simply stays stopped
-            // this pass (the reason is already logged with the account
-            // fingerprint and the engine's exit code).
-            match self.gate_slot_start(&slot).await {
-                StoreMigrationDecision::Start { .. } => {}
-                _ => continue,
-            }
-            match slot.supervisor.start().await {
-                Ok(status) if status.state == EngineState::Running => {
-                    slot.set_resident(true);
-                    tracing::info!(
-                        account_id = %slot.account_id,
-                        group_id = %slot.proxy_group,
-                        pid = status.pid.unwrap_or(0),
-                        "per-account engine started (resident window)"
-                    );
-                }
-                Ok(_) => {}
-                Err(EngineError::Backpressure) => slot.set_resident(true),
-                Err(error) => tracing::warn!(
-                    account_id = %slot.account_id,
-                    group_id = %slot.proxy_group,
-                    error_class = error.class(),
-                    "per-account engine did not start"
-                ),
+            if let Some(block) = self.start_or_schedule(&slot).await
+                && first_block.is_none()
+            {
+                first_block = Some(block);
             }
         }
+        first_block
+    }
+
+    /// The pool's own start of one slot: start it now when its store is ready,
+    /// otherwise schedule the pass that starts it when it lands. A whole-store
+    /// migration never runs on the caller's clock (§4.277 A). The return value
+    /// is a terminal refusal (a latched block or a preflight refusal) so the
+    /// caller can answer runtime.start honestly instead of a retryable lie.
+    async fn start_or_schedule(
+        self: &Arc<Self>,
+        slot: &Arc<AccountSlot>,
+    ) -> Option<StoreMigrationBlock> {
+        if slot.supervisor.status().await.state == EngineState::Running {
+            slot.set_resident(true);
+            return None;
+        }
+        let options = self.config.store_migration;
+        match options.mode {
+            StoreMigrationMode::Apply => {
+                // The whole-store copy is the expensive half: schedule it and
+                // let this start return (§4.277 A).
+                match self.admit_engine_start(slot, true).await {
+                    Ok(()) => {}
+                    Err(decision) => return terminal_store_block(&decision),
+                }
+            }
+            StoreMigrationMode::DryRun => {
+                // A dry run also runs in its own task. It is observation only,
+                // so the pass itself starts the engine when the plan lands -
+                // runtime.start must never serially spend eight plan budgets
+                // on the host's 300 s dispatch clock (§4.277 A).
+                if slot.store_migrated() {
+                    self.start_engine_after_gate(slot).await;
+                    return None;
+                }
+                let state = self.begin_store_migration(slot);
+                if state == StoreMigrationState::Migrated && !slot.migration_in_flight() {
+                    self.start_engine_after_gate(slot).await;
+                }
+                return None;
+            }
+            StoreMigrationMode::Off => {
+                // Off keeps the pre-migration path plus the operator's
+                // preflight; the preflight is a bounded 16-byte read per slot,
+                // never a migrator run.
+                match self.gate_slot_start(slot).await.decision {
+                    StoreMigrationDecision::Start { .. } => {}
+                    decision => return terminal_store_block(&decision),
+                }
+            }
+        }
+        self.start_engine_after_gate(slot).await;
+        None
+    }
+
+    /// Spawn the engine of a slot whose store gate the caller already cleared -
+    /// the pool's scheduled start, a wake, and the link path all land here.
+    async fn start_engine_after_gate(self: &Arc<Self>, slot: &Arc<AccountSlot>) {
+        if self.stopping.load(Ordering::Acquire) {
+            tracing::info!(
+                account_id = %slot.account_id,
+                group_id = %slot.proxy_group,
+                "per-account engine start dropped: the runtime is stopping"
+            );
+            return;
+        }
+        if !self.still_registered(slot) {
+            tracing::info!(
+                account_id = %slot.account_id,
+                group_id = %slot.proxy_group,
+                "per-account engine start dropped: the slot was reclaimed"
+            );
+            return;
+        }
+        match slot.supervisor.start_after_store_gate().await {
+            Ok(status) if status.state == EngineState::Running => {
+                slot.set_resident(true);
+                tracing::info!(
+                    account_id = %slot.account_id,
+                    group_id = %slot.proxy_group,
+                    pid = status.pid.unwrap_or(0),
+                    "per-account engine started (resident window)"
+                );
+                self.enforce_window(Arc::clone(slot));
+            }
+            Ok(_) => {}
+            Err(EngineError::Backpressure) => slot.set_resident(true),
+            Err(error) => tracing::warn!(
+                account_id = %slot.account_id,
+                group_id = %slot.proxy_group,
+                error_class = error.class(),
+                "per-account engine did not start"
+            ),
+        }
+    }
+
+    /// Whether this exact slot is still the one the pool serves for its account.
+    fn still_registered(self: &Arc<Self>, slot: &Arc<AccountSlot>) -> bool {
+        self.get(slot.account_id())
+            .is_some_and(|current| Arc::ptr_eq(&current, slot))
     }
 
     /// O1: the first latched contract refusal across the pool's slots, if any.
@@ -1234,7 +1730,12 @@ impl AccountPool {
 
     /// Stop every dynamic engine (runtime.stop), leaving the slots registered
     /// and cold so a later runtime.start can rebuild the resident window.
+    ///
+    /// Contract 1.291: a migration pass that lands after this point must not
+    /// resurrect an engine the caller just asked to stop, so the pool is marked
+    /// stopping before the first engine is touched.
     pub async fn stop_all(&self) {
+        self.stopping.store(true, Ordering::Release);
         for slot in self.slots() {
             slot.set_resident(false);
             match slot.supervisor.stop().await {
@@ -1261,12 +1762,20 @@ impl AccountPool {
     ///
     /// Off - the default - returns before touching anything: no process, no
     /// read, no per-account line.
-    async fn gate_slot_start(self: &Arc<Self>, slot: &Arc<AccountSlot>) -> StoreMigrationDecision {
+    ///
+    /// Contract 1.291 (§4.277 D): the operator's intent is checked **before** the
+    /// switch. A plaintext store that nothing is armed to migrate is a reason not
+    /// to start whatever the mode says; with the intent off (the default) this
+    /// costs one boolean and the gate below is exactly the 4.276 gate.
+    async fn gate_slot_start(self: &Arc<Self>, slot: &Arc<AccountSlot>) -> StoreMigrationPass {
         let options = self.config.store_migration;
+        if let Some(decision) = self.preflight_refusal(slot) {
+            return StoreMigrationPass::plain(decision);
+        }
         if !options.is_enabled() {
-            return StoreMigrationDecision::Start {
+            return StoreMigrationPass::plain(StoreMigrationDecision::Start {
                 outcome: "disabled",
-            };
+            });
         }
         // M6 D3 review M1: an engine that is already live is success, not a
         // reason to restart. Its store is open in that process, so nothing can
@@ -1275,9 +1784,9 @@ impl AccountPool {
         // migration it does not need. Same reading ensure_resident applies
         // before it ever reaches this gate (`Running` answers Ok).
         if slot.supervisor.status().await.state == EngineState::Running {
-            return StoreMigrationDecision::Start {
+            return StoreMigrationPass::plain(StoreMigrationDecision::Start {
                 outcome: "already_running",
-            };
+            });
         }
         // M6 D3 review M4: this process has already migrated this slot's store
         // (or found it migrated). A later start - after a stop, an idle
@@ -1285,28 +1794,28 @@ impl AccountPool {
         // the whole-store verification is the expensive half, and re-running it
         // on every start is pure cost.
         if slot.store_migrated() {
-            return StoreMigrationDecision::Start {
+            return StoreMigrationPass::plain(StoreMigrationDecision::Start {
                 outcome: "already_migrated",
-            };
+            });
         }
         // A latched terminal failure is answered without spawning anything:
         // that is exactly what keeps exit 11 from becoming a restart storm.
         if let Some(block) = slot.migration_block() {
-            return StoreMigrationDecision::Blocked { block };
+            return StoreMigrationPass::plain(StoreMigrationDecision::Blocked { block });
         }
-        // Nothing to migrate without a directory: the engine creates its own
-        // store on first start, and a migrator pointed at a missing directory
-        // answers a terminal data_dir_missing that would block a brand-new
-        // account for no reason.
-        if !slot.data_dir.is_dir() {
+        // No non-empty store file: there is nothing a migrator could act on.
+        // A true fresh slot's engine creates the encrypted store with its key;
+        // a zero-byte placeholder is replaced the same way. This is a no-op
+        // pass (`migrated`), never `skipped`/`failed` (task-24).
+        if !crate::store_preflight::has_any_store(&slot.data_dir) {
             tracing::info!(
                 store_migration = options.mode.label(),
                 account = %account_fingerprint(&slot.account_id),
-                store_migration_outcome = "skipped",
-                reason = "no_data_dir",
-                "engine store migration skipped"
+                store_migration_outcome = "noop",
+                reason = "no_store",
+                "engine store migration is a no-op: no store file to migrate"
             );
-            return StoreMigrationDecision::Start { outcome: "skipped" };
+            return StoreMigrationPass::plain(StoreMigrationDecision::Start { outcome: "noop" });
         }
         // Only a pooled slot maps to exactly one account, so only a pooled slot
         // has exactly one account's key. Any other decision must not migrate:
@@ -1325,7 +1834,9 @@ impl AccountPool {
                     engine_store_key = other.decision(),
                     "engine store migration skipped: no per-account store key"
                 );
-                return StoreMigrationDecision::Start { outcome: "skipped" };
+                return StoreMigrationPass::plain(StoreMigrationDecision::Start {
+                    outcome: "skipped",
+                });
             }
         };
         // Stop the slot before the migrator touches the store. A slot whose
@@ -1340,9 +1851,9 @@ impl AccountPool {
                 reason = "engine_did_not_stop",
                 "engine store migration deferred: the slot did not stop"
             );
-            return StoreMigrationDecision::Retry {
+            return StoreMigrationPass::plain(StoreMigrationDecision::Retry {
                 code: "store_busy".to_string(),
-            };
+            });
         }
         let mut attempt = 0_usize;
         loop {
@@ -1442,7 +1953,380 @@ impl AccountPool {
                 tokio::time::sleep(STORE_MIGRATION_BACKOFF * attempt as u32).await;
                 continue;
             }
-            return decision;
+            return StoreMigrationPass {
+                decision,
+                code: run.code.clone(),
+            };
+        }
+    }
+
+    /// The operator's intent as a refusal (contract 1.291, §4.277 D). Three
+    /// conditions are evaluated here beside the pool's own answer to the fourth
+    /// (this is a pooled slot, by construction): a plaintext store is still on
+    /// disk, the migrator is off, and KT_ENGINE_STORE_REQUIRE_ENCRYPTED is on.
+    ///
+    /// The connector's own plaintext backup (`connector.sqlite3.plaintext-backup`)
+    /// is a **warning only**: the store it copies is already encrypted, so nothing
+    /// on the runtime path reads it.
+    fn preflight_refusal(
+        self: &Arc<Self>,
+        slot: &Arc<AccountSlot>,
+    ) -> Option<StoreMigrationDecision> {
+        let options = self.config.store_migration;
+        if !options.require_encrypted {
+            return None;
+        }
+        if crate::store_preflight::plaintext_backup_present(&self.config.state_dir)
+            && slot.backup_warn.allow(REFUSAL_LOG_WINDOW).is_some()
+        {
+            tracing::warn!(
+                env = crate::store_preflight::REQUIRE_ENCRYPTED_ENV,
+                file = crate::store_preflight::PLAINTEXT_BACKUP_FILE,
+                "a plaintext backup of the connector store is still on disk; the live store is encrypted, so this is informational"
+            );
+        }
+        let crate::store_preflight::PreflightVerdict::Refuse { code } =
+            crate::store_preflight::check(
+                options.require_encrypted,
+                options.is_enabled(),
+                &slot.data_dir,
+            )
+        else {
+            return None;
+        };
+        // Deliberately **no** status state here: with the switch off the face must
+        // stay empty (task B), and `check` only refuses while it is off - so this
+        // refusal reaches a host through the error face and the log line, never
+        // through `engines[].storeMigration`. §4.277 records that boundary.
+        tracing::error!(
+            store_migration = options.mode.label(),
+            account = %account_fingerprint(&slot.account_id),
+            store_migration_outcome = "preflight_blocked",
+            code,
+            "this account's store is plaintext, no migration is armed, and this host asks for encrypted stores; the engine is not started"
+        );
+        Some(StoreMigrationDecision::Blocked {
+            block: StoreMigrationBlock {
+                code: code.to_string(),
+                exit: None,
+                message: store_plaintext_refusal_message().to_string(),
+            },
+        })
+    }
+
+    /// Whether a migration pass could change this slot's answer at all: there is
+    /// a directory to look in and exactly one account's key to open it with. A
+    /// slot with neither is the old gate's "skipped" - it starts normally.
+    fn migration_pass_applies(&self, slot: &AccountSlot) -> bool {
+        slot.data_dir.is_dir()
+            // A directory is not a store. An empty data directory (a fresh
+            // link's empty V2 registry) has no plaintext to move; running the
+            // migrator there only answers `accounts: []`, which used to be
+            // classified as `completed` -> `failed` (task-24). A non-empty
+            // store file is the entry fee for a pass.
+            && crate::store_preflight::has_any_store(&slot.data_dir)
+            && matches!(
+                crate::store::engine_store_key_for_account(
+                    self.config.root_store_key.as_ref(),
+                    &slot.account_id
+                ),
+                crate::store::EngineStoreKey::Account(_)
+            )
+    }
+
+    /// The admission gate every engine spawn passes (contract 1.291, §4.277 A/C).
+    ///
+    /// Ok means "spawn now". Err carries the same classification the wake path
+    /// hands a host, and a slot that needs a pass has that pass **scheduled**
+    /// here: the pass starts the engine itself when the store is ready, so a
+    /// refused spawn is a deferral, never a dropped start.
+    ///
+    /// The default posture - switch off, intent off - answers Ok without a read,
+    /// a lock, or a log line.
+    ///
+    /// `retry_failed` is the UX ruling (docs/plan/store-migration-ux.md): a
+    /// `failed` pass is **not** retried automatically - not by a watchdog tick,
+    /// not by a request waking the slot. Only an explicit runtime.start (the
+    /// user's own "try again") schedules another pass; every other face answers
+    /// the last verdict and leaves the state alone, so a transient failure can
+    /// neither spin in the background nor be silently forgotten.
+    pub(crate) async fn admit_engine_start(
+        self: &Arc<Self>,
+        slot: &Arc<AccountSlot>,
+        retry_failed: bool,
+    ) -> Result<(), StoreMigrationDecision> {
+        let options = self.config.store_migration;
+        if !options.touches_store() {
+            return Ok(());
+        }
+        if let Some(decision) = self.preflight_refusal(slot) {
+            return Err(decision);
+        }
+        if !options.is_enabled() {
+            return Ok(());
+        }
+        if slot.supervisor.status().await.state == EngineState::Running {
+            return Ok(());
+        }
+        if slot.store_migrated() {
+            return Ok(());
+        }
+        if let Some(block) = slot.migration_block() {
+            return Err(StoreMigrationDecision::Blocked { block });
+        }
+        if !self.migration_pass_applies(slot) {
+            return Ok(());
+        }
+        // A pass that is already running owns the store. This check precedes
+        // the dry-run arm on purpose: a crash restart must not spawn an engine
+        // while a dry-run pass is reading the store either.
+        let state = slot.migration_state();
+        if slot.migration_in_flight() || state == StoreMigrationState::Migrating {
+            return Err(StoreMigrationDecision::Retry {
+                code: STORE_MIGRATION_IN_PROGRESS.to_string(),
+            });
+        }
+        // Dry-run observes and never withholds a start (§4.276): when no pass
+        // is running, a wake may let the engine come up without waiting. The
+        // runtime.start scheduler handles its own quiet-store pass separately.
+        if options.mode == StoreMigrationMode::DryRun {
+            return Ok(());
+        }
+        // UX 2: a failed pass waits for the user. Refuse here with the verdict
+        // it failed on, and leave the state exactly as the pass left it.
+        if state == StoreMigrationState::Failed && !retry_failed {
+            return Err(last_verdict_refusal(slot));
+        }
+        // The verdict of the last landed pass is the honest answer for this
+        // refusal: a retryable failure stays retryable, an exit-2 version skew
+        // stays non-retryable, and a first-ever pass answers "being prepared".
+        let last = slot.last_migration_decision();
+        let begun = self.begin_store_migration(slot);
+        // begin_store_migration reads the header first and may prove the store
+        // already encrypted without scheduling a pass; that is a start, not a
+        // deferral.
+        if begun == StoreMigrationState::Migrated && !slot.migration_in_flight() {
+            return Ok(());
+        }
+        Err(match last {
+            Some(StoreMigrationDecision::Misconfigured) => StoreMigrationDecision::Misconfigured,
+            Some(StoreMigrationDecision::Retry { code }) => StoreMigrationDecision::Retry { code },
+            Some(StoreMigrationDecision::Blocked { block }) => {
+                StoreMigrationDecision::Blocked { block }
+            }
+            _ => StoreMigrationDecision::Retry {
+                code: STORE_MIGRATION_IN_PROGRESS.to_string(),
+            },
+        })
+    }
+
+    /// Schedule one migration pass for a slot and answer the state a caller may
+    /// report. Single-flight: a second caller joins the pass already in flight
+    /// instead of starting another, which is what makes two concurrent
+    /// runtime.start calls one migration rather than two migrator processes on
+    /// one store.
+    fn begin_store_migration(self: &Arc<Self>, slot: &Arc<AccountSlot>) -> StoreMigrationState {
+        if !slot.begin_migration_flight() {
+            return slot.migration_state();
+        }
+        // A true fresh slot has no store file to act on (an empty V2 registry
+        // is not a store): the migrator would answer `accounts: []` over an
+        // empty directory, which is a no-op, not work. The engine creates the
+        // encrypted store itself on this start.
+        if !crate::store_preflight::has_any_store(&slot.data_dir) && !slot_has_store_path(slot) {
+            slot.set_migration_state(StoreMigrationState::Migrated, None);
+            slot.end_migration_flight();
+            return StoreMigrationState::Migrated;
+        }
+        // The store header, not memory, is the authority (contract 1.291 B).
+        // A process restart forgets the old face; reading the header before
+        // writing `pending` keeps an already-encrypted store from being
+        // re-announced as un-migrated, and keeps `store_migrated` true so the
+        // first start of the new process does not pay for a whole-store verify.
+        let evidence = crate::store_preflight::store_files(&slot.data_dir);
+        let encrypted = evidence.iter().any(|path| {
+            crate::store_preflight::store_file_state(path)
+                == crate::store_preflight::StoreFileState::Encrypted
+        });
+        let has_plaintext = evidence.iter().any(|path| {
+            crate::store_preflight::store_file_state(path)
+                == crate::store_preflight::StoreFileState::Plaintext
+        });
+        if !has_plaintext && encrypted {
+            slot.mark_store_migrated();
+            slot.set_migration_state(StoreMigrationState::Migrated, None);
+            slot.end_migration_flight();
+            return StoreMigrationState::Migrated;
+        }
+        slot.set_migration_state(StoreMigrationState::Pending, None);
+        let pool = Arc::clone(self);
+        let owned = Arc::clone(slot);
+        tokio::spawn(async move { pool.run_migration_pass(owned).await });
+        slot.migration_state()
+    }
+
+    /// One scheduled pass: the whole lifecycle of a slot's migration, off the
+    /// caller's clock.
+    ///
+    /// Crash recovery is not this function's problem, and that is the design: it
+    /// writes nothing to disk, so a process killed here leaves the store exactly
+    /// as the migrator left it - and the next process re-runs the same pass, whose
+    /// idempotency is the store's own header.
+    async fn run_migration_pass(self: Arc<Self>, slot: Arc<AccountSlot>) {
+        let _wake = slot.wake.lock().await;
+        slot.set_migration_state(StoreMigrationState::Migrating, None);
+        let pass = self.gate_slot_start(&slot).await;
+        slot.record_migration_decision(
+            &pass.decision,
+            self.config.store_migration.mode,
+            pass.code.as_deref(),
+        );
+        let started = matches!(pass.decision, StoreMigrationDecision::Start { .. });
+        if started {
+            // The pass owns the start: it is the only caller that may spawn this
+            // account's engine without asking the gate again (it just cleared it).
+            self.start_engine_after_gate(&slot).await;
+        } else {
+            tracing::info!(
+                store_migration = self.config.store_migration.mode.label(),
+                account = %account_fingerprint(&slot.account_id),
+                store_migration_outcome = slot.migration_state().label(),
+                "the migration pass did not land; this slot stays stopped until the next start"
+            );
+        }
+        slot.end_migration_flight();
+    }
+
+    /// Recompute a slot's migration face from the **store header on disk**
+    /// (contract 1.291, §4.277 B/UX-4).
+    ///
+    /// The stored format is the only durable fact in this design, so `migrated`
+    /// is derived, not remembered: a restart reports `migrated` for a store that
+    /// is already encrypted and `pending` for one that is still plaintext (or
+    /// not there yet). No connector-written state file exists to drift from it.
+    ///
+    /// Only the *face* is seeded: the process-scoped "already migrated" skip
+    /// marker stays clear, so the first start of the new process still runs the
+    /// migrator once and gets the engine's own verdict (a `noop` for a healthy
+    /// encrypted store, a terminal code for a damaged one). Reporting from the
+    /// header costs one bounded read; skipping the verdict would cost an
+    /// operator the only diagnosis they get.
+    fn seed_store_migration_face(&self, slot: &Arc<AccountSlot>) {
+        if !self.config.store_migration.touches_store() {
+            return;
+        }
+        let state = if !crate::store_preflight::plaintext_stores(&slot.data_dir).is_empty() {
+            StoreMigrationState::Pending
+        } else if crate::store_preflight::has_any_store(&slot.data_dir) {
+            // The header is the durable fact: an encrypted store is already
+            // migrated, so the process-scoped marker must say so as well. A
+            // later start then skips the whole-store verify instead of paying
+            // for it again after every restart.
+            slot.mark_store_migrated();
+            StoreMigrationState::Migrated
+        } else if slot_has_store_path(slot) {
+            // A zero-byte, unreadable or symlinked placeholder is not proof of
+            // a migrated store (task-22 ruling): the engine creates the real
+            // one on start, so a pass is still owed.
+            StoreMigrationState::Pending
+        } else {
+            // A true fresh slot - empty V2 registry, no store file at all.
+            // There is no plaintext to migrate and an engine started with the
+            // account key creates the encrypted store itself, so the honest
+            // face is `migrated`, never `failed` (task-24).
+            StoreMigrationState::Migrated
+        };
+        slot.set_migration_state(state, None);
+    }
+
+    /// The migration face of one slot, as this connector reports it.
+    ///
+    /// `None` while the migration switch is off: the operator's intent alone does
+    /// not add a field (task B - an unarmed connector's status face stays
+    /// byte-identical), it only decides whether an engine may start on a
+    /// plaintext store.
+    fn store_migration_face(&self, slot: &AccountSlot) -> Option<StoreMigrationStatus> {
+        if !self.config.store_migration.is_enabled() {
+            return None;
+        }
+        slot.store_migration_face()
+    }
+
+    /// The migration lifecycle of one account, if it has a slot.
+    pub fn store_migration_status(&self, account_id: &str) -> Option<StoreMigrationStatus> {
+        self.get(account_id)
+            .and_then(|slot| self.store_migration_face(&slot))
+    }
+
+    /// Whether any slot has a migration pass running (runtime.start's "this pool
+    /// is on its way up" answer).
+    pub fn any_migration_in_flight(&self) -> bool {
+        self.slots().iter().any(|slot| slot.migration_in_flight())
+    }
+
+    /// Wait until this account's migration lifecycle stops moving, bounded.
+    /// A diagnostics/test helper: nothing on the serving path blocks on it.
+    pub async fn wait_for_store_migration(
+        self: &Arc<Self>,
+        account_id: &str,
+        budget: Duration,
+    ) -> Option<StoreMigrationStatus> {
+        let deadline = Instant::now() + budget;
+        loop {
+            let slot = self.get(account_id)?;
+            if !slot.migration_in_flight() || Instant::now() >= deadline {
+                return self.store_migration_face(&slot);
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Wait for the pass a waiting human flow just scheduled. The pass owns
+    /// the engine start; this only maps its recorded verdict back to the
+    /// caller, so a failed/blocked pass is never re-run here.
+    async fn wait_for_scheduled_store_pass(
+        self: &Arc<Self>,
+        slot: &Arc<AccountSlot>,
+    ) -> Result<(), SlotWakeRefusal> {
+        let per_pass = self.config.store_migration.budget;
+        let deadline = Instant::now()
+            + per_pass.saturating_mul(STORE_MIGRATION_ATTEMPTS as u32 + 1)
+            + Duration::from_secs(5);
+        while slot.migration_in_flight() {
+            if Instant::now() >= deadline {
+                return Err(SlotWakeRefusal::MigrationGate(
+                    StoreMigrationDecision::Retry {
+                        code: "store_migration_timeout".to_string(),
+                    },
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        match slot.last_migration_decision() {
+            Some(StoreMigrationDecision::Start { .. }) => {
+                if slot.supervisor.status().await.state != EngineState::Running {
+                    self.start_engine_after_gate(slot).await;
+                }
+                Ok(())
+            }
+            Some(decision) => Err(SlotWakeRefusal::MigrationGate(decision)),
+            None => Err(SlotWakeRefusal::MigrationGate(
+                StoreMigrationDecision::Retry {
+                    code: STORE_MIGRATION_IN_PROGRESS.to_string(),
+                },
+            )),
+        }
+    }
+
+    /// Wire this pool's gate into every supervisor's start face (contract 1.291,
+    /// §4.277 C). Idempotent; called after the pool is assembled and after every
+    /// provisioned slot.
+    fn install_start_gates(self: &Arc<Self>) {
+        for slot in self.slots() {
+            slot.supervisor().set_start_gate(Arc::new(SlotStartGate {
+                slot: Arc::downgrade(&slot),
+                pool: Arc::downgrade(self),
+            }));
         }
     }
 
@@ -1466,21 +2350,41 @@ impl AccountPool {
             .map_err(SlotWakeRefusal::into_service_error)
     }
 
-    /// Wake one cold slot and keep the reason it did not work distinguishable.
+    /// Wake one cold slot on the **request** path and keep the reason it did not
+    /// work distinguishable.
     ///
-    /// Same gate as the resident window, under the wake lock: a cold slot woken
-    /// by an account-addressed request migrates before it serves, and a
-    /// gateway refusal answers the caller with the matching error instead of
-    /// starting an engine that cannot work.
-    ///
+    /// Contract 1.291 (§4.277 A): a request never waits for a whole-store
+    /// migration. When the slot's store still needs a pass, this schedules it
+    /// and answers the caller the retryable deferral; the pass starts the engine
+    /// itself, so the retry a moment later is served. Nothing is lost and no
+    /// request budget is stretched to the migration budget.
+    pub async fn wake_slot(
+        self: &Arc<Self>,
+        slot: &Arc<AccountSlot>,
+    ) -> Result<(), SlotWakeRefusal> {
+        self.wake_slot_with(slot, SlotStartMode::Defer).await
+    }
+
+    /// Wake one cold slot and **wait** for the store gate (contract 1.291): the
+    /// two callers that must not be answered "not yet" - a local-data delete and
+    /// a link - are human flows with their own budget, and both would rather
+    /// block for the pass than be told to come back.
+    pub async fn wake_slot_waiting(
+        self: &Arc<Self>,
+        slot: &Arc<AccountSlot>,
+    ) -> Result<(), SlotWakeRefusal> {
+        self.wake_slot_with(slot, SlotStartMode::Wait).await
+    }
+
     /// A caller that needs an engine **only as a means** to reach the store -
     /// the local-data delete, its one non-routing user - can tell
     /// [`SlotWakeRefusal::MigrationGate`] from a plain failure and take the
     /// engine-free path, instead of letting the gate veto the very action its
     /// own message prescribes.
-    pub async fn wake_slot(
+    async fn wake_slot_with(
         self: &Arc<Self>,
         slot: &Arc<AccountSlot>,
+        mode: SlotStartMode,
     ) -> Result<(), SlotWakeRefusal> {
         slot.touch();
         if slot.supervisor.status().await.state == EngineState::Running {
@@ -1494,15 +2398,32 @@ impl AccountPool {
                 false,
             ))));
         }
-        let _wake = slot.wake.lock().await;
-        if slot.supervisor.status().await.state != EngineState::Running {
-            match self.gate_slot_start(slot).await {
-                StoreMigrationDecision::Start { .. } => {}
-                refusal => return Err(SlotWakeRefusal::MigrationGate(refusal)),
+        match mode {
+            SlotStartMode::Wait => {
+                // A human flow (link.start, local-data delete) waits for the
+                // store gate, but it must join the same single-flight pass as
+                // every other caller: `admit_engine_start` owns the
+                // begin_migration_flight CAS and the failed-pass policy. When
+                // it schedules a pass, wait for that pass to record its
+                // verdict; a completed pass starts the engine itself.
+                match self.admit_engine_start(slot, false).await {
+                    Ok(()) => {}
+                    Err(StoreMigrationDecision::Retry { code })
+                        if code == STORE_MIGRATION_IN_PROGRESS =>
+                    {
+                        self.wait_for_scheduled_store_pass(slot).await?;
+                    }
+                    Err(decision) => return Err(SlotWakeRefusal::MigrationGate(decision)),
+                }
+            }
+            SlotStartMode::Defer => {
+                if let Err(refusal) = self.admit_engine_start(slot, false).await {
+                    return Err(SlotWakeRefusal::MigrationGate(refusal));
+                }
             }
         }
         if slot.supervisor.status().await.state != EngineState::Running {
-            match slot.supervisor.start().await {
+            match slot.supervisor.start_after_store_gate().await {
                 Ok(status) if status.state == EngineState::Running => {}
                 Ok(_) => {
                     return Err(SlotWakeRefusal::Failed(ServiceError::Engine(
@@ -1584,12 +2505,82 @@ impl AccountPool {
                 resource_pressure: status.resource_pressure,
                 resident: slot.is_resident(),
                 restarts: slot.supervisor.restart_count(),
+                store_migration: self.store_migration_face(&slot),
             });
         }
         statuses
     }
 }
 
+/// The bridge from a supervisor's start face to this pool's gate (contract
+/// 1.291, §4.277 C). Weak refs on purpose: a gate must never keep a reclaimed
+/// slot - or the whole pool - alive.
+struct SlotStartGate {
+    slot: std::sync::Weak<AccountSlot>,
+    pool: std::sync::Weak<AccountPool>,
+}
+
+impl crate::supervisor::EngineStartGate for SlotStartGate {
+    fn admit_engine_start(&self) -> futures_util::future::BoxFuture<'_, Result<(), &'static str>> {
+        Box::pin(async move {
+            let (Some(slot), Some(pool)) = (self.slot.upgrade(), self.pool.upgrade()) else {
+                // The slot is gone: there is no store left to protect, and
+                // refusing here would only break a shutdown path.
+                return Ok(());
+            };
+            pool.admit_engine_start(&slot, false)
+                .await
+                .map_err(|decision| store_migration_refusal_code(&decision))
+        })
+    }
+}
+
+/// A terminal gate verdict for a start that cannot ever succeed in this
+/// process: a latched block or the preflight refusal. Retry-shaped verdicts
+/// return None (they may be re-tried by an explicit runtime.start).
+fn terminal_store_block(decision: &StoreMigrationDecision) -> Option<StoreMigrationBlock> {
+    match decision {
+        StoreMigrationDecision::Blocked { block } => Some(block.clone()),
+        StoreMigrationDecision::Misconfigured => Some(StoreMigrationBlock {
+            code: "store_migration_misconfigured".to_string(),
+            exit: None,
+            message: store_migration_misconfigured_message().to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// The refusal a slot that already failed re-answers, without running (or
+/// scheduling) anything: the same sentence and the same retryable bit its own
+/// pass produced, so a host sees a stable verdict instead of a timer.
+fn last_verdict_refusal(slot: &AccountSlot) -> StoreMigrationDecision {
+    match slot.last_migration_decision() {
+        Some(StoreMigrationDecision::Retry { code }) => StoreMigrationDecision::Retry { code },
+        Some(StoreMigrationDecision::Misconfigured) => StoreMigrationDecision::Misconfigured,
+        Some(StoreMigrationDecision::Blocked { block }) => {
+            StoreMigrationDecision::Blocked { block }
+        }
+        _ => StoreMigrationDecision::Retry {
+            code: STORE_MIGRATION_IN_PROGRESS.to_string(),
+        },
+    }
+}
+
+/// The closed literal a supervisor start refusal carries. The host face renders
+/// the sentence; this word is only for the log line and the caller's match.
+fn store_migration_refusal_code(decision: &StoreMigrationDecision) -> &'static str {
+    match decision {
+        StoreMigrationDecision::Blocked { block }
+            if block.code == STORE_PLAINTEXT_REQUIRES_MIGRATION =>
+        {
+            STORE_PLAINTEXT_REQUIRES_MIGRATION
+        }
+        StoreMigrationDecision::Blocked { .. } => "store_migration_blocked",
+        StoreMigrationDecision::Retry { .. } => "store_migration_pending",
+        StoreMigrationDecision::Misconfigured => "store_migration_misconfigured",
+        StoreMigrationDecision::Start { .. } => "store_migration_settled",
+    }
+}
 #[allow(clippy::too_many_arguments)]
 fn build_slot(
     config: &EnginePoolConfig,
@@ -1647,9 +2638,11 @@ fn build_slot(
         provisioned: AtomicBool::new(provisioned),
         lock: StdMutex::new(lock),
         last_used: StdMutex::new(last_used),
-        migration_block: StdMutex::new(None),
+        migration: StdMutex::new(MigrationLifecycle::default()),
+        migration_in_flight: AtomicBool::new(false),
         store_migrated: AtomicBool::new(false),
         misconfigured_log: RepeatThrottle::default(),
+        backup_warn: RepeatThrottle::default(),
     })
 }
 
@@ -1794,6 +2787,39 @@ fn modified_instant(path: &Path) -> Instant {
     Instant::now().checked_sub(age).unwrap_or_else(Instant::now)
 }
 
+/// Whether a slot's data directory holds any store-shaped path at all - even
+/// a zero-byte, unreadable or symlinked placeholder the preflight classifies
+/// as `Absent`/`Unverifiable`. A true fresh slot (empty V2 registry, no store
+/// file) has none; that distinction lets the migration face call a fresh slot
+/// `migrated` without calling a zero-byte placeholder a store (task-22).
+fn slot_has_store_path(slot: &AccountSlot) -> bool {
+    if std::fs::symlink_metadata(slot.data_dir.join(crate::store_preflight::STORE_FILE_NAME))
+        .is_ok()
+    {
+        return true;
+    }
+    let accounts = slot.data_dir.join("accounts");
+    let Ok(metadata) = std::fs::symlink_metadata(&accounts) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(&accounts) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .take(crate::store_preflight::MAX_SCANNED_ACCOUNT_DIRS)
+        .any(|entry| {
+            entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                && std::fs::symlink_metadata(
+                    entry.path().join(crate::store_preflight::STORE_FILE_NAME),
+                )
+                .is_ok()
+        })
+}
+
 fn error_class(error: &io::Error) -> &'static str {
     match error.kind() {
         io::ErrorKind::NotFound => "not_found",
@@ -1852,6 +2878,75 @@ mod tests {
             root_store_key: Some(StoreKey::from_bytes([0x5A; 32])),
             store_migration: StoreMigrationOptions::default(),
         }
+    }
+
+    /// 3: begin_store_migration must read the store header before writing
+    /// `pending`; an encrypted store it discovers belongs to a finished
+    /// migration, not to a pass that is owed. This is the in-process half of
+    /// the persistence guarantee (the seed covers process assembly).
+    #[tokio::test]
+    async fn begin_store_migration_reads_the_header_before_writing_pending() {
+        let temp = TempDir::new().unwrap();
+        let mut config = config(&temp, false);
+        config.store_migration = StoreMigrationOptions {
+            mode: StoreMigrationMode::Apply,
+            ..StoreMigrationOptions::default()
+        };
+        let account = "0123456789abcdef0123456789abcdef";
+        let store = config
+            .signal_data_dir
+            .join("engines")
+            .join(account)
+            .join("accounts")
+            .join("lk-0123456789abcdef")
+            .join("store.db");
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        std::fs::write(&store, [0x9a_u8, 0x1f, 0x00, 0x5c, 0x11, 0x7d]).unwrap();
+        let pool = AccountPool::discover(config);
+        let slot = pool.get(account).expect("the encrypted slot is discovered");
+        assert_eq!(slot.migration_state(), StoreMigrationState::Migrated);
+        // Simulate the state a fresh process has before the seed runs: the
+        // header is the only authority left.
+        slot.store_migrated.store(false, Ordering::Relaxed);
+        slot.set_migration_state(StoreMigrationState::Pending, None);
+        let state = pool.begin_store_migration(&slot);
+        assert_eq!(state, StoreMigrationState::Migrated);
+        assert!(slot.store_migrated(), "the header sets the process marker");
+        assert_eq!(slot.migration_state(), StoreMigrationState::Migrated);
+        assert!(
+            !slot.migration_in_flight(),
+            "no pass is scheduled for an already encrypted store"
+        );
+    }
+
+    /// task-24: an empty data directory (empty V2 registry, no store file) is
+    /// not migration work: no pass applies, and the face is `migrated`.
+    #[tokio::test]
+    async fn a_fresh_empty_slot_is_migrated_without_a_pass() {
+        let temp = TempDir::new().unwrap();
+        let mut config = config(&temp, false);
+        config.store_migration = StoreMigrationOptions {
+            mode: StoreMigrationMode::Apply,
+            ..StoreMigrationOptions::default()
+        };
+        let pool = AccountPool::discover(config);
+        let slot = pool.provision_slot(DEFAULT_PROXY_GROUP_ID).unwrap();
+        assert!(
+            !pool.migration_pass_applies(&slot),
+            "an empty directory is not a store"
+        );
+        assert_eq!(
+            slot.migration_state(),
+            StoreMigrationState::Migrated,
+            "a fresh slot has no plaintext to migrate"
+        );
+        assert_eq!(
+            pool.begin_store_migration(&slot),
+            StoreMigrationState::Migrated,
+            "the scheduler must not queue a pass over an empty directory"
+        );
+        assert!(!slot.migration_in_flight(), "no migrator task is scheduled");
+        pool.discard(slot.account_id(), true).await;
     }
 
     #[test]
@@ -2330,15 +3425,40 @@ mod tests {
 
     #[test]
     fn a_gate_refusal_stays_distinguishable_from_a_plain_start_failure() {
-        let retry = SlotWakeRefusal::MigrationGate(StoreMigrationDecision::Retry {
-            code: "store_busy".to_string(),
+        // A pass that is running right now is the one retryable verdict: it
+        // finishes on its own and the next start serves the account.
+        let running = SlotWakeRefusal::MigrationGate(StoreMigrationDecision::Retry {
+            code: STORE_MIGRATION_IN_PROGRESS.to_string(),
         });
-        assert!(retry.is_migration_gate());
-        match retry.into_service_error() {
+        assert!(running.is_migration_gate());
+        match running.into_service_error() {
             ServiceError::Api(error) => {
                 assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
-                assert!(error.retryable, "the next start may work");
+                assert!(error.retryable, "the pass is still running");
+                assert!(
+                    error.message.contains("being prepared"),
+                    "{}",
+                    error.message
+                );
+                assert!(
+                    error.message.contains("Retry in a moment"),
+                    "{}",
+                    error.message
+                );
+            }
+            other => panic!("a gate refusal is an API error, got {other:?}"),
+        }
+        // A pass that already failed does not: contract 1.291 (UX 2) retires
+        // the "the next start may work" promise, because nothing retries it.
+        let failed = SlotWakeRefusal::MigrationGate(StoreMigrationDecision::Retry {
+            code: "store_busy".to_string(),
+        });
+        match failed.into_service_error() {
+            ServiceError::Api(error) => {
+                assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
+                assert!(!error.retryable, "nothing retries this on its own");
                 assert!(error.message.contains("store_busy"));
+                assert!(error.message.contains("not retried automatically"));
             }
             other => panic!("a gate refusal is an API error, got {other:?}"),
         }
@@ -2355,6 +3475,147 @@ mod tests {
         assert!(!failed.is_migration_gate());
     }
 
+    #[test]
+    fn the_five_wire_states_map_onto_start_permission() {
+        // Only an unarmed connector and a proven-encrypted store may spawn
+        // without asking the migrator again (contract 1.291).
+        for state in [
+            StoreMigrationState::Off,
+            StoreMigrationState::Pending,
+            StoreMigrationState::Migrating,
+            StoreMigrationState::Migrated,
+            StoreMigrationState::Blocked,
+            StoreMigrationState::Failed,
+        ] {
+            assert_eq!(
+                state.allows_start(),
+                matches!(
+                    state,
+                    StoreMigrationState::Off | StoreMigrationState::Migrated
+                ),
+                "{}",
+                state.label()
+            );
+        }
+        assert_eq!(StoreMigrationState::default().label(), "off");
+        // The wire never carries the off word: a slot whose switch is off omits
+        // the whole key instead (see the schema consistency test).
+        assert_eq!(
+            [
+                StoreMigrationState::Pending.label(),
+                StoreMigrationState::Migrating.label(),
+                StoreMigrationState::Migrated.label(),
+                StoreMigrationState::Blocked.label(),
+                StoreMigrationState::Failed.label(),
+            ],
+            ["pending", "migrating", "migrated", "blocked", "failed"]
+        );
+    }
+
+    #[test]
+    fn the_status_code_is_clamped_by_characters_not_bytes() {
+        let long = "x".repeat(STORE_MIGRATION_CODE_MAX_CHARS + 20);
+        assert_eq!(clamp_store_migration_code(&long).chars().count(), 64);
+        // A multi-byte code must be cut on a character boundary, never mid-byte.
+        let multibyte = "存".repeat(STORE_MIGRATION_CODE_MAX_CHARS + 5);
+        let clamped = clamp_store_migration_code(&multibyte);
+        assert_eq!(clamped.chars().count(), 64);
+        assert_eq!(clamped, multibyte.chars().take(64).collect::<String>());
+        assert_eq!(clamp_store_migration_code("LOCKED"), "LOCKED");
+    }
+
+    #[test]
+    fn the_engine_vocabulary_maps_onto_the_connector_words() {
+        let blocked = |code: &str| {
+            store_migration_face_code(
+                &StoreMigrationDecision::Blocked {
+                    block: StoreMigrationBlock {
+                        code: code.to_string(),
+                        exit: Some(11),
+                        message: store_migration_block_message(code),
+                    },
+                },
+                Some(code),
+            )
+        };
+        assert_eq!(blocked("StoreKeyRequired"), STORE_CODE_KEY_INVALID);
+        assert_eq!(blocked("store_key_rejected"), STORE_CODE_KEY_INVALID);
+        assert_eq!(blocked("store_corrupt"), STORE_CODE_VERIFY_FAILED);
+        assert_eq!(
+            blocked("store_migration_verify_failed"),
+            STORE_CODE_VERIFY_FAILED
+        );
+        assert_eq!(
+            blocked("StoreCipherUnavailable"),
+            STORE_CODE_CAPABILITY_MISSING
+        );
+        // An unknown terminal code still lands on a closed word.
+        assert_eq!(blocked("something_new"), STORE_CODE_VERIFY_FAILED);
+        // The preflight's own refusal is the REQUIRED word.
+        assert_eq!(
+            store_migration_face_code(
+                &StoreMigrationDecision::Blocked {
+                    block: StoreMigrationBlock {
+                        code: STORE_PLAINTEXT_REQUIRES_MIGRATION.to_string(),
+                        exit: None,
+                        message: store_plaintext_refusal_message().to_string(),
+                    },
+                },
+                None,
+            ),
+            STORE_CODE_REQUIRED
+        );
+        let retry = |code: &str| {
+            store_migration_face_code(
+                &StoreMigrationDecision::Retry {
+                    code: code.to_string(),
+                },
+                None,
+            )
+        };
+        assert_eq!(retry("store_migration_timeout"), STORE_CODE_TIMEOUT);
+        assert_eq!(retry("store_busy"), STORE_CODE_LOCKED);
+        assert_eq!(retry("store_lock_held"), STORE_CODE_LOCKED);
+        assert_eq!(
+            retry("store_migration_spawn_failed"),
+            STORE_CODE_INTERRUPTED
+        );
+        assert_eq!(retry("store_pull_failed"), STORE_CODE_IO_ERROR);
+        assert_eq!(
+            store_migration_face_code(&StoreMigrationDecision::Misconfigured, None),
+            STORE_CODE_CAPABILITY_MISSING
+        );
+    }
+
+    #[test]
+    fn a_failed_pass_never_promises_an_automatic_retry() {
+        let message = store_migration_failed_message("store_busy");
+        assert!(message.contains("store_busy"), "{message}");
+        assert!(message.contains("not retried automatically"), "{message}");
+        assert!(
+            message.contains("plaintext store was left untouched"),
+            "{message}"
+        );
+        // The old sentence promised a retry nobody makes; it must not come back.
+        assert!(!message.contains("retried on the next start"), "{message}");
+    }
+
+    #[test]
+    fn a_preflight_refusal_names_both_ways_out() {
+        let message = store_plaintext_refusal_message();
+        assert!(message.contains("KT_ENGINE_STORE_MIGRATE"), "{message}");
+        assert!(
+            message.contains("KT_ENGINE_STORE_REQUIRE_ENCRYPTED"),
+            "{message}"
+        );
+        assert!(message.contains("Nothing was changed"), "{message}");
+        // It must not read as a data problem: a plaintext store is intact.
+        assert!(!message.contains("Re-link"), "{message}");
+        assert!(
+            store_gate_deferral_message(STORE_PLAINTEXT_REQUIRES_MIGRATION)
+                .contains("KT_ENGINE_STORE_REQUIRE_ENCRYPTED")
+        );
+    }
     #[test]
     fn account_fingerprint_is_short_and_never_the_whole_id() {
         let id = "0123456789abcdef0123456789abcdef";

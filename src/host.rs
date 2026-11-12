@@ -4560,6 +4560,15 @@ fn map_start_failure(failure: StartFailure) -> ApiError {
             "engine runtime could not be started",
             true,
         ),
+        // Contract 1.291: every slot was refused by the store-migration gate.
+        // That verdict is terminal for this process - a retry cannot heal a
+        // latched block or an unarmed plaintext store - so the wire must not
+        // promise one. The store code rides `data` beside the actionable
+        // sentence the gate already produced.
+        StartFailure::StoreMigrationBlocked { code, message } => ApiError {
+            data: Some(json!({ "storeMigrationCode": code })),
+            ..ApiError::new("STORE_MIGRATION_BLOCKED", message, false)
+        },
         // O1: the structured fatal. `retryable: false` is the class's own
         // assertion (the supervisor latched the fault); the three facts the
         // launcher needs to repair ride `data`, mirrored by the byte-stable
@@ -7744,5 +7753,25 @@ mod tests {
         assert!(frame["data"].get("peerId").is_none());
         assert!(frame["data"].get("callId").is_none());
         assert!(frame["data"].get("conversationId").is_none());
+    }
+
+    /// A start whose every slot is refused by the store gate is terminal:
+    /// retrying cannot heal a latched block or an unarmed plaintext store, and
+    /// the wire must carry the store code rather than a generic retry.
+    #[test]
+    fn a_store_blocked_start_is_terminal_and_carries_the_store_code() {
+        let api = map_start_failure(StartFailure::StoreMigrationBlocked {
+            code: "store_key_rejected".to_string(),
+            message: "the encrypted store cannot be opened".to_string(),
+        });
+        assert_eq!(api.code, "STORE_MIGRATION_BLOCKED");
+        assert!(!api.retryable, "a terminal store verdict must not retry");
+        assert_eq!(
+            api.data
+                .as_ref()
+                .and_then(|data| data.get("storeMigrationCode")),
+            Some(&json!("store_key_rejected"))
+        );
+        assert_eq!(api.message, "the encrypted store cannot be opened");
     }
 }
