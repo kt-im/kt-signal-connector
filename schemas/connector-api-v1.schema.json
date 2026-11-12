@@ -36,7 +36,7 @@
         "blocked",
         "failed"
       ],
-      "description": "Contract 1.291 (§4.277 B): one per-account store-migration lifecycle state, as reported on runtime.status engines[].storeMigration.state. The wire vocabulary is exactly these five words - there is no \"off\" member: a connector whose KT_ENGINE_STORE_MIGRATE is off omits the whole storeMigration key, so an unarmed connector\u0027s engines[] entry keeps its pre-1.291 shape. pending = a pass is scheduled or owed (including a dry-run plan that observed and proved nothing); migrating = the migrator is running for this slot right now; migrated = this store is encrypted and the connector knows it (derived from the store header, so it survives a restart); blocked = a terminal verdict, retried never (UX: blocked never auto-retries); failed = the last pass did not land, retried only by an explicit runtime.start (UX: failed never auto-retries). The connector owns this classification - a host renders it and never guesses from engine output."
+      "description": "Contract 1.291 (§4.277 B): one per-account store-migration lifecycle state, as reported on runtime.status engines[].storeMigration.state. The wire vocabulary is exactly these five words - there is no \"off\" member: a connector whose KT_ENGINE_STORE_MIGRATE is off omits the whole storeMigration key, so an unarmed connector's engines[] entry keeps its pre-1.291 shape. pending = a pass is scheduled or owed (including a dry-run plan that observed and proved nothing); migrating = the migrator is running for this slot right now; migrated = this store is encrypted and the connector knows it (derived from the store header, so it survives a restart); blocked = a terminal verdict, retried never (UX: blocked never auto-retries); failed = the last pass did not land, retried only by an explicit runtime.start (UX: failed never auto-retries). The connector owns this classification - a host renders it and never guesses from engine output."
     },
     "storeMigration": {
       "type": "object",
@@ -44,7 +44,7 @@
       "required": [
         "state"
       ],
-      "description": "Contract 1.291 (§4.277 B): the additive per-account engine status face engines[].storeMigration = {state, code?}. Absent (the whole key) when the migration switch is off, so an unarmed connector's runtime.status stays byte-identical to its pre-1.291 answer. code is present for blocked and failed - the connector's own closed vocabulary, never an engine code, never a path, never key material: blocked carries CAPABILITY_MISSING (the engine build cannot use the encrypted format, or the migration mode is missing - a deployment problem, fix the build), KEY_INVALID (the store key is missing or does not open this store), VERIFY_FAILED (the store is damaged or failed the migration\u0027s own checks), or REQUIRED (the store is still plaintext, nothing is armed to migrate it, and this host asks for encrypted stores); failed carries INTERRUPTED (the pass was cut off, or the runtime stopped underneath it), IO_ERROR (a transient I/O failure), LOCKED (the store was busy), TIMEOUT (the pass ran out of its budget), or CAPABILITY_MISSING (the engine build has no migration mode). Clamped to 64 characters.",
+      "description": "Contract 1.291 (§4.277 B): the additive per-account engine status face engines[].storeMigration = {state, code?}. Absent (the whole key) when the migration switch is off, so an unarmed connector's runtime.status stays byte-identical to its pre-1.291 answer. code is present for blocked and failed - the connector's own closed vocabulary, never an engine code, never a path, never key material: blocked carries CAPABILITY_MISSING (the engine build cannot use the encrypted format, or the migration mode is missing - a deployment problem, fix the build), KEY_INVALID (the store key is missing or does not open this store), VERIFY_FAILED (the store is damaged or failed the migration's own checks), or REQUIRED (the store is still plaintext, nothing is armed to migrate it, and this host asks for encrypted stores); failed carries INTERRUPTED (the pass was cut off, or the runtime stopped underneath it), IO_ERROR (a transient I/O failure), LOCKED (the store was busy), TIMEOUT (the pass ran out of its budget), or CAPABILITY_MISSING (the engine build has no migration mode). Clamped to 64 characters.",
       "properties": {
         "state": {
           "$ref": "#/$defs/storeMigrationState"
@@ -94,6 +94,8 @@
             "runtime.status",
             "runtime.start",
             "runtime.stop",
+            "ownership.quarantineSlot",
+            "ownership.hibernateSlot",
             "runtime.doctor",
             "events.list",
             "accounts.list",
@@ -267,6 +269,8 @@
                   "runtime.status",
                   "runtime.start",
                   "runtime.stop",
+                  "ownership.quarantineSlot",
+                  "ownership.hibernateSlot",
                   "runtime.doctor",
                   "accounts.list"
                 ]
@@ -454,6 +458,68 @@
                 "$ref": "#/$defs/accountsGetSyncStateParams"
               }
             }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "ownership.quarantineSlot"
+              }
+            },
+            "required": [
+              "method"
+            ]
+          },
+          "then": {
+            "properties": {
+              "method": {
+                "const": "ownership.quarantineSlot"
+              },
+              "accountId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Per-account engine slot key (linked account id). Slot-level: must NOT require the account row to resolve - an orphan slot (binding gone, credentials left) is exactly the target."
+              },
+              "reason": {
+                "type": "string",
+                "description": "Cause word from the Main ownership-table decision (audit face); hibernate ignores it."
+              }
+            },
+            "required": [
+              "method",
+              "accountId"
+            ],
+            "description": "D4 ownership exec (SIGNAL-STAGE1-DESIGN §三, batch 1-5c): stop the account engine and move the credential-bearing directory under engines/.quarantine-* (bytes auditable, BUG-1 discipline). Idempotent: already-settled when no slot exists - a directory is never moved twice. Control lane, local orchestration (no upstream passthrough). Response: {accountId, outcome: \"quarantined\" | \"already-settled\"}."
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "ownership.hibernateSlot"
+              }
+            },
+            "required": [
+              "method"
+            ]
+          },
+          "then": {
+            "properties": {
+              "method": {
+                "const": "ownership.hibernateSlot"
+              },
+              "accountId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Per-account engine slot key (linked account id). Slot-level: must NOT require the account row to resolve - an orphan slot (binding gone, credentials left) is exactly the target."
+              }
+            },
+            "required": [
+              "method",
+              "accountId"
+            ],
+            "description": "D4 ownership exec (batch 1-5c): stop the account engine, keep the directory in place (cold-slot semantics: the next request for the account re-spawns it, one spawn cost). Idempotent like quarantine. Control lane, local orchestration. Response: {accountId, outcome: \"hibernated\" | \"already-settled\"}."
           }
         },
         {

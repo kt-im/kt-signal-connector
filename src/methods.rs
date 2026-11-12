@@ -29,6 +29,10 @@ pub const METHODS: &[MethodRow] = &[
     ("runtime.status", Lane::Control, false, "control"),
     ("runtime.start", Lane::Control, false, "control"),
     ("runtime.stop", Lane::Control, false, "control"),
+    // D4 所有权执行面(阶段1 批1-5c):本地编排(不透传上游),Control 车道
+    // ——隔离/休眠都是破坏性收敛动作,与 runtime.stop 同级同格。
+    ("ownership.quarantineSlot", Lane::Control, false, "control"),
+    ("ownership.hibernateSlot", Lane::Control, false, "control"),
     ("accounts.list", Lane::Control, false, "accounts"),
     ("accounts.deleteLocalData", Lane::Control, true, "accounts"),
     // Account settings writes (contract 1.46, §4.45): the three storage-record
