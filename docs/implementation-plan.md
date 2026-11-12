@@ -21289,3 +21289,173 @@ key 时先被 connector 自己的 store fail-closed 挡住，走不到这条分�
 「没有 key 就不工作」硬语义、明文 → SQLCipher 迁移、fail-closed 锚词都在 engine 仓，另报。
 root key 的生成、持久化、备份与取回都在桌面/运维侧，connector 只做通道，不持有任何可恢复
 副本。legacy 组引擎的组级 key 不在本阶段范围内。
+
+## §4.276 M6 D 阶段（connector 半边）：store 迁移编排 off / dry-run / apply（契约 1.290 · 无 wire 变更）
+
+engine 侧（同仓外）用同一二进制的 storeMigrate argv 模式把明文 store.db 迁成 SQLCipher 库；
+本节是**连接器这一半**：谁在什么时候调它、按什么顺序、失败怎么分档、什么时候绝不再试。
+设计依据是 engine 仓 docs/plan/engine-store-migration-design.md（§2.3 调用点、§2.4 退出码、
+§8.2 预算、§9 失败矩阵）。
+
+### 开关
+
+| KT_ENGINE_STORE_MIGRATE | 行为 |
+|---|---|
+| 未设 / off（**默认**） | 不派生、不 spawn、不读盘；槽位启动与 D 之前逐字节一致 |
+| dry-run | 每槽跑一次带 --dry-run 的迁移器（只出 plan，一个字节都不写），无论它说什么都照常起引擎 |
+| apply | 停槽 → 用该账号的派生 key 迁移 → 成功才起引擎；10 本轮重试上限 3 次、耗尽后留待下次启动重试；11 终态锁死并给出可操作文案 |
+
+未识别的值一律按 off 并 warn：这个键决定一次具备写能力的动作是否发生，方向必须是「什么都不做」；
+一个拼写错误不该让连接器起不来。取值在**运行时装配时读一次**（registry 的
+open_group_runtime_with_options），不按槽读：一个进程不会一半槽按一种读法迁移、一半按另一种。
+
+预算：KT_ENGINE_STORE_MIGRATE_BUDGET_MS（默认 120000，下限 200ms）。迁移要复制 + 导出整库，
+所以用独立预算，绝不与 15s 请求超时混用——共享请求预算的后果是「越需要迁移的慢盘越迁不动」。
+
+### 顺序（不变量）
+
+停槽 → 迁移 → 起引擎。两条启动入口都过同一道闸：常驻窗口 start_resident 与冷启动唤醒
+ensure_resident（后者在 wake 锁内，闸先于 supervisor.start）。
+
+- **引擎已经在跑 = 成功，不是「先 stop 再迁移」的理由**（D3 复审 M1）：闸的第一条判定就是
+  supervisor 状态为 Running 时直接返回 Start（outcome=already_running），与 ensure_resident
+  的既有口径一致。活引擎正在持有 store，它下面本来也无法迁移；对一个健康槽位做
+  stop→迁移→start 只是把该账号所有在飞请求掐断一次。
+- **本进程已迁移过就跳过整库校验**（D3 复审 M4）：槽上记一个进程内 migrated 标记（action=migrate
+  或 noop 时置位），此后的 start（stop 之后、idle 降级之后、runtime.stop→start）直接返回
+  Start（outcome=already_migrated），不再 spawn 迁移器——整库 verify 是一次迁移里最贵的一半，
+  对已经证明过的库重跑一次没有任何收益。标记故意只活在进程内：下一个进程仍校验一次，这样从
+  备份还原的库还会再迁。
+- 迁移期间不允许有任何引擎持有 store：过了上面两条之后，非 Stopped 先 stop，stop 失败按
+  可重试（store_busy）返回，绝不在引擎未退出的情况下让迁移器碰库。
+- 没有 data dir 就不迁移：引擎首次启动自己建库，而迁移器指向不存在的目录会答终态
+  store_migrate_data_dir_missing——那会把一个全新账号误标成坏了。
+- 只有池化槽能做：一个 data-dir 恰一个账号，才恰有一把该账号的派生 key。拿不到
+  EngineStoreKey::Account（root 缺 / legacy 组引擎）就跳过并 warn，不用一把 key 去开别的账号的库。
+
+### 退出码 → 决策
+
+| exit | 含义 | 决策 | 该槽当轮 | 下次启动 |
+|---|---|---|---|---|
+| 0 | 完成 / 无需做（noop）/ 干跑计划 | 起引擎（日志 outcome=planned / migrated / noop / absent / completed）：dry-run 恒 planned；apply 下按迁移器的 action 映射 migrate→migrated、noop→noop、absent→absent，**其它或缺失 action 一律 completed**。migrate 与 noop 另置进程内 migrated 标记；absent / completed 不是「库已加密」的证明，不置标记 | 起引擎、可用 | 已置标记则跳过迁移器 |
+| 2 | 迁移器拒绝了这次调用（混版 / 该 engine build 没有 storeMigrate 子模式） | 不起引擎、不锁死、本轮不重试；错误行按 60 秒窗口节流 | **停服**（该槽不起引擎） | 重试（换成匹配版本即可自愈） |
+| 10 | 可重试（忙 / 瞬时 IO） | 本轮退避重试至多 3 次；耗尽则不起引擎、不锁死 | **停服**（等价于该账号本轮没有引擎） | 重试 |
+| 11 | 终态（key 缺失/不符、库损坏、校验不过、状态违规、StoreCipherUnavailable） | 不起引擎，锁在槽位上 | **停服**，直到人处理 | **永不**，直到人处理 |
+| 超时 | 预算耗尽，子进程被 kill + reap | 不起引擎、不锁死、**本轮不重试** | **停服** | 重试 |
+| 其它 / 无退出码 | 归不了的效应 | 不起引擎、不锁死 | **停服** | 重试 |
+
+> **本表是 apply 档的裁决**，dry-run 档不套用它：干跑是观察模式，不论迁移器答什么——
+> exit 0、2、10、11、超时、spawn 失败或其它非 0——connector 一律照常起引擎（exit 0 记
+> `planned`，其余一律 `planned_failed`），既不锁存也不本轮重试；行为以本节「开关」表里
+> 的 dry-run 一行与本条为准。
+
+「10 允许下次重试」与「11 不无限重试」是两条独立承诺：10 不写任何 latched 状态；11 写
+StoreMigrationBlock（code + exit + 一句人话），此后同一进程内任何 start / 唤醒 / watchdog
+都只读这个锁存，不 spawn 迁移器、也不 spawn 引擎——这正是设计 §8.3-2 要防的 1 秒级重启风暴。
+
+### 失败时留给用户的路
+
+迁移器本身在失败路径上零写入（engine §3.0/§9）：明文库与备份原样保留。**但「数据没坏」不等于
+「账号还能用」**——D3 复审 M3 纠正了本节原先的说法：
+
+- 10 / 超时 / 其它 / 2：数据确实完好，但**该槽当轮停服**：闸拒绝起引擎，所以本进程里这个账号
+  此刻没有可用引擎。恢复路径是运维动作，不是「等引擎自己起来」：把 KT_ENGINE_STORE_MIGRATE
+  关掉（off）或重启连接器/桌面，就回到明文库路径；想继续迁移则修掉原因（换匹配的 engine
+  build、解决 store 忙）后再启动。明文库还在，但**不要**把它当成「引擎照常能跑」的退路：
+  本进程里这个槽就是停的。
+- 11：同上当轮停服，且是**终态**：给出可操作文案（重新 link，或恢复该账号迁移时用的 store
+  key，然后重启 KT Desktop），由 host 侧以不可重试的 CAPABILITY_UNAVAILABLE 呈现
+  （ensure_resident 的错误面）。锁存之后**删本地数据这条路必须仍然通**（D3 复审 M2）：
+  account.delete 不走 ensure_resident 的闸，见下节「锁存槽的删除出口」。
+
+文案按 error code 分三支（key 面 / 损坏面 / 兜底），都点名 code 与补救动作；另外
+StoreCipherUnavailable 单列一支（D3 复审 M6）：那是 engine build 没有 cipher 能力的部署问题，
+账号数据是好的，文案要说「修部署、别动账号数据」，绝不给「重新 link」这种会毁掉一份完好
+数据的建议。文案里没有任何 key、号码、路径或引擎原始输出，并有用例把「不得出现 ≥64 位
+十六进制串」钉死。
+
+### 锁存槽的删除出口（D3 复审 M2）
+
+account.delete 原来在池化路径上先 ensure_resident 再交给引擎删——于是闸锁死的账号**删不掉**，
+而锁存文案给的补救恰恰是「删掉本地数据再重新 link」。现在：
+
+- 唤醒结果分成两档（pool::SlotWakeRefusal）：MigrationGate（闸的裁决）与 Failed（其它）。
+  对外错误面不变，仍走 ensure_resident 的两个既有错误形状。
+- 命中 MigrationGate 时，delete 走**不依赖引擎的纯 store 路径**：先过
+  validate_account_delete_operation_id（畸形 operationId 在进入幂等账本之前就被拒——绕开引擎
+  不等于绕开边界）→ complete_account_delete_recorded 删行 → 清 media handle/文件 → 明文备份行
+  擦除（spawn_blocking，不占服务锁）→ clear_account_delete_files 清进程级 §4.46 backup handle 表
+  里该账号的句柄与 state-dir 下的 §4.115 明文导出物（pass `backup_export::clear_plaintext_artifacts`；
+  supervisor 自带的内存态 plaintext_tasks / skip counters / receipt 缓存随被 discard 的 supervisor
+  一并消亡，这里不再重碰）→ pool.discard 删掉整个槽目录（引擎自己的本地删除本来也只是这些文件），
+  随后清 forwarder。Completed 重放臂与 supervisor 同形（同样跑残留擦除 + 文件清理 + 回收槽），
+  否则重放会把句柄与导出物留在原地。槽位因此被回收，账号可以重新 link。
+  用例：`a_malformed_operation_id_is_refused_on_the_engine_free_path`、
+  `an_engine_free_delete_leaves_no_plaintext_export_artifacts`（含旁观账号导出物不被误删）、
+  `the_engine_free_delete_releases_that_accounts_backup_handles`。
+- 可重试档（10 / 超时 / 2）同样受益：它们也答不出引擎，删除同样是这条路径。
+
+### exit 2 的文案与节流（D3 复审 M5）
+
+退出码 2 是「迁移器不接受这次调用」，人话就是混版或缺子模式：connector 与 engine 不同版本，
+或该 engine build 根本没有 storeMigrate。文案按此改写（无多余空格、点名 storeMigrate 与版本），
+并且错误行按 60 秒窗口节流（pool::RepeatThrottle）：重启风暴里同一句话每秒一行等于没有告警，
+被压掉的行数会附在下一行。
+
+### 日志纪律
+
+迁移相关行只带四个字段：store_migration（模式 label：off / dry_run / apply）、account
+（账号 id 的前 8 字符指纹）、exit、code（engine 的证据码），外加 store_migration_outcome。
+key 与派生结果不出现在任何日志行：子进程只经由 KT_SIGNAL_STORE_KEY 拿到该账号的派生，
+父进程不打印、不落盘。
+
+### 测试
+
+tests/store_migrate_orchestration.rs（新测试二进制；env 是进程全局，故每个用例整段持锁）：
+
+| 用例 | 钉住的行为 |
+|---|---|
+| unset_switch_is_off_and_an_unrecognised_value_stays_off | 默认 off；拼写错误不启用 |
+| off_mode_spawns_no_migrator_and_starts_the_engine | off 不产生任何迁移子进程，引擎照常起 |
+| apply_mode_migrates_before_the_engine_and_hands_over_the_derived_key | 调用序 migrate → jsonrpc；argv 形状；子进程拿到的 key 恰等于 HKDF(root, accountId) 且不等于 root |
+| dry_run_only_plans_and_still_starts_the_engine | argv 含 --dry-run；store.db 逐字节不变；引擎照常起 |
+| a_retryable_exit_ten_is_retried_within_the_pass_and_then_succeeds | 10,10,0 → 3 次尝试后放行 |
+| an_exhausted_retryable_failure_stays_retryable_and_never_starts_the_engine | 10 耗尽 → 3 次、不起引擎、不锁死；再 start 再试 3 次 |
+| a_terminal_exit_eleven_latches_a_block_and_is_never_retried | 11 → 1 次、不起引擎、锁存；再 start 仍 1 次；唤醒返回不可重试的可操作文案 |
+| a_usage_error_exit_two_is_a_connector_bug_not_a_blocked_account | 2 → 不锁死、不重试，下次启动再来；文案点名 storeMigrate/版本且无多余空格；同一槽第三次仍只打一行（节流） |
+| a_timeout_is_not_retried_within_the_same_pass | 超时不重试（否则一次启动 = 尝试数 × 预算） |
+| a_missing_data_directory_is_not_a_terminal_failure | 无目录 → 不迁移、不锁死、引擎自建库 |
+| migration_logs_name_the_mode_the_fingerprint_and_the_exit_but_never_the_key | 日志带模式/指纹/退出码，无账号全 id、无 key、无 ≥64 位 hex |
+| a_second_start_leaves_the_live_engine_alone（D3 复审 M1） | 引擎已在跑时再调 runtime.start：不 spawn 迁移器、不重启引擎（pid 不变、jsonrpc 只起过一次）、并发请求全部成功 |
+| a_migrated_slot_skips_the_second_migration_run（D3 复审 M4） | 迁移成功后 stop→start：迁移器不再跑第二次，引擎照常起 |
+| a_latched_slot_still_deletes_its_local_data_and_frees_the_slot（D3 复审 M2） | 11 锁存后 account.delete 成功：行清空、槽位回收、槽目录删除、锁存随之消失 |
+| a_cipherless_engine_build_gets_the_deployment_remedy（D3 复审 M6） | exit 11 + StoreCipherUnavailable 的文案说「修部署、别动账号数据」，不给重新 link |
+| the_plan_says_what_a_retryable_migration_really_does（D3 复审 M3） | 文档改写成「该槽当轮停服 + 关开关/重启恢复」，不再写明文库能顶替引擎 |
+
+src/pool.rs 单测：三档解析（未设/off/dry-run/dry_run/大小写/垃圾值）、exit 0/2/10/11/未声明
+× apply/dry-run 的分类矩阵、block 文案（含 code、含重新 link、无 ≥64 位 hex）、
+block.service_error 的 retryable=false、指纹函数。
+src/engine.rs 单测：store_migrate_args 形状（storeMigrate 位于 --data-dir 取值之后）、
+--json 文档解析（最后一行、顶层 error、不可解析时给空结果而非臆断）。
+
+### 边界（如实记档）
+
+- 本节只改 connector 的编排面，不改 engine 的迁移语义，也没有 wire 变更（不新增错误码、
+  不改 runtime.status 形状）。锁存状态的对外可见面目前只有两处：ensure_resident 的错误文案
+  与日志；若要进 runtime.status 的 engines[]，属于下一次 wire 变更。
+- supervisor 自己的崩溃重启路径（不是 pool 的 start）不经过这道闸。engine 侧终态拒绝明文库
+  之后，若引擎在迁移未完成的槽位上被 supervisor 反复拉起，重启节奏仍由 supervisor 的
+  退避决定——把闸下沉到 supervisor 需要改它的启动面，不在本阶段文件域内。
+- 同一槽位若被两条路径同时进闸（常驻窗口与一次冷启动唤醒），迁移器自身的 store-migrate.lock
+  是唯一互斥：后到者答 exit 10，按可重试处理，不为闸再加一把进程内锁（加锁会把一次 I/O 放大
+  的动作串到连接器主路径上）。
+- legacy 组引擎拓扑下一律不迁移（无账号级 key），只 warn 一次；真要在 legacy 布局迁移，
+  必须先切到池化。
+- 纯 store 删除路径只覆盖「闸拒绝起引擎」的槽位；健康槽位仍走引擎的 deleteLocalAccountData
+  （它比槽目录整体删除多一步引擎自己的账号清理，能问就不绕过）。两条路径共用同一份 store
+  事务与同一份 receipt，所以 host 侧看到的回执形状没有分叉。
+- 节流是每槽、每进程的窗口计时，不做全局限流：一个槽被混版挡住，另一个槽的可重试行不该
+  陪它一起被压。
+- 引擎已经在跑的槽位本轮不迁移（M1）：它的库要等下一次冷启动（stop、idle 降级、重启进程）
+  才会过闸。打开开关后想让在跑的账号立刻迁移，重启连接器是最直接的办法——这也是「不停活引擎」
+  这条不变量换来的代价，写在这里免得下一个人以为是漏迁。

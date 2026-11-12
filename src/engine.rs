@@ -273,6 +273,218 @@ fn engine_args(data_dir: &Path, media_ingest: bool) -> Vec<std::ffi::OsString> {
     args
 }
 
+/// The engine's migration argv mode (M6 phase D1/D3). The connector spawns
+/// the **same engine binary** in this mode instead of `jsonRpc` to move one
+/// account's plaintext `store.db` to an encrypted one, so the one programmable
+/// judgement stays the exit code (0 done/no-op/planned, 2 usage, 10 retryable,
+/// 11 terminal — engine design §2.4). Nothing in this module interprets the
+/// human-readable text: only `--json` evidence fields ride along for the log
+/// line.
+pub const STORE_MIGRATE_SUBCOMMAND: &str = "storeMigrate";
+
+/// Hard bound on the migration child's stdout/stderr the connector keeps. The
+/// `--json` document is one line; anything past this is a child that is not
+/// respecting its own contract, and a startup path must not grow with it.
+const STORE_MIGRATION_OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// The fixed argv shape of one migration run (engine design §2.2):
+/// `--data-dir <DIR> storeMigrate [--dry-run] --json`. `--account` is
+/// deliberately absent: a pooled data directory holds exactly one
+/// `accounts/lk-*` store (pool invariant I3), so naming it would only add a
+/// second source of truth the connector does not own.
+fn store_migrate_args(data_dir: &Path, dry_run: bool) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--data-dir".into(),
+        data_dir.as_os_str().into(),
+        STORE_MIGRATE_SUBCOMMAND.into(),
+    ];
+    if dry_run {
+        args.push("--dry-run".into());
+    }
+    args.push("--json".into());
+    args
+}
+
+/// What one migration run left behind. Evidence only — the caller classifies
+/// on `exit` (the engine's programmable判据), never on the text.
+#[derive(Clone, Debug, Default)]
+pub struct StoreMigrationRun {
+    /// The child's exit code; `None` when it never produced one (spawn
+    /// failure, I/O failure, or the budget expired).
+    pub exit: Option<i32>,
+    /// The budget expired and the child was killed.
+    pub timed_out: bool,
+    /// The child could not be spawned or waited on.
+    pub failed: bool,
+    /// `accounts[0].action` from the `--json` document
+    /// (`migrate`/`dry-run`/`noop`/`absent`/`failed`), when it parsed.
+    pub action: Option<String>,
+    /// The first `code` the document offered (`accounts[0].code`, else the
+    /// top-level `error.code`) — an evidence label, never a secret.
+    pub code: Option<String>,
+    /// `plan[]` (step-name array) when the document carried one.
+    pub plan: Vec<String>,
+}
+
+impl StoreMigrationRun {
+    /// One short label for the log line: `timed_out`, `spawn_failed`, or the
+    /// exit code as text. Never fabricates a code the child did not state.
+    pub fn outcome_label(&self) -> String {
+        match (self.timed_out, self.failed, self.exit) {
+            (true, _, _) => "timed_out".to_string(),
+            (_, true, _) => "spawn_failed".to_string(),
+            (_, _, Some(exit)) => format!("exit_{exit}"),
+            (_, _, None) => "no_exit".to_string(),
+        }
+    }
+}
+
+/// Run the engine's `storeMigrate` mode for one slot.
+///
+/// The child is handed exactly the account's derived key through
+/// `KT_SIGNAL_STORE_KEY` — the same env the engine that will open the store
+/// gets, and the same derivation (K1/K2: the key that encrypts is the key that
+/// opens). Everything else about the child's environment is inherited, except
+/// the single-account guard, which is a topology promise that means nothing to
+/// a one-shot migrator and must not be echoed as if it did.
+///
+/// The budget is the caller's (migration budget, deliberately not the 15 s
+/// request timeout): a store copy is I/O amplification, and inheriting a
+/// request budget would fail it on exactly the machines that need it most.
+pub async fn run_store_migration(
+    executable: &Path,
+    data_dir: &Path,
+    key: &crate::store::StoreKey,
+    dry_run: bool,
+    budget: Duration,
+) -> StoreMigrationRun {
+    let encoded = key.to_hex();
+    let mut command = Command::new(executable);
+    command
+        .args(store_migrate_args(data_dir, dry_run))
+        .env(crate::store::STORE_KEY_ENV, encoded.as_str())
+        .env_remove(crate::pool::SINGLE_ACCOUNT_ENV)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            return StoreMigrationRun {
+                failed: true,
+                ..StoreMigrationRun::default()
+            };
+        }
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_task = tokio::spawn(read_bounded(stdout));
+    let stderr_task = tokio::spawn(read_bounded(stderr));
+    let status = match timeout(budget, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return StoreMigrationRun {
+                failed: true,
+                ..StoreMigrationRun::default()
+            };
+        }
+        Err(_) => {
+            // Budget expired: kill and reap, so no migration child outlives the
+            // slot start it was launched for.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return StoreMigrationRun {
+                timed_out: true,
+                ..StoreMigrationRun::default()
+            };
+        }
+    };
+    let stdout = stdout_task.await.unwrap_or_default();
+    let _stderr = stderr_task.await.unwrap_or_default();
+    let mut run = parse_store_migration_document(&stdout);
+    run.exit = status.code();
+    run
+}
+
+/// Read a child pipe to a bounded buffer. A migrator that writes past the
+/// limit is truncated, not trusted: the document is one line, and the
+/// classification never depends on the bytes anyway.
+async fn read_bounded<R>(reader: Option<R>) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(mut reader) = reader else {
+        return String::new();
+    };
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let room = STORE_MIGRATION_OUTPUT_LIMIT.saturating_sub(buffer.len());
+                if room == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read.min(room)]);
+            }
+        }
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+/// Pull the evidence fields out of the `--json` document: `accounts[0]`'s
+/// `action`/`code` and `plan[]`. A document that does not parse yields an
+/// empty run — never an invented verdict.
+fn parse_store_migration_document(stdout: &str) -> StoreMigrationRun {
+    let mut run = StoreMigrationRun::default();
+    let document = stdout
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(|line| serde_json::from_str::<Value>(line).ok());
+    let Some(document) = document else {
+        return run;
+    };
+    if let Some(account) = document
+        .get("accounts")
+        .and_then(Value::as_array)
+        .and_then(|accounts| accounts.first())
+    {
+        run.action = account
+            .get("action")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        run.code = account
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    if run.code.is_none() {
+        run.code = document
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    if let Some(plan) = document.get("plan").and_then(Value::as_array) {
+        run.plan = plan
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+    }
+    run
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EngineState {
@@ -8480,6 +8692,90 @@ mod tests {
             config.shutdown_grace + SHUTDOWN_TIMEOUT_MARGIN,
             Duration::from_secs(12)
         );
+    }
+
+    /// M6 D3: the migration child's argv is the engine's documented mode shape
+    /// and nothing else - no account name (a pooled directory holds exactly
+    /// one), and --json always, because the connector reads the document.
+    #[test]
+    fn store_migrate_args_match_the_engine_mode_shape() {
+        let apply: Vec<std::ffi::OsString> = ["--data-dir", "/data", "storeMigrate", "--json"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(store_migrate_args(Path::new("/data"), false), apply);
+        let plan: Vec<std::ffi::OsString> =
+            ["--data-dir", "/data", "storeMigrate", "--dry-run", "--json"]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+        assert_eq!(store_migrate_args(Path::new("/data"), true), plan);
+        // The subcommand must sit after the data-dir *value*: the engine routes
+        // on a non-value position, and a directory literally named storeMigrate
+        // must keep launching jsonRpc.
+        assert_eq!(apply[2], std::ffi::OsString::from("storeMigrate"));
+    }
+
+    #[test]
+    fn the_json_document_supplies_evidence_but_never_the_verdict() {
+        let document = r#"{"ok":true,"dryRun":false,"freeBytes":1,"needBytes":2,"accounts":[{"lk":"lk-01","action":"migrate","code":"store_migrated","bytes":16,"elapsedMs":4,"keyid":"abcd","backup":null,"checks":["rows"]}],"plan":["checkpoint","backup","export","verify","swap"],"did":["checkpoint","backup","export","verify","swap"]}"#;
+        let run = parse_store_migration_document(document);
+        assert_eq!(run.action.as_deref(), Some("migrate"));
+        assert_eq!(run.code.as_deref(), Some("store_migrated"));
+        assert_eq!(
+            run.plan,
+            vec!["checkpoint", "backup", "export", "verify", "swap"]
+        );
+        // Exit is only ever the child's; a parsed document invents nothing.
+        assert_eq!(run.exit, None);
+        assert!(!run.timed_out);
+        assert!(!run.failed);
+    }
+
+    #[test]
+    fn a_top_level_error_is_the_code_when_no_account_reported_one() {
+        let run = parse_store_migration_document(
+            r#"{"ok":false,"accounts":[],"plan":[],"did":[],"error":{"code":"StoreKeyRequired","retryable":false}}"#,
+        );
+        assert_eq!(run.code.as_deref(), Some("StoreKeyRequired"));
+        assert_eq!(run.action, None);
+    }
+
+    #[test]
+    fn unparseable_output_yields_an_empty_run_not_an_invented_verdict() {
+        for text in ["", "not json", "{\"ok\":", "   "] {
+            let run = parse_store_migration_document(text);
+            assert_eq!(run.exit, None);
+            assert_eq!(run.action, None);
+            assert_eq!(run.code, None);
+            assert!(run.plan.is_empty());
+            assert_eq!(run.outcome_label(), "no_exit");
+        }
+    }
+
+    #[test]
+    fn the_last_json_line_wins_because_the_engine_prints_one_at_the_end() {
+        let run = parse_store_migration_document(
+            "noise before\n{\"accounts\":[{\"action\":\"noop\",\"code\":\"store_migration_noop\"}]}\n",
+        );
+        assert_eq!(run.action.as_deref(), Some("noop"));
+        assert_eq!(run.code.as_deref(), Some("store_migration_noop"));
+    }
+
+    #[test]
+    fn the_outcome_label_prefers_the_failure_shape_over_an_exit_code() {
+        let mut run = StoreMigrationRun {
+            exit: Some(11),
+            ..StoreMigrationRun::default()
+        };
+        assert_eq!(run.outcome_label(), "exit_11");
+        run.timed_out = true;
+        assert_eq!(run.outcome_label(), "timed_out");
+        let failed = StoreMigrationRun {
+            failed: true,
+            ..StoreMigrationRun::default()
+        };
+        assert_eq!(failed.outcome_label(), "spawn_failed");
     }
 
     #[test]

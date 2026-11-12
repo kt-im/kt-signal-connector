@@ -306,6 +306,14 @@ pub struct ProxyGroupRuntime {
     /// transition writes it; `None` on the legacy path, where no sweep reads
     /// it.
     shared_running: StdMutex<Option<Arc<AtomicBool>>>,
+    /// The process-wide §4.46 backup file-handle table, when the launcher armed
+    /// it (M6 D3 follow-up). Every supervisor already holds the same `Arc`;
+    /// this one exists so the engine-free account delete can release one
+    /// account's handles without borrowing a supervisor — a slot the
+    /// store-migration gate refuses never gets one to borrow. Armed once, at
+    /// assembly (`install_backup_handles`); `None` keeps the engine-free path
+    /// down to its on-disk residue.
+    backup_handles: StdMutex<Option<Arc<crate::backup_export::BackupFileHandleTable>>>,
 }
 
 impl ProxyGroupRuntime {
@@ -373,6 +381,17 @@ impl ProxyGroupRuntime {
         runtime
     }
 
+    /// Arm the process-wide §4.46 backup file-handle table this runtime's
+    /// engine-free account delete clears (M6 D3 follow-up). Set once at
+    /// assembly, from the same `Arc` every supervisor receives; the legacy
+    /// path never needs it because it always has a supervisor to clear its own
+    /// handles.
+    fn install_backup_handles(&self, handles: Arc<crate::backup_export::BackupFileHandleTable>) {
+        if let Ok(mut slot) = self.backup_handles.lock() {
+            *slot = Some(handles);
+        }
+    }
+
     /// Publish the current running state to the sweep's copy. Called on every
     /// transition (start/stop/restart), so the sweep reads one writer's fact
     /// without a polling thread or a second source of truth.
@@ -418,6 +437,7 @@ impl ProxyGroupRuntime {
             forwarders: StdMutex::new(Vec::new()),
             forwarded_accounts: StdMutex::new(HashSet::new()),
             shared_running: StdMutex::new(None),
+            backup_handles: StdMutex::new(None),
         });
         runtime.spawn_forwarders();
         runtime.spawn_event_log_sweeper();
@@ -524,7 +544,10 @@ impl ProxyGroupRuntime {
     }
 
     /// The dynamic registry, when the per-account pool is enabled.
-    pub(crate) fn account_pool(&self) -> Option<&Arc<crate::pool::AccountPool>> {
+    /// The per-account pool of this runtime, when full pooling is armed. Read
+    /// only: diagnostics and tests consult per-slot faces (status, migration
+    /// block) through it; nothing routes work through this accessor.
+    pub fn account_pool(&self) -> Option<&Arc<crate::pool::AccountPool>> {
         self.pool.as_ref()
     }
 
@@ -1625,6 +1648,111 @@ impl ProxyGroupRuntime {
         &self.router
     }
 
+    /// The engine-free local delete (M6 D3 review M2).
+    ///
+    /// Used only when the store-migration gate refuses this slot an engine: an
+    /// account whose engine can never start still has to be deletable, because
+    /// "delete its local data and link it again" is the remedy its own block
+    /// message states. Everything the engine's `deleteLocalAccountData` would
+    /// have erased locally is covered here — the store rows, the media handles
+    /// and files, the plaintext-backup scrub, the §4.197 file half (M6 D3
+    /// follow-up, `clear_account_delete_files`) — and the slot directory
+    /// itself is removed wholesale, so the engine-owned files (and the store it
+    /// could not open) go with it.
+    async fn delete_account_without_engine(
+        &self,
+        account_id: &str,
+        operation_id: Option<String>,
+    ) -> Result<Value, ServiceError> {
+        // The same ladder the engine path opens with (`RuntimeSupervisor::
+        // delete_local_account`) and the absent-account replay in this file
+        // uses: a malformed operationId is a caller bug and is refused before
+        // the idempotency ledger sees it. Bypassing the engine must not bypass
+        // the bound — least of all here, where this branch exists precisely to
+        // keep the delete answerable.
+        if let Some(operation_id) = operation_id.as_deref() {
+            crate::service::validate_account_delete_operation_id(operation_id)?;
+        }
+        let receipt = {
+            let mut service = self.router_service().lock().await;
+            if let Some(operation_id) = operation_id.as_deref()
+                && let AccountDeletePlan::Completed =
+                    service.prepare_account_delete(account_id, operation_id)?
+            {
+                // An idempotent replay: the rows are already gone. The
+                // supervisor's own Completed arm still clears the account's
+                // residue, so this path runs the same scrub and file cleanup
+                // below instead of returning early with the receipt alone.
+                service
+                    .store_ref()
+                    .account_delete_receipt(account_id)
+                    .ok()
+                    .flatten()
+            } else {
+                let receipt = service
+                    .complete_account_delete_recorded(account_id, operation_id.as_deref())?;
+                // ADR 0004 gate 3: a chunk-stream handle cannot outlive the
+                // account session it was opened from.
+                service.clear_media_for_account(account_id);
+                receipt
+            }
+        };
+        // §4.197: the scrub is VACUUM-sized blocking work — off the async
+        // threads and outside the service lock, exactly like the supervisor's
+        // engine-path sibling.
+        let store = Arc::clone(&self.store);
+        let scrub_id = account_id.to_string();
+        let receipt = match receipt {
+            Some(receipt) => {
+                match tokio::task::spawn_blocking(move || {
+                    store.finish_account_delete_residue(&scrub_id)
+                })
+                .await
+                {
+                    Ok(Ok(residue)) => residue.or(Some(receipt)),
+                    _ => Some(receipt),
+                }
+            }
+            None => None,
+        };
+        // §4.197 file half, before the slot goes: the shared handle tables and
+        // the state-dir products outlive `pool.discard`.
+        self.clear_account_delete_files(account_id);
+        if let Some(pool) = &self.pool {
+            pool.discard(account_id, true).await;
+        }
+        self.forget_account_forwarders(account_id);
+        Ok(account_delete_result(receipt))
+    }
+
+    /// The §4.197 file half of an account delete, for the engine-free path
+    /// (M6 D3 follow-up).
+    ///
+    /// The engine path clears this through its supervisor
+    /// (`supervisor.rs` `clear_account_delete_files`), which a slot the
+    /// store-migration gate refuses never has. What survives `pool.discard`
+    /// is here, so here is where it is cleared:
+    ///
+    /// - the process-wide §4.46 backup file-handle table — a handle cannot
+    ///   outlive the account session it was opened from (its residual cap and
+    ///   addressability would otherwise survive the account);
+    /// - this account's §4.115 `state-dir` plaintext export products — an
+    ///   export never outlives its account, which is the whole point of the
+    ///   delete remedy ("delete its local data and link it again").
+    ///
+    /// The slot-local in-memory caches the supervisor's version also clears
+    /// (`plaintext_tasks`, skip counters, receipt failures, resync stamps,
+    /// cancel flags) die with the supervisor `pool.discard` stops, so they
+    /// need no entry here.
+    fn clear_account_delete_files(&self, account_id: &str) {
+        if let Ok(handles) = self.backup_handles.lock()
+            && let Some(handles) = handles.as_ref()
+        {
+            handles.clear_account(account_id);
+        }
+        crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), account_id);
+    }
+
     pub async fn delete_local_account(
         &self,
         account_id: String,
@@ -1642,7 +1770,25 @@ impl ProxyGroupRuntime {
                 return self.delete_absent_account(&account_id, operation_id).await;
             };
             if self.running.load(Ordering::Acquire) {
-                pool.ensure_resident(&slot).await?;
+                match pool.wake_slot(&slot).await {
+                    Ok(()) => {}
+                    // M2 (M6 D3 review): the store-migration gate may refuse
+                    // this slot an engine. It must not thereby refuse the user
+                    // the one action the gate's own message names ("delete its
+                    // local data and link it again"), so the delete takes the
+                    // engine-free path instead of being vetoed by a gate that
+                    // is about serving traffic.
+                    Err(refusal) if refusal.is_migration_gate() => {
+                        tracing::warn!(
+                            account = %crate::pool::account_fingerprint(&account_id),
+                            "the store migration refuses this slot an engine; deleting the local data without one"
+                        );
+                        return self
+                            .delete_account_without_engine(&account_id, operation_id)
+                            .await;
+                    }
+                    Err(refusal) => return Err(refusal.into_service_error()),
+                }
             }
             let result = slot
                 .supervisor()
@@ -3472,6 +3618,11 @@ pub fn open_group_runtime_with_options(
             single_account_guard: options.single_account_guard,
             watchdog_interval: options.watchdog_interval,
             root_store_key: engine_store_root,
+            // M6 D3: the store-migration switch, resolved here (once, at
+            // runtime assembly) rather than at each slot start, so one process
+            // cannot migrate half its slots under one reading and half under
+            // another. Off by default: no migrator is spawned.
+            store_migration: crate::pool::StoreMigrationOptions::from_env(),
         });
         if pool.len() > rows.len() {
             return Err(StoreError::EnginePoolInvalid(format!(
@@ -3496,6 +3647,7 @@ pub fn open_group_runtime_with_options(
             Arc::clone(&pool),
             Arc::clone(&running),
         );
+        runtime.install_backup_handles(Arc::clone(&backup_handles));
         pool.install_orphan_sweep(running);
         tracing::info!(
             groups = json!(runtime.group_ids()).to_string(),
@@ -3519,6 +3671,19 @@ pub fn open_group_runtime_with_options(
         return Err(StoreError::EnginePoolInvalid(format!(
             "this data directory holds {count} per-account engine slot(s); start with --per-account-engines (the legacy group engines cannot serve the pool layout). Run `kt-signal-connector migrate-pool --signal-data-dir <dir> --state-dir <dir> --dry-run` to review the layout first: one process never serves both layouts."
         )));
+    }
+    // M6 D3: a legacy group engine serves every account of its group from one
+    // process, so there is no single account's key to migrate with
+    // (EngineStoreKey::GroupEngineNoAccountKey). Say so once instead of
+    // silently doing nothing when the operator armed the switch.
+    let migration = crate::pool::StoreMigrationOptions::from_env();
+    if migration.is_enabled() {
+        tracing::warn!(
+            store_migration = migration.mode.label(),
+            store_migration_outcome = "skipped",
+            reason = "legacy_group_topology",
+            "store migration needs one account per engine; this legacy launch will not migrate"
+        );
     }
     let mut slots = Vec::with_capacity(plan.groups.len());
     for entry in &plan.groups {
@@ -3780,6 +3945,7 @@ mod tests {
             single_account_guard: false,
             watchdog_interval: None,
             root_store_key: Some(StoreKey::from_bytes([0x5A; 32])),
+            store_migration: crate::pool::StoreMigrationOptions::default(),
         });
         let slot = pool.provision_slot(DEFAULT_PROXY_GROUP_ID).unwrap();
         let runtime = ProxyGroupRuntime::full_pool_with_running(
@@ -4227,5 +4393,55 @@ mod tests {
             .expect("engines rides as an array");
         assert_eq!(engines.len(), 2);
         assert_eq!(engines[0]["accountId"], "00000000000000000000000000000001");
+    }
+
+    /// M6 D3 follow-up: the engine-free delete is the one delete path with no
+    /// supervisor to borrow, and the §4.46 backup handle table is process-wide
+    /// — `pool.discard` takes the slot, never the handle. The file half the
+    /// delete calls must release that account's handles (and only that
+    /// account's), or a handle outlives the session it was opened from.
+    #[tokio::test]
+    async fn the_engine_free_delete_releases_that_accounts_backup_handles() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap());
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            EngineConfig::new(
+                PathBuf::from("unused-engine"),
+                PathBuf::from("/tmp/unused-signal-data"),
+            ),
+            Arc::clone(&store),
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        let runtime = ProxyGroupRuntime::new(vec![ProxyGroupSlot::new(
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            supervisor,
+        )]);
+        let handles = Arc::new(crate::backup_export::BackupFileHandleTable::new());
+        runtime.install_backup_handles(Arc::clone(&handles));
+        let snapshot = temp.path().join("snapshot.db");
+        std::fs::write(&snapshot, b"snapshot").unwrap();
+        let deleted = handles.open("acct-a", snapshot.clone(), 8).unwrap();
+        let kept = handles.open("acct-b", snapshot, 8).unwrap();
+        assert!(
+            handles.read_chunk(&deleted, 0).is_ok(),
+            "the handle is live"
+        );
+        assert!(handles.read_chunk(&kept, 0).is_ok(), "the handle is live");
+
+        runtime.clear_account_delete_files("acct-a");
+
+        assert!(
+            matches!(
+                handles.read_chunk(&deleted, 8),
+                Err(crate::backup_export::BackupHandleError::NotFound)
+            ),
+            "a handle cannot outlive the account session it was opened from"
+        );
+        assert!(
+            handles.read_chunk(&kept, 8).is_ok(),
+            "another account's handle is untouched"
+        );
     }
 }
