@@ -103,9 +103,29 @@ jobs:
           key = os.environ['OSS_KEY']
           with open(src, 'rb') as f:
               local_sha = hashlib.sha256(f.read()).hexdigest()
-          bucket.put_object_from_file(key, src)
+          local_size = os.path.getsize(src)
+
+          # key 不可变纪律：产物路径含版本号，同一 key 永不复用。
+          # 若已存在且内容不同 → 直接失败，交给人 bump 版本号；
+          # 若已存在且内容相同 → 幂等跳过（重跑构建不报错）。
+          if bucket.object_exists(key):
+              meta = bucket.head_object(key)
+              remote_sha = (meta.headers or {}).get('x-oss-meta-sha256', '')
+              if remote_sha and remote_sha != local_sha:
+                  raise SystemExit(f"FATAL: oss://{os.environ['OSS_BUCKET']}/{key} already holds sha256={remote_sha}, refusing to overwrite with {local_sha}. Bump the version in Cargo.toml instead of reusing this path.")
+              if meta.content_length != local_size:
+                  raise SystemExit(f"FATAL: oss://{os.environ['OSS_BUCKET']}/{key} size {meta.content_length} != local {local_size}. Bump the version instead of reusing this path.")
+              if not remote_sha:
+                  remote = bucket.get_object(key).read()
+                  if hashlib.sha256(remote).hexdigest() != local_sha:
+                      raise SystemExit(f"FATAL: oss://{os.environ['OSS_BUCKET']}/{key} content differs from local build. Bump the version instead of reusing this path.")
+              print(f"already published with identical content, skip upload: {key}")
+              print(f"public url: https://download.ktai.im/{key}")
+              raise SystemExit(0)
+
+          bucket.put_object_from_file(key, src, headers={'x-oss-meta-sha256': local_sha})
           meta = bucket.head_object(key)
-          assert meta.content_length == os.path.getsize(src), 'size mismatch after upload'
+          assert meta.content_length == local_size, 'size mismatch after upload'
           print(f"uploaded {key} size={meta.content_length} sha256={local_sha}")
           print(f"public url: https://download.ktai.im/{key}")
           '@
