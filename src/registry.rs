@@ -547,13 +547,38 @@ impl ProxyGroupRuntime {
             if slot.supervisor().has_pending_link().await {
                 continue;
             }
+            let account_id = slot.account_id().to_string();
+            // The lease is the only owner an uncommitted slot has: reap it
+            // through exactly the same idempotent function finish/cancel use.
+            if let Some(attempt_id) = slot.lease_attempt_id() {
+                tracing::warn!(
+                    target: "connector.pool",
+                    invariant = crate::pool::LINK_SLOT_LEAK_INVARIANT,
+                    stage = "abandoned_link_reaped",
+                    account = %crate::pool::account_fingerprint(&account_id),
+                    group_id = %slot.proxy_group(),
+                    "abandoned link attempt lease is being reclaimed"
+                );
+                let outcome = pool.reclaim_link_attempt(&attempt_id).await;
+                if matches!(
+                    outcome,
+                    crate::pool::LinkReclaimOutcome::Reclaimed
+                        | crate::pool::LinkReclaimOutcome::Quarantined
+                ) {
+                    self.forget_account_forwarders(&account_id);
+                }
+                continue;
+            }
+            // A pre-lease slot (a crash window from an older build, or a
+            // slot whose lease was already settled): the same teardown, no
+            // lease record to address.
             tracing::warn!(
-                account_id = %slot.account_id(),
+                account_id = %account_id,
                 group_id = %slot.proxy_group(),
                 "abandoned per-account link slot is being reclaimed"
             );
-            pool.discard(slot.account_id(), true).await;
-            self.forget_account_forwarders(slot.account_id());
+            pool.discard(&account_id, true).await;
+            self.forget_account_forwarders(&account_id);
         }
     }
 
@@ -1354,8 +1379,32 @@ impl ProxyGroupRuntime {
             // directory that can never mint a QR.
             return Err(ServiceError::Engine(EngineError::NotRunning));
         }
+        // A previous attempt whose QR expired (or whose finish was never
+        // answered) must not hold one of the eight slots against this fresh
+        // link. The reaper is the same lease-based reclaim every terminal
+        // answer uses; running one pass here makes the free slot immediate
+        // instead of waiting for the 30 s tick.
+        self.reap_uncommitted_links().await;
         let _admission = pool.lock_admission().await;
         let account = pool.provision_slot(&group_id)?;
+        // The slot is owned by the attempt, never by the preallocated account
+        // id: mint the host-facing `linkAttemptId` before the engine is asked
+        // for a code, open the lease, and let the guard below be the one
+        // authority that either persists it (a live QR) or reclaims it (every
+        // early exit).
+        let attempt_id = crate::ids::random_id();
+        let guard =
+            match crate::pool::LinkAttemptGuard::open(Arc::clone(pool), &account, &attempt_id) {
+                Some(guard) => guard,
+                None => {
+                    self.rollback_account_slot(&account).await;
+                    return Err(ServiceError::Api(ApiError::new(
+                        "CAPABILITY_UNAVAILABLE",
+                        "the link attempt could not claim its engine slot",
+                        false,
+                    )));
+                }
+            };
         // Contract 1.275: a fresh link is the one human intent that may replace
         // a terminal `device_unlinked` verdict, so the slot's latch is cleared
         // before its QR engine is woken. Without this a re-link could only ever
@@ -1376,16 +1425,24 @@ impl ProxyGroupRuntime {
         match pool.wake_slot_waiting(&account).await {
             Ok(()) => {}
             Err(refusal) => {
-                self.rollback_account_slot(&account).await;
+                self.settle_link_attempt(Some(guard), &account).await;
                 return Err(refusal.into_service_error());
             }
         }
-        match account.supervisor().start_link(device_name).await {
+        match account
+            .supervisor()
+            .start_link_with_attempt(device_name, Some(attempt_id.clone()))
+            .await
+        {
             Ok(value) => {
                 if let Some(session) = value.get("linkSessionId").and_then(Value::as_str) {
                     pool.remember_session(session, account.account_id());
                 }
                 pool.note_activity(&account);
+                // A live QR exists: the attempt owns the slot until its
+                // terminal answer. The lease record persists in the pool and
+                // the guard disarms (its Drop must not reclaim a live link).
+                guard.persist();
                 tracing::info!(
                     account_id = %account.account_id(),
                     group_id = %account.proxy_group(),
@@ -1394,8 +1451,38 @@ impl ProxyGroupRuntime {
                 Ok(value)
             }
             Err(error) => {
-                self.rollback_account_slot(&account).await;
+                self.settle_link_attempt(Some(guard), &account).await;
                 Err(error)
+            }
+        }
+    }
+
+    /// Settle one pooled link attempt through the single reclaim path. Every
+    /// terminal caller (start rollback, finish failure/timeout, cancel) funnels
+    /// here; the guard's own Drop is the no-bypass net behind it.
+    async fn settle_link_attempt(
+        &self,
+        guard: Option<crate::pool::LinkAttemptGuard>,
+        account: &Arc<crate::pool::AccountSlot>,
+    ) -> crate::pool::LinkReclaimOutcome {
+        match guard {
+            Some(guard) => {
+                let outcome = guard.reclaim().await;
+                // Promoted means a committed row won the race: the slot is
+                // still live, so its forwarders must stay. Only an actual
+                // teardown releases them.
+                if matches!(
+                    outcome,
+                    crate::pool::LinkReclaimOutcome::Reclaimed
+                        | crate::pool::LinkReclaimOutcome::Quarantined
+                ) {
+                    self.forget_account_forwarders(account.account_id());
+                }
+                outcome
+            }
+            None => {
+                self.rollback_account_slot(account).await;
+                crate::pool::LinkReclaimOutcome::AlreadySettled
             }
         }
     }
@@ -1519,6 +1606,15 @@ impl ProxyGroupRuntime {
         match self.link_owner(&link_session_id).await? {
             LinkOwner::Group(slot) => slot.supervisor.finish_link(link_session_id).await,
             LinkOwner::Account(slot) => {
+                // The attempt lease is resumed before the supervisor call, so
+                // every exit below — success, a commit against another row, a
+                // definite finish failure, a timeout — settles it through the
+                // one promote/reclaim pair. The guard's Drop is the net for a
+                // panic or a future early return.
+                let guard = self.link_attempt_guard(&slot);
+                // [link-stage] BUG-5 取证：槽转正计时从 registry 受理起算，
+                // 与 supervisor 的 link-register 行同窗口（仅日志，零行为变更）。
+                let slot_stage_started = std::time::Instant::now();
                 let summary = slot.supervisor().finish_link(link_session_id.clone()).await;
                 match summary {
                     Ok(summary) if summary.id == slot.account_id() => {
@@ -1531,6 +1627,18 @@ impl ProxyGroupRuntime {
                             pool.forget_session(&link_session_id);
                             pool.note_activity(&slot);
                         }
+                        // The attempt committed: its lease is promoted to the
+                        // account row and can never reclaim this slot again.
+                        self.promote_link_attempt(guard, &slot);
+                        // [link-stage] 槽转正完成（sidecar 已置 provisioned、会话
+                        // 映射已释放）。elapsed 与 link-register 同窗口，可相减。
+                        crate::link_stage::line(
+                            "slot-promote",
+                            slot_stage_started.elapsed(),
+                            &link_session_id,
+                            Some(slot.account_id()),
+                            "pool slot provisioned",
+                        );
                         tracing::info!(
                             account_id = %slot.account_id(),
                             group_id = %slot.proxy_group(),
@@ -1549,12 +1657,12 @@ impl ProxyGroupRuntime {
                         // The number already belongs to another local account:
                         // committing it here would produce two engines for one
                         // account (I1). The freshly linked device/data-dir is
-                        // rolled back and the caller is told to delete the old
+                        // reclaimed and the caller is told to delete the old
                         // local data before linking again.
                         if let Some(pool) = &self.pool {
                             pool.forget_session(&link_session_id);
                         }
-                        self.rollback_account_slot(&slot).await;
+                        self.settle_link_attempt(guard, &slot).await;
                         tracing::warn!(
                             account_id = %slot.account_id(),
                             existing_account_id = %summary.id,
@@ -1563,12 +1671,80 @@ impl ProxyGroupRuntime {
                         Err(account_already_linked_error())
                     }
                     Err(error) => {
-                        // A timed-out/cancelled finish keeps the slot and its
-                        // session for the retry the contract allows.
+                        // The three terminal answers — a definite finish
+                        // failure, a cancellation, and a timeout/unknown
+                        // outcome — all converge on the same idempotent
+                        // reclaim. A retryable refusal (a concurrent finish
+                        // lane, store hiccup, runtime not running) keeps the
+                        // lease for its retry; that is not a terminal answer.
+                        if Self::link_finish_is_terminal(&error) {
+                            self.settle_link_attempt(guard, &slot).await;
+                        } else if let Some(guard) = guard {
+                            // A retryable refusal is not a terminal answer:
+                            // the live attempt keeps its lease for the retry.
+                            // Persist explicitly so the guard's Drop cannot
+                            // mistake the early return for an abandoned link.
+                            guard.persist();
+                        }
                         Err(error)
                     }
                 }
             }
+        }
+    }
+
+    /// The attempt lease guard for one pooled slot, when the slot is leased.
+    fn link_attempt_guard(
+        &self,
+        slot: &Arc<crate::pool::AccountSlot>,
+    ) -> Option<crate::pool::LinkAttemptGuard> {
+        let pool = self.pool.as_ref()?;
+        let attempt_id = slot.lease_attempt_id()?;
+        Some(crate::pool::LinkAttemptGuard::resume(
+            Arc::clone(pool),
+            &attempt_id,
+        ))
+    }
+
+    /// Promote one attempt's lease (or the slot's residual lease if the guard
+    /// was already gone). Promotion is idempotent and never deletes the slot.
+    fn promote_link_attempt(
+        &self,
+        guard: Option<crate::pool::LinkAttemptGuard>,
+        slot: &Arc<crate::pool::AccountSlot>,
+    ) {
+        if let Some(guard) = guard {
+            let _ = guard.promote();
+            return;
+        }
+        if let (Some(pool), Some(attempt_id)) = (&self.pool, slot.lease_attempt_id()) {
+            pool.promote_link_attempt(&attempt_id);
+        }
+    }
+
+    /// Whether a finish error is a **terminal** answer: the attempt can never
+    /// commit again, so its preallocated slot must be reclaimed. Retryable
+    /// refusals (a concurrent finish, a store hiccup, a stopped runtime) and
+    /// protocol anomalies that leave the session alive are not in this set.
+    fn link_finish_is_terminal(error: &ServiceError) -> bool {
+        const TERMINAL: &[&str] = &[
+            "LINK_OUTCOME_UNKNOWN",
+            "LINK_LOST",
+            "LINK_EXPIRED",
+            "LINK_NOT_FOUND",
+            "LINK_CANCELLED",
+            "ACCOUNT_LIMIT_REACHED",
+            "ACCOUNT_DELETE_IN_PROGRESS",
+            "ACCOUNT_DELETE_OUTCOME_UNKNOWN",
+        ];
+        match error {
+            ServiceError::Api(api) => TERMINAL.contains(&api.code),
+            // The terminal link codes ride their engine shape through the
+            // supervisor (LINK_LOST in particular); into_api wraps them
+            // verbatim, so the reclaim decision cannot depend on the error
+            // having already been flattened.
+            ServiceError::Engine(EngineError::UpstreamCode { code, .. }) => TERMINAL.contains(code),
+            _ => false,
         }
     }
 
@@ -1594,15 +1770,23 @@ impl ProxyGroupRuntime {
         match self.link_owner(&link_session_id).await? {
             LinkOwner::Group(slot) => slot.supervisor.cancel_link(link_session_id).await,
             LinkOwner::Account(slot) => {
+                let guard = self.link_attempt_guard(&slot);
                 let result = slot.supervisor().cancel_link(link_session_id.clone()).await;
                 if let Some(pool) = &self.pool {
                     pool.forget_session(&link_session_id);
                 }
-                // An uncommitted link's directory holds no credentials: drop
-                // the slot and delete it. A committed slot stays (cancelling
-                // an already-committed session has nothing to roll back).
+                // An uncommitted link's directory holds no credentials: the
+                // attempt's lease reclaims the slot through the same path the
+                // finish failure and timeout take. A committed slot stays
+                // (cancelling an already-committed session has nothing to
+                // roll back) and its lease was already promoted.
                 if !slot.is_provisioned() {
-                    self.rollback_account_slot(&slot).await;
+                    self.settle_link_attempt(guard, &slot).await;
+                } else if let Some(guard) = guard {
+                    // Defensive: a committed slot should carry no lease, but a
+                    // residual one must never survive a cancel as a live
+                    // reclaim candidate.
+                    let _ = guard.promote();
                 }
                 result
             }

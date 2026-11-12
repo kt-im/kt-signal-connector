@@ -3175,6 +3175,18 @@ impl RuntimeSupervisor {
     }
 
     pub async fn start_link(&self, device_name: String) -> Result<Value, ServiceError> {
+        self.start_link_with_attempt(device_name, None).await
+    }
+
+    /// The pooled entry: the registry mints the connector attempt id before
+    /// provisioning the slot, so the slot lease and the host-facing
+    /// `linkAttemptId` are the same owner. `None` keeps the legacy
+    /// service-minted id exactly as before.
+    pub async fn start_link_with_attempt(
+        &self,
+        device_name: String,
+        connector_attempt_id: Option<String>,
+    ) -> Result<Value, ServiceError> {
         self.service.lock().await.ensure_link_available()?;
         // Per-engine account ceiling (optimization-plan §6.4 M3.3): refuse
         // before the engine mints a QR, so no one scans a code that can never
@@ -3212,10 +3224,11 @@ impl RuntimeSupervisor {
             .map(str::trim)
             .filter(|attempt| !attempt.is_empty())
             .map(str::to_string);
-        let mut result = self.service.lock().await.begin_link_with_engine_attempt(
+        let mut result = self.service.lock().await.begin_link_with_identities(
             device_name,
             device_link_uri,
             engine_attempt_id,
+            connector_attempt_id,
         )?;
         // The wire result echoes the selected group (implementation-plan §4.4);
         // this supervisor IS the selected group.
@@ -3347,6 +3360,9 @@ impl RuntimeSupervisor {
         &self,
         link_session_id: String,
     ) -> Result<AccountSummary, ServiceError> {
+        // [link-stage] BUG-5 取证：connector 侧同一时钟从 link.finish 受理起算，
+        // 与 registry 的 slot-promote 行同窗口（仅日志，零行为变更）。
+        let link_stage_started = std::time::Instant::now();
         let cancel = {
             let mut active = self.active_link_finish.lock().await;
             if active.is_some() {
@@ -3544,6 +3560,16 @@ impl RuntimeSupervisor {
             }
             Err(error) => return Err(ServiceError::Engine(error)),
         };
+        // [link-stage] 引擎 finishLink 返回 = link 已在引擎侧注册完成。手机确认
+        // 与 provisioning 的等待都包含在本段内；该行与桌面 scan-confirmed 行的
+        // 时间差就是这段等待（仅日志，零行为变更）。
+        crate::link_stage::line(
+            "link-register",
+            link_stage_started.elapsed(),
+            &link_session_id,
+            self.preferred_account_id.as_deref(),
+            "engine finishLink returned",
+        );
         let number = result
             .get("number")
             .and_then(Value::as_str)

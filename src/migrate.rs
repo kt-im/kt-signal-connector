@@ -823,6 +823,33 @@ fn reconcile_orphans(
             .map_err(pool_invalid_io)?
             .is_some();
         if has_accounts || has_store {
+            // 无账号行的槽不可服务；隔离而不是拒绝启动：留下字节可审计，
+            // 但不让它挡住整个连接器（放弃的 link 尝试会留下这种槽）。
+            if !dry_run {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let target = engines_root.join(format!(".quarantine-{name}-{stamp}"));
+                if let Err(error) = fs::rename(&path, &target) {
+                    return Err(pool_invalid_io(error));
+                }
+                tracing::warn!(
+                    target: "connector.pool",
+                    // The invariant witness: a slot that holds credentials
+                    // while the store has no row for its id is a leaked
+                    // link-attempt slot. The quarantine below is the startup
+                    // backstop; the live reclaim path runs the same invariant
+                    // name through `AccountPool::reclaim_link_attempt`.
+                    invariant = crate::pool::LINK_SLOT_LEAK_INVARIANT,
+                    stage = "orphan_slot_quarantined",
+                    slot = %name,
+                    has_accounts,
+                    has_store,
+                    "engine slot has credentials but no account row; quarantined"
+                );
+                continue;
+            }
             return Err(pool_invalid(format!(
                 "engine slot {} has credentials but no account row; refusing to start",
                 name
@@ -1408,9 +1435,10 @@ mod tests {
 
     /// Empty engine directories are rolled-back link leftovers and are
     /// removed; a directory that still carries credentials with no account
-    /// row aborts startup.
+    /// row is a leaked link-attempt slot and is quarantined (bytes stay
+    /// auditable, never a live slot) instead of blocking startup.
     #[test]
-    fn removes_empty_orphans_and_refuses_orphan_credentials() {
+    fn removes_empty_orphans_and_quarantines_orphan_credentials() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("signal-data");
         let state_dir = temp.path().join("state");
@@ -1441,14 +1469,30 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let error = run(&store, &root, &state_dir, false, 8).unwrap_err();
-        assert!(
-            matches!(error, StoreError::EnginePoolInvalid(_)),
-            "{error:?}"
+        let report =
+            run(&store, &root, &state_dir, false, 8).expect("a leaked slot is quarantined");
+        assert_eq!(
+            report.orphans_removed, 0,
+            "the second pass removes no empty orphan; the credential slot is quarantined"
         );
         assert!(
-            orphan.join(STATE_FILE).is_file(),
-            "credentials stay untouched"
+            !orphan.exists(),
+            "the credential-bearing slot must leave the live namespace"
+        );
+        let quarantine: Vec<_> = fs::read_dir(root.join(ENGINE_SLOT_SUBDIR))
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(".quarantine-{}", account_id(7)))
+            })
+            .collect();
+        assert_eq!(quarantine.len(), 1, "exactly one quarantine entry");
+        assert!(
+            quarantine[0].path().join(STATE_FILE).is_file(),
+            "credentials stay auditable in the quarantine"
         );
     }
 

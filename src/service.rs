@@ -2613,6 +2613,20 @@ impl ConnectorService {
         device_link_uri: String,
         engine_attempt_id: Option<String>,
     ) -> Result<Value, ServiceError> {
+        self.begin_link_with_identities(device_name, device_link_uri, engine_attempt_id, None)
+    }
+
+    /// The pooled variant: `connector_attempt_id` is minted by the registry
+    /// **before** the slot is provisioned, so the slot's attempt lease and the
+    /// host-facing `linkAttemptId` name the same owner. Absent keeps the
+    /// legacy service-minted id byte-for-byte.
+    pub fn begin_link_with_identities(
+        &mut self,
+        device_name: String,
+        device_link_uri: String,
+        engine_attempt_id: Option<String>,
+        connector_attempt_id: Option<String>,
+    ) -> Result<Value, ServiceError> {
         validate_device_name(&device_name)?;
         if let Some(existing) = self.link.as_ref() {
             // QR B1: an attempt with no live slot (lost, committed, or fully
@@ -2627,11 +2641,12 @@ impl ConnectorService {
             }
             self.link = None;
         }
-        let session = ActiveLinkSession::with_engine_attempt(
+        let session = ActiveLinkSession::with_engine_attempt_and_id(
             device_name,
             device_link_uri,
             LINK_SESSION_TTL,
             engine_attempt_id,
+            connector_attempt_id,
         );
         let device_link_uri = session.qr_payload().to_string();
         let response = json!({

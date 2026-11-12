@@ -154,10 +154,25 @@ impl ActiveLinkSession {
         ttl: Duration,
         engine_attempt_id: Option<String>,
     ) -> Self {
+        Self::with_engine_attempt_and_id(device_name, device_link_uri, ttl, engine_attempt_id, None)
+    }
+
+    /// The identity-injecting variant: the registry mints the attempt id
+    /// before it provisions the slot, so the slot's link-attempt lease and the
+    /// host-facing `linkAttemptId` are the **same** id from the first
+    /// instruction. `None` keeps the pre-existing behavior (the service
+    /// mints an opaque id itself).
+    pub fn with_engine_attempt_and_id(
+        device_name: String,
+        device_link_uri: String,
+        ttl: Duration,
+        engine_attempt_id: Option<String>,
+        connector_attempt_id: Option<String>,
+    ) -> Self {
         let first = LinkSlot::new(0, device_link_uri, now_ms());
         let session_id = first.link_session_id.clone();
         Self {
-            attempt_id: random_id(),
+            attempt_id: connector_attempt_id.unwrap_or_else(random_id),
             engine_attempt_id,
             session_id,
             device_name,

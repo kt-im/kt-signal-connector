@@ -42,6 +42,7 @@
 //! directory — `engines/<accountId>/logs/engine-stderr.log` — which is what
 //! keeps two engines' logs disjoint.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1015,6 +1016,54 @@ struct MigrationLifecycle {
     block: Option<StoreMigrationBlock>,
 }
 
+/// The tracing invariant name a leaked link-attempt slot is reported under.
+/// The same literal is used by the startup quarantine scan, the live reaper
+/// and the guard, so a log query finds every leak witness in one place.
+pub const LINK_SLOT_LEAK_INVARIANT: &str = "link_attempt_slot_leaked";
+
+/// One link attempt's ownership record over a preallocated slot
+///
+/// A `link.start` slot is provisioned under an opaque account id that has
+/// **no store row yet**, so that id is not an owner: the attempt
+/// (`linkAttemptId`) owns the slot until `link.finish` commits it. Only a
+/// committed finish promotes the lease to the account row; every other
+/// terminal answer (finish failure, cancel, timeout) reclaims it through
+/// [`AccountPool::reclaim_link_attempt`].
+#[derive(Clone, Debug)]
+pub struct LinkAttemptLease {
+    pub attempt_id: String,
+    pub account_id: String,
+    /// When the attempt claimed the slot (the abandoned-attempt reaper's age).
+    pub opened_at: Instant,
+}
+
+/// The one idempotent outcome of a link-attempt reclaim pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkReclaimOutcome {
+    /// A committed account row owns the slot: the lease was dropped, the
+    /// slot and its data stay. This is the promotion that must never delete.
+    Promoted,
+    /// The engine was stopped and the slot directory removed.
+    Reclaimed,
+    /// The engine was stopped and the credential-bearing directory was moved
+    /// aside under `engines/.quarantine-<id>-<token>` (bytes stay auditable).
+    Quarantined,
+    /// Nothing was leased under that attempt id: an idempotent replay, or a
+    /// slot another terminal path already reclaimed.
+    AlreadySettled,
+}
+
+/// What teardown does with a removed slot's directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotDisposition {
+    /// Leave the directory in place (runtime.stop keeps slots cold).
+    Keep,
+    /// Remove it (an uncommitted slot holds no credentials).
+    Delete,
+    /// Move it under `engines/.quarantine-*` (credential-bearing bytes).
+    Quarantine,
+}
+
 /// One dynamically provisioned account engine: its routing handle, its own
 /// data directory, the process-lifetime occupancy lock, and the small amount
 /// of in-memory bookkeeping the pool needs.
@@ -1031,6 +1080,9 @@ pub struct AccountSlot {
     wake: tokio::sync::Mutex<()>,
     resident: AtomicBool,
     provisioned: AtomicBool,
+    /// The attempt that owns this uncommitted slot. `None` on a committed
+    /// account (promoted) or before the first `link.start` lease.
+    lease_attempt_id: StdMutex<Option<String>>,
     lock: StdMutex<Option<DataDirLock>>,
     last_used: StdMutex<Instant>,
     /// The store-migration lifecycle of this slot (contract 1.291, §4.277):
@@ -1220,6 +1272,23 @@ impl AccountSlot {
         self.provisioned.load(Ordering::Relaxed)
     }
 
+    /// The attempt that currently owns this uncommitted slot, if any. This is
+    /// the slot's side of the lease record; `AccountPool::leases` is the
+    /// attempt-keyed authority and the two are written together.
+    pub fn lease_attempt_id(&self) -> Option<String> {
+        self.lease_attempt_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_lease_attempt(&self, attempt_id: Option<String>) {
+        *self
+            .lease_attempt_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = attempt_id;
+    }
+
     pub fn touch(&self) {
         if let Ok(mut last) = self.last_used.lock() {
             *last = Instant::now();
@@ -1248,6 +1317,12 @@ pub struct AccountPool {
     config: EnginePoolConfig,
     slots: StdRwLock<BTreeMap<String, Arc<AccountSlot>>>,
     sessions: StdMutex<HashMap<String, String>>,
+    /// Open link-attempt leases, keyed by the host-facing `linkAttemptId`.
+    /// This is the ownership authority for a preallocated slot that has no
+    /// account row yet; only a committed `link.finish` removes a record by
+    /// promotion, every other terminal answer removes it through
+    /// [`AccountPool::reclaim_link_attempt`].
+    leases: StdMutex<HashMap<String, LinkAttemptLease>>,
     /// Serializes dynamic link admission so the capacity ceiling cannot be
     /// overshot by two concurrent `link.start` calls. Held only for the QR
     /// mint, never across `link.finish`'s phone-approval wait.
@@ -1365,6 +1440,7 @@ impl AccountPool {
             config,
             slots: StdRwLock::new(slots),
             sessions: StdMutex::new(HashMap::new()),
+            leases: StdMutex::new(HashMap::new()),
             link_lock: tokio::sync::Mutex::new(()),
             available,
             stopping: AtomicBool::new(false),
@@ -1373,8 +1449,33 @@ impl AccountPool {
         for slot in pool.slots() {
             pool.seed_store_migration_face(&slot);
         }
+        pool.warn_leaked_slots();
         tracing::info!(accounts = count, "per-account engine pool discovered");
         pool
+    }
+
+    /// Startup invariant witness: a slot that carries credentials while the
+    /// store has no row for its id is a leaked link-attempt slot. The startup
+    /// migration pass quarantines these before the pool is built; this second
+    /// read-only pass keeps the invariant visible even when the pool is
+    /// assembled from a store a test or another launcher opened.
+    fn warn_leaked_slots(&self) {
+        for slot in self.slots() {
+            match self.config.store.account_by_id(&slot.account_id) {
+                // A row exists, or the store cannot answer (an unreadable
+                // store is never evidence of a leak): say nothing.
+                Ok(Some(_)) | Err(_) => continue,
+                Ok(None) => {}
+            }
+            if slot_has_credentials(&slot) {
+                tracing::warn!(
+                    target: "connector.pool",
+                    invariant = LINK_SLOT_LEAK_INVARIANT,
+                    account = %account_fingerprint(&slot.account_id),
+                    "engine slot has credentials but no account row: leaked link-attempt slot"
+                );
+            }
+        }
     }
 
     /// P0 orphan-engine sweep arming: exactly one watchdog clock per data
@@ -1458,6 +1559,156 @@ impl AccountPool {
     pub fn forget_session(&self, link_session_id: &str) {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.remove(link_session_id);
+        }
+    }
+
+    /// Open a link attempt's lease over a freshly provisioned slot. The
+    /// attempt id is the host-facing `linkAttemptId` minted before the engine
+    /// is asked for a code, so the slot is owned by the attempt from the
+    /// moment it exists. Returns the record on success; `None` means the
+    /// attempt id is empty, already leased, or this slot already carries a
+    /// different attempt (never silently overwrite an owner).
+    pub fn open_link_lease(
+        &self,
+        slot: &Arc<AccountSlot>,
+        attempt_id: &str,
+    ) -> Option<LinkAttemptLease> {
+        let attempt_id = attempt_id.trim();
+        if attempt_id.is_empty() || slot.lease_attempt_id().is_some() {
+            return None;
+        }
+        let lease = LinkAttemptLease {
+            attempt_id: attempt_id.to_string(),
+            account_id: slot.account_id.clone(),
+            opened_at: Instant::now(),
+        };
+        let mut leases = self
+            .leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if leases.contains_key(attempt_id) {
+            return None;
+        }
+        leases.insert(attempt_id.to_string(), lease.clone());
+        drop(leases);
+        slot.set_lease_attempt(Some(attempt_id.to_string()));
+        Some(lease)
+    }
+
+    /// The attempt leasing this account's slot, if any.
+    pub fn lease_for_account(&self, account_id: &str) -> Option<String> {
+        let slot = self.get(account_id)?;
+        if let Some(attempt_id) = slot.lease_attempt_id() {
+            return Some(attempt_id);
+        }
+        self.leases
+            .lock()
+            .ok()?
+            .values()
+            .find(|lease| lease.account_id == account_id)
+            .map(|lease| lease.attempt_id.clone())
+    }
+
+    /// One open lease by attempt id (diagnostics and tests).
+    pub fn link_lease(&self, attempt_id: &str) -> Option<LinkAttemptLease> {
+        self.leases
+            .lock()
+            .ok()
+            .and_then(|leases| leases.get(attempt_id).cloned())
+    }
+
+    /// Number of open link-attempt leases (the pool's uncommitted-slot count).
+    pub fn open_link_leases(&self) -> usize {
+        self.leases
+            .lock()
+            .map(|leases| leases.len())
+            .unwrap_or_default()
+    }
+
+    /// Promote a lease to its committed account row: the finish that owns the
+    /// attempt succeeded, so the slot is no longer reclaimable by the attempt
+    /// (it belongs to the account from here on). Idempotent.
+    pub fn promote_link_attempt(&self, attempt_id: &str) -> bool {
+        let lease = self
+            .leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(attempt_id);
+        let Some(lease) = lease else {
+            return false;
+        };
+        if let Some(slot) = self.get(&lease.account_id) {
+            slot.set_lease_attempt(None);
+        }
+        true
+    }
+
+    /// The one idempotent reclaim path every terminal link answer converges
+    /// on: finish failure, cancel and timeout all call this exact function
+    /// (directly through [`LinkAttemptGuard`]).
+    ///
+    /// Steps, all idempotent:
+    /// 1. take the attempt's lease out of the ownership table (a second call
+    ///    finds nothing and answers [`LinkReclaimOutcome::AlreadySettled`]);
+    /// 2. refuse to touch a slot a committed account row already owns
+    ///    (promotion wins any race with a late cleanup);
+    /// 3. stop the engine process through [`Self::discard_with`] (slot map
+    ///    removal, session-map purge, supervisor shutdown);
+    /// 4. delete the directory when it holds no credentials, or move it into
+    ///    `engines/.quarantine-<id>-<token>` when it does (auditable bytes,
+    ///    never a live slot);
+    /// 5. the sidecar and every session mapping for the slot are cleared.
+    pub async fn reclaim_link_attempt(self: &Arc<Self>, attempt_id: &str) -> LinkReclaimOutcome {
+        let lease = self
+            .leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(attempt_id);
+        let Some(lease) = lease else {
+            return LinkReclaimOutcome::AlreadySettled;
+        };
+        let Some(slot) = self.get(&lease.account_id) else {
+            // The slot was already discarded by a sibling path; the lease is
+            // the only residue and it is gone now.
+            return LinkReclaimOutcome::AlreadySettled;
+        };
+        slot.set_lease_attempt(None);
+        // A committed row is the durable proof the attempt succeeded even if
+        // its lease cleanup was lost (crash window between the store commit
+        // and the in-memory promotion). Never delete such a slot; an
+        // unreadable store is not evidence of abandonment either, so it also
+        // fails closed to "leave the slot alone".
+        let committed = slot.is_provisioned()
+            || match self.config.store.account_by_id(&lease.account_id) {
+                Ok(Some(_)) | Err(_) => true,
+                Ok(None) => false,
+            };
+        if committed {
+            tracing::info!(
+                account = %account_fingerprint(&lease.account_id),
+                "link attempt lease was promoted: a committed account row owns the slot"
+            );
+            return LinkReclaimOutcome::Promoted;
+        }
+        let credentials = slot_has_credentials(&slot);
+        if credentials {
+            tracing::warn!(
+                target: "connector.pool",
+                invariant = LINK_SLOT_LEAK_INVARIANT,
+                account = %account_fingerprint(&lease.account_id),
+                "reclaiming a link-attempt slot that still holds credentials; quarantining"
+            );
+            self.discard_with(&lease.account_id, SlotDisposition::Quarantine)
+                .await;
+            LinkReclaimOutcome::Quarantined
+        } else {
+            tracing::info!(
+                account = %account_fingerprint(&lease.account_id),
+                "reclaiming an uncommitted link-attempt slot"
+            );
+            self.discard_with(&lease.account_id, SlotDisposition::Delete)
+                .await;
+            LinkReclaimOutcome::Reclaimed
         }
     }
 
@@ -1585,6 +1836,21 @@ impl AccountPool {
     /// rollback deletes a directory the connector created moments ago for an
     /// uncommitted link, so no credentials can be lost.
     pub async fn discard(self: &Arc<Self>, account_id: &str, remove_dir: bool) {
+        let disposition = if remove_dir {
+            SlotDisposition::Delete
+        } else {
+            SlotDisposition::Keep
+        };
+        self.discard_with(account_id, disposition).await;
+    }
+
+    /// The one teardown every slot-removal path uses (account delete,
+    /// link rollback, reclaim). Removing the slot from the map first makes the
+    /// pass idempotent: a concurrent second caller finds no slot and does
+    /// nothing. The engine is always stopped before the directory is touched
+    /// (I5), and the attempt lease — whatever its state — is cleared with the
+    /// slot so no reclaim can address a dead slot afterwards.
+    async fn discard_with(self: &Arc<Self>, account_id: &str, disposition: SlotDisposition) {
         let slot = self
             .slots
             .write()
@@ -1593,6 +1859,10 @@ impl AccountPool {
         let Some(slot) = slot else {
             return;
         };
+        if let Ok(mut leases) = self.leases.lock() {
+            leases.retain(|_, lease| lease.account_id != account_id);
+        }
+        slot.set_lease_attempt(None);
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.retain(|_, owner| owner != account_id);
         }
@@ -1605,8 +1875,10 @@ impl AccountPool {
                 "per-account engine did not stop cleanly before slot removal"
             );
         }
-        if remove_dir {
-            self.remove_slot_directory(&slot);
+        match disposition {
+            SlotDisposition::Keep => {}
+            SlotDisposition::Delete => self.remove_slot_directory(&slot),
+            SlotDisposition::Quarantine => self.quarantine_slot_directory(&slot),
         }
         tracing::info!(
             account_id = %slot.account_id,
@@ -1636,6 +1908,52 @@ impl AccountPool {
                 error_class = error_class(&error),
                 "per-account engine directory could not be removed"
             );
+        }
+        let _ = std::fs::remove_file(&slot.sidecar);
+    }
+
+    /// Move a credential-bearing slot directory out of the live slot
+    /// namespace. Unlike an uncommitted empty directory this one may hold a
+    /// device credential (an engine-side link the connector never committed),
+    /// so the bytes stay on disk for audit instead of being deleted. A rename
+    /// failure falls back to deletion: a stopped engine's orphan directory
+    /// must never keep blocking the pool.
+    fn quarantine_slot_directory(&self, slot: &AccountSlot) {
+        let account_id = slot.account_id.as_str();
+        if !is_account_id(account_id) {
+            return;
+        }
+        let engines_root = self.config.signal_data_dir.join(ENGINE_SLOT_SUBDIR);
+        if slot.data_dir.parent() != Some(engines_root.as_path()) {
+            return;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&slot.data_dir) else {
+            return;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return;
+        }
+        let target = engines_root.join(format!(
+            ".quarantine-{account_id}-{}",
+            crate::ids::random_id()
+        ));
+        match std::fs::rename(&slot.data_dir, &target) {
+            Ok(()) => tracing::warn!(
+                target: "connector.pool",
+                invariant = LINK_SLOT_LEAK_INVARIANT,
+                account = %account_fingerprint(account_id),
+                "credential-bearing link-attempt slot quarantined"
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    target: "connector.pool",
+                    invariant = LINK_SLOT_LEAK_INVARIANT,
+                    account = %account_fingerprint(account_id),
+                    error_class = error_class(&error),
+                    "credential-bearing slot could not be quarantined; deleting it instead"
+                );
+                let _ = std::fs::remove_dir_all(&slot.data_dir);
+            }
         }
         let _ = std::fs::remove_file(&slot.sidecar);
     }
@@ -2613,6 +2931,99 @@ impl AccountPool {
     }
 }
 
+/// RAII guard for one link attempt's slot lease.
+///
+/// The normal lifecycle is explicit: `link.start` opens the guard and
+/// persists it once the QR exists; `link.finish` resumes it and either
+/// promotes (committed) or reclaims (terminal failure); `link.cancel`
+/// resumes and reclaims. The guard's `Drop` is the no-bypass net: any early
+/// return, panic, or future edit that forgets to settle the attempt still
+/// schedules the **same** idempotent [`AccountPool::reclaim_link_attempt`].
+/// It holds the pool strongly on purpose — only an operation-scoped guard, never
+/// a slot, so no pool cycle is created.
+pub struct LinkAttemptGuard {
+    pool: Arc<AccountPool>,
+    attempt_id: String,
+    /// Armed until an explicit `persist`/`promote`/`reclaim` settles it.
+    armed: Cell<bool>,
+}
+
+impl LinkAttemptGuard {
+    /// Open a fresh lease for a just-provisioned slot. `None` means the
+    /// attempt id was already leased or this slot has an owner (a bug, never
+    /// silently overwritten).
+    pub fn open(pool: Arc<AccountPool>, slot: &Arc<AccountSlot>, attempt_id: &str) -> Option<Self> {
+        pool.open_link_lease(slot, attempt_id)?;
+        Some(Self {
+            pool,
+            attempt_id: attempt_id.to_string(),
+            armed: Cell::new(true),
+        })
+    }
+
+    /// Resume the lease an existing terminal operation is about to settle.
+    /// The lease is not created here: a finish/cancel on an attempt without a
+    /// lease is the legacy path and keeps its old behavior.
+    pub fn resume(pool: Arc<AccountPool>, attempt_id: &str) -> Self {
+        Self {
+            pool,
+            attempt_id: attempt_id.to_string(),
+            armed: Cell::new(true),
+        }
+    }
+
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    /// The attempt now outlives this call (a live QR is on screen). The lease
+    /// stays in the pool table; the guard must not reclaim on drop.
+    pub fn persist(self) {
+        self.armed.set(false);
+    }
+
+    /// The attempt committed: the account row owns the slot from now on.
+    pub fn promote(self) -> bool {
+        self.armed.set(false);
+        self.pool.promote_link_attempt(&self.attempt_id)
+    }
+
+    /// Terminal answer: run the one idempotent reclaim path and report what
+    /// it did. Consuming the guard makes a double settle impossible.
+    pub async fn reclaim(self) -> LinkReclaimOutcome {
+        self.armed.set(false);
+        self.pool.reclaim_link_attempt(&self.attempt_id).await
+    }
+}
+
+impl Drop for LinkAttemptGuard {
+    fn drop(&mut self) {
+        if !self.armed.get() {
+            return;
+        }
+        self.armed.set(false);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                target: "connector.pool",
+                invariant = LINK_SLOT_LEAK_INVARIANT,
+                attempt = %self.attempt_id,
+                "link attempt guard dropped outside a runtime; the startup scan will reclaim the slot"
+            );
+            return;
+        };
+        let pool = Arc::clone(&self.pool);
+        let attempt_id = self.attempt_id.clone();
+        handle.spawn(async move {
+            let outcome = pool.reclaim_link_attempt(&attempt_id).await;
+            tracing::info!(
+                attempt = %attempt_id,
+                outcome = ?outcome,
+                "unsettled link attempt guard ran the reclaim path"
+            );
+        });
+    }
+}
+
 /// The bridge from a supervisor's start face to this pool's gate (contract
 /// 1.291, §4.277 C). Weak refs on purpose: a gate must never keep a reclaimed
 /// slot - or the whole pool - alive.
@@ -2737,6 +3148,7 @@ fn build_slot(
         wake: tokio::sync::Mutex::new(()),
         resident: AtomicBool::new(false),
         provisioned: AtomicBool::new(provisioned),
+        lease_attempt_id: StdMutex::new(None),
         lock: StdMutex::new(lock),
         last_used: StdMutex::new(last_used),
         migration: StdMutex::new(MigrationLifecycle::default()),
@@ -2975,6 +3387,28 @@ fn slot_has_store_path(slot: &AccountSlot) -> bool {
         })
 }
 
+/// Whether a slot directory carries something a reclaim must not delete
+/// silently: a non-empty engine registry account list, or any store-shaped
+/// path under `accounts/`. A fresh `link.start` slot writes an empty V2
+/// registry and nothing else, so it is safe to delete; anything beyond that is
+/// an engine-side link the connector never committed and goes to quarantine.
+fn slot_has_credentials(slot: &AccountSlot) -> bool {
+    let has_accounts = std::fs::read(
+        slot.data_dir
+            .join(crate::history_import::ENGINE_REGISTRY_FILE),
+    )
+    .ok()
+    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    .and_then(|state| {
+        state
+            .get("accounts")
+            .and_then(serde_json::Value::as_array)
+            .map(|accounts| !accounts.is_empty())
+    })
+    .unwrap_or(false);
+    has_accounts || slot_has_store_path(slot)
+}
+
 fn error_class(error: &io::Error) -> &'static str {
     match error.kind() {
         io::ErrorKind::NotFound => "not_found",
@@ -3102,6 +3536,62 @@ mod tests {
         );
         assert!(!slot.migration_in_flight(), "no migrator task is scheduled");
         pool.discard(slot.account_id(), true).await;
+    }
+
+    /// BUG-1: a slot whose engine-side registry carries an account (a phone
+    /// approval the connector never committed) must be stopped and moved into
+    /// `engines/.quarantine-*`, never deleted silently; a replay is a quiet
+    /// no-op and never touches the bytes again.
+    #[tokio::test]
+    async fn reclaim_quarantines_a_credential_bearing_slot_and_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let pool = AccountPool::discover(config(&temp, false));
+        let slot = pool.provision_slot(DEFAULT_PROXY_GROUP_ID).unwrap();
+        let account = slot.account_id().to_string();
+        let dir = slot.data_dir.clone();
+        // The engine's own registry proves a credential was linked (the
+        // connector never wrote a row): this is exactly the leak shape.
+        std::fs::write(
+            dir.join("engine-state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "accounts": [{"number": "+15550000123", "dir": "accounts/lk-one"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(pool.open_link_lease(&slot, "leaked-attempt").is_some());
+
+        assert_eq!(
+            pool.reclaim_link_attempt("leaked-attempt").await,
+            LinkReclaimOutcome::Quarantined
+        );
+        assert!(!dir.exists(), "the live slot directory is gone");
+        assert!(pool.get(&account).is_none());
+        assert_eq!(pool.open_link_leases(), 0);
+
+        let engines_root = temp.path().join("signal-data").join(ENGINE_SLOT_SUBDIR);
+        let quarantined: Vec<_> = std::fs::read_dir(&engines_root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(".quarantine-{account}-"))
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert!(
+            quarantined[0].path().join("engine-state.json").is_file(),
+            "the credential bytes stay auditable"
+        );
+        // Idempotent: the replay removes nothing and reports settled.
+        assert_eq!(
+            pool.reclaim_link_attempt("leaked-attempt").await,
+            LinkReclaimOutcome::AlreadySettled
+        );
+        assert!(quarantined[0].path().join("engine-state.json").is_file());
     }
 
     #[test]

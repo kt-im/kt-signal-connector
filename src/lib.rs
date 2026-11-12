@@ -15,6 +15,7 @@ pub mod host;
 pub mod ids;
 pub mod ipc;
 pub mod link;
+pub(crate) mod link_stage;
 pub mod lkg;
 pub mod manifest;
 pub mod media;
