@@ -88,11 +88,28 @@ jobs:
           $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
           $obj = "$env:OSS_PREFIX/$ver/kt-signal-connector-windows-x64.exe"
           Write-Host "publishing target/release/kt-signal-connector.exe -> oss://$env:OSS_BUCKET/$obj"
-          # ossutil 官方 CLI（支持 STS token）
-          Invoke-WebRequest -Uri "https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil64.exe" -OutFile ossutil.exe
-          ./ossutil.exe config -e $env:OSS_ENDPOINT -i $env:OSS_ACCESS_KEY_ID -k $env:OSS_ACCESS_KEY_SECRET -t $env:OSS_STS_TOKEN --force
-          ./ossutil.exe cp -f target/release/kt-signal-connector.exe "oss://$env:OSS_BUCKET/$obj"
-          ./ossutil.exe stat "oss://$env:OSS_BUCKET/$obj"
-          $hash = (Get-FileHash target/release/kt-signal-connector.exe -Algorithm SHA256).Hash.ToLower()
-          Write-Host "sha256=$hash"
-          Write-Host "public url: https://download.ktai.im/$obj"
+
+          # 用 Python oss2 上传：ossutil 的官方下载地址已失效（gosspublic 全 404），
+          # 且 oss2 对 STS（含 security-token）支持稳定、无需额外二进制分发。
+          $py = (Get-Command python -ErrorAction SilentlyContinue).Source
+          if (-not $py) { $py = 'C:\actions-runner\tools\python\python.exe' }
+          & $py -m pip install --quiet --disable-pip-version-check oss2
+
+          $pyCode = @'
+          import os, hashlib, oss2
+          auth = oss2.StsAuth(os.environ['OSS_ACCESS_KEY_ID'], os.environ['OSS_ACCESS_KEY_SECRET'], os.environ['OSS_STS_TOKEN'])
+          bucket = oss2.Bucket(auth, 'https://' + os.environ['OSS_ENDPOINT'], os.environ['OSS_BUCKET'])
+          src = 'target/release/kt-signal-connector.exe'
+          key = os.environ['OSS_KEY']
+          with open(src, 'rb') as f:
+              local_sha = hashlib.sha256(f.read()).hexdigest()
+          bucket.put_object_from_file(key, src)
+          meta = bucket.head_object(key)
+          assert meta.content_length == os.path.getsize(src), 'size mismatch after upload'
+          print(f"uploaded {key} size={meta.content_length} sha256={local_sha}")
+          print(f"public url: https://download.ktai.im/{key}")
+          '@
+          $pyFile = Join-Path $env:RUNNER_TEMP 'upload_signal.py'
+          Set-Content -Path $pyFile -Value $pyCode -Encoding UTF8
+          $env:OSS_KEY = $obj
+          & $py $pyFile
