@@ -590,6 +590,45 @@ impl ProxyGroupRuntime {
         self.pool.as_ref()
     }
 
+    /// D4 所有权执行面(阶段1 批1-5c,SIGNAL-STAGE1-DESIGN §三):Main 的
+    /// 所有权表 quarantine 裁决在 connector 的执行臂。**槽级操作,不经账号
+    /// 行解析**——孤儿槽(绑定已消失、只剩凭据目录)正是它的目标客户,
+    /// 走 resolve 会恰好拒掉要清理的对象。停引擎 + 目录移 `.quarantine-*`
+    /// (字节保留可审计)。幂等:返回 `false` = 无槽(已隔离/从未存在),
+    /// 绝不重复移动目录。前向转发账(若在)同批忘却。
+    pub async fn ownership_quarantine_slot(&self, account_id: &str, reason: &str) -> bool {
+        let Some(pool) = self.pool.as_ref() else {
+            return false; // legacy 无池布局:无槽可执行,幂等成功
+        };
+        let removed = pool.discard_quarantined(account_id).await;
+        tracing::info!(
+            account_id = %crate::pool::account_fingerprint(account_id),
+            reason,
+            removed,
+            "ownership quarantine executed (D4)"
+        );
+        if removed {
+            self.forget_account_forwarders(account_id);
+        }
+        removed
+    }
+
+    /// D4 所有权执行面(阶段1 批1-5c):Main 的 hibernate 裁决执行臂 —
+    /// 停引擎 + 目录原地保留(冷槽语义:下次该账号请求自动重新拉起,
+    /// 代价一次 spawn)。幂等同上;不触碰前向转发账(账号仍绑定,只是省内存)。
+    pub async fn ownership_hibernate_slot(&self, account_id: &str) -> bool {
+        let Some(pool) = self.pool.as_ref() else {
+            return false;
+        };
+        let removed = pool.hibernate_slot(account_id).await;
+        tracing::info!(
+            account_id = %crate::pool::account_fingerprint(account_id),
+            removed,
+            "ownership hibernate executed (D4)"
+        );
+        removed
+    }
+
     /// Exactly one process-wide history-retention pass, whichever supervisor
     /// happens to land first (a pool can legitimately have no slots at
     /// startup; the first linked account then owns the pass).

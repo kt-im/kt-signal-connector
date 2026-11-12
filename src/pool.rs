@@ -1884,20 +1884,42 @@ impl AccountPool {
         self.discard_with(account_id, disposition).await;
     }
 
+    /// D4 所有权执行面(阶段1 批1-5c):Main 所有权表 quarantine 裁决的
+    /// connector 执行臂——停引擎 + 凭据目录移 `engines/.quarantine-*`
+    /// (字节保留可审计,BUG-1 纪律)。幂等:槽不存在(已隔离/从未存在)
+    /// 返回 `false`,绝不重复移动目录。
+    pub async fn discard_quarantined(self: &Arc<Self>, account_id: &str) -> bool {
+        self.discard_with(account_id, SlotDisposition::Quarantine)
+            .await
+    }
+
+    /// D4 所有权执行面(阶段1 批1-5c):Main 所有权表 hibernate 裁决的
+    /// connector 执行臂——停引擎 + 目录原地保留(冷槽语义:下次账号请求
+    /// 自动重新拉起,代价一次 spawn)。幂等同上。
+    pub async fn hibernate_slot(self: &Arc<Self>, account_id: &str) -> bool {
+        self.discard_with(account_id, SlotDisposition::Keep).await
+    }
+
     /// The one teardown every slot-removal path uses (account delete,
-    /// link rollback, reclaim). Removing the slot from the map first makes the
-    /// pass idempotent: a concurrent second caller finds no slot and does
-    /// nothing. The engine is always stopped before the directory is touched
-    /// (I5), and the attempt lease — whatever its state — is cleared with the
-    /// slot so no reclaim can address a dead slot afterwards.
-    async fn discard_with(self: &Arc<Self>, account_id: &str, disposition: SlotDisposition) {
+    /// link rollback, reclaim, D4 ownership exec). Removing the slot from
+    /// the map first makes the pass idempotent: a concurrent second caller
+    /// finds no slot and does nothing. The engine is always stopped before
+    /// the directory is touched (I5), and the attempt lease — whatever its
+    /// state — is cleared with the slot so no reclaim can address a dead
+    /// slot afterwards. Returns whether a slot was actually torn down
+    /// (`false` = idempotent no-op: nothing was there).
+    async fn discard_with(
+        self: &Arc<Self>,
+        account_id: &str,
+        disposition: SlotDisposition,
+    ) -> bool {
         let slot = self
             .slots
             .write()
             .ok()
             .and_then(|mut slots| slots.remove(account_id));
         let Some(slot) = slot else {
-            return;
+            return false;
         };
         if let Ok(mut leases) = self.leases.lock() {
             leases.retain(|_, lease| lease.account_id != account_id);
@@ -1925,6 +1947,7 @@ impl AccountPool {
             group_id = %slot.proxy_group,
             "per-account engine slot removed"
         );
+        true
     }
 
     fn remove_slot_directory(&self, slot: &AccountSlot) {

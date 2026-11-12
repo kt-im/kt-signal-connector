@@ -1578,6 +1578,38 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
             ),
             Err(failure) => HostResponse::failure(request_id, map_stop_failure(failure)),
         },
+        // D4 所有权执行面(阶段1 批1-5c):Main 所有权表裁决的 connector 执行
+        // 臂。槽级操作——孤儿槽不走账号行解析(那会恰好拒掉清理对象);幂等,
+        // `already-settled` 是合法答案不是错误。隔离移 `.quarantine-*`(字节
+        // 保留可审计);休眠停引擎留目录(冷槽,下次请求自动唤醒)。
+        "ownership.quarantineSlot" => match ownership_slot_params(&request.params) {
+            Ok((account_id, reason)) => {
+                let removed = runtime
+                    .ownership_quarantine_slot(&account_id, &reason)
+                    .await;
+                HostResponse::success(
+                    request_id,
+                    serde_json::json!({
+                        "accountId": account_id,
+                        "outcome": if removed { "quarantined" } else { "already-settled" },
+                    }),
+                )
+            }
+            Err(probe) => HostResponse::failure(request_id, probe),
+        },
+        "ownership.hibernateSlot" => match ownership_slot_params(&request.params) {
+            Ok((account_id, _reason)) => {
+                let removed = runtime.ownership_hibernate_slot(&account_id).await;
+                HostResponse::success(
+                    request_id,
+                    serde_json::json!({
+                        "accountId": account_id,
+                        "outcome": if removed { "hibernated" } else { "already-settled" },
+                    }),
+                )
+            }
+            Err(probe) => HostResponse::failure(request_id, probe),
+        },
         "runtime.status" | "runtime.start" | "runtime.stop" => HostResponse::failure(
             request_id,
             reject_probe(
@@ -4572,6 +4604,32 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
 
 fn empty_params(params: &Value) -> bool {
     params.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+/// D4 所有权执行面(1-5c)参数闸:`accountId` 必填非空字符串(槽键语义由
+/// 池侧 discard 幂等兜底,这里只挡形状);`reason` 可选字符串(隔离打点用,
+/// 休眠臂忽略)。坏形状 = `reject_probe` 同款拒绝,绝不猜默认。
+fn ownership_slot_params(params: &Value) -> Result<(String, String), ApiError> {
+    let invalid = |field: &'static str, reason: &'static str| -> ApiError {
+        reject_probe("ownership.slot", field, reason)
+    };
+    let account_id = params
+        .get("accountId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| invalid("accountId", "a non-empty accountId string is required"))?
+        .to_string();
+    let reason = params
+        .get("reason")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| invalid("reason", "when present, reason must be a string"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok((account_id, reason))
 }
 
 fn map_start_failure(failure: StartFailure) -> ApiError {
