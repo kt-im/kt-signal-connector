@@ -27,7 +27,7 @@ use kt_signal_connector::engine::EngineState;
 use kt_signal_connector::groups;
 use kt_signal_connector::pool::EnginePoolPolicy;
 use kt_signal_connector::registry::{
-    ProxyGroupRuntime, RuntimeOptions, StartFailure, open_group_runtime_with_options,
+    ProxyGroupRuntime, RuntimeOptions, open_group_runtime_with_options,
 };
 use kt_signal_connector::service::{
     MessagesMarkReadParams, PresenceSetTypingMessageParams, SendTarget,
@@ -1347,11 +1347,16 @@ async fn device_unlinked_account_answers_a_terminal_wake() {
     runtime.shutdown().await.unwrap();
 }
 
-/// Contract 1.275 (requirement 3b): `runtime.start` on a pool whose every
-/// account was unlinked answers the terminal code (retryable=false) instead of
-/// the retryable RUNTIME_START_FAILED that invited another doomed spawn.
+/// Contract 1.293 (§4.282), BUG-9: `runtime.start` on a pool whose every
+/// account was unlinked **succeeds**. An account's terminal state is an account
+/// attribute - the domain is up and simply has `serviceableAccountCount: 0` -
+/// so the runtime must neither spawn an engine for a dead credential nor answer
+/// a start failure that makes the host render "recovering the connection".
+///
+/// Mutation: restoring the pre-1.293 `Err(StartFailure::AccountUnlinked)`
+/// branch makes the `expect` red.
 #[tokio::test]
-async fn runtime_start_answers_terminal_when_every_account_is_unlinked() {
+async fn runtime_start_stays_ready_when_every_account_is_unlinked() {
     let _guard = POOL_TEST_LOCK.lock().await;
     let temp = TempDir::new().unwrap();
     let accounts = seed_accounts(&temp, 1);
@@ -1362,6 +1367,11 @@ async fn runtime_start_answers_terminal_when_every_account_is_unlinked() {
     );
     runtime.start().await.unwrap();
     let pid = runtime.status().await.engines[0].pid.unwrap();
+    assert_eq!(
+        runtime.status().await.aggregate.serviceable_account_count,
+        Some(1),
+        "a running account is serviceable"
+    );
 
     fs::write(
         data_dir(&temp, &id).join(".fixture-auth-failed-user-status"),
@@ -1381,22 +1391,148 @@ async fn runtime_start_answers_terminal_when_every_account_is_unlinked() {
     assert!(!process_alive(pid));
 
     // The runtime is stopped (its slots keep their terminal state) and the
-    // next start must answer the terminal face, not a retryable failure.
+    // next start must still succeed: nothing to serve, nothing to spawn.
     let _ = runtime.stop().await;
-    let error = runtime
+    let status = runtime
         .start()
         .await
-        .expect_err("a pool of unlinked accounts cannot start");
-    match error {
-        StartFailure::AccountUnlinked => {}
-        other => panic!("runtime.start must answer the terminal unlink, got {other:?}"),
-    }
-    // ...and the refusal spawned nothing.
+        .expect("a domain with zero serviceable accounts is still a ready domain");
+    assert_eq!(
+        status.aggregate.serviceable_account_count,
+        Some(0),
+        "every account is terminal, so the domain reports zero serviceable accounts"
+    );
+    assert_eq!(status.aggregate.state, EngineState::Stopped);
+    assert!(status.engines[0].needs_relink);
+    // The wire shape: pooled mode always names the key, and 0 is a number.
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(
+        wire.get("serviceableAccountCount"),
+        Some(&json!(0)),
+        "the additive field rides runtime.start in pooled mode"
+    );
     assert_eq!(
         engine_processes(&data_dir(&temp, &id)),
         0,
         "runtime.start must not revive a dead credential"
     );
+
+    // ...while the account's own calls keep the terminal face: the account
+    // surface (re-link prompt) owns this, not the domain.
+    let error = runtime
+        .list_conversations(id, 10, None)
+        .await
+        .expect_err("an unlinked device is never served by an engine");
+    assert_eq!(error.into_api().code, "ACCOUNT_UNLINKED");
+    runtime.shutdown().await.unwrap();
+}
+
+/// Contract 1.293 (§4.282), BUG-9: one parked account must leave the rest of
+/// the domain untouched. Two accounts - one unlinked, one healthy - start
+/// together, report `serviceableAccountCount: 1`, and the healthy account
+/// still serves while the parked one answers its own terminal code.
+///
+/// Mutation: counting parked slots as serviceable (or failing the start when
+/// any slot is parked) turns this red.
+#[tokio::test]
+async fn a_parked_account_leaves_the_rest_of_the_domain_serving() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let accounts = seed_accounts(&temp, 2);
+    let (parked, parked_number) = accounts[0].clone();
+    let (healthy, _healthy_number) = accounts[1].clone();
+    let runtime = open_pool(
+        &temp,
+        pool_options(2, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    runtime.start().await.unwrap();
+
+    // Park the first slot exactly the way the upstream verdict does: the store
+    // row first, then the slot's terminal retire.
+    store_for(&temp)
+        .mark_account_device_unlinked(&parked_number)
+        .unwrap()
+        .expect("account row");
+    {
+        let pool = runtime.account_pool().expect("pooled runtime").clone();
+        let slot = pool.get(&parked).expect("slot");
+        assert!(slot.supervisor().retire_device_unlinked().await);
+    }
+    assert_eq!(engine_processes(&data_dir(&temp, &parked)), 0);
+
+    let _ = runtime.stop().await;
+    let status = runtime
+        .start()
+        .await
+        .expect("a partially parked pool still starts");
+    assert_eq!(
+        status.aggregate.serviceable_account_count,
+        Some(1),
+        "exactly the healthy account is serviceable"
+    );
+    assert_eq!(
+        engine_processes(&data_dir(&temp, &parked)),
+        0,
+        "the parked account never earns an engine"
+    );
+    assert_eq!(
+        engine_processes(&data_dir(&temp, &healthy)),
+        1,
+        "the healthy account keeps its own engine"
+    );
+    // The healthy account serves; the parked one answers its terminal code.
+    runtime
+        .list_conversations(healthy.clone(), 10, None)
+        .await
+        .expect("the healthy account is unaffected");
+    let error = runtime
+        .list_conversations(parked, 10, None)
+        .await
+        .expect_err("the parked account stays terminal");
+    assert_eq!(error.into_api().code, "ACCOUNT_UNLINKED");
+
+    runtime.shutdown().await.unwrap();
+}
+
+/// Contract 1.293 (§4.282), BUG-9 + D4: deleting every account of a domain
+/// leaves a ready domain with `serviceableAccountCount: 0` - the delete face
+/// removes the slot with the account (D4 alignment), so no half state survives
+/// and `runtime.start` still answers success.
+///
+/// Mutation: keeping a slot after its account row is deleted (the "account gone,
+/// slot still there" half state) turns the count assertion red.
+#[tokio::test]
+async fn deleting_every_account_leaves_a_ready_domain_with_zero_serviceable() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let accounts = seed_accounts(&temp, 2);
+    let runtime = open_pool(
+        &temp,
+        pool_options(2, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    runtime.start().await.unwrap();
+    for (id, _number) in &accounts {
+        runtime
+            .delete_local_account(id.clone(), None)
+            .await
+            .expect("the local data delete owns this account");
+    }
+    assert!(
+        runtime.status().await.engines.is_empty(),
+        "a deleted account takes its slot with it (D4)"
+    );
+
+    let status = runtime
+        .start()
+        .await
+        .expect("an empty domain is still a ready domain");
+    assert_eq!(status.aggregate.serviceable_account_count, Some(0));
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(wire.get("serviceableAccountCount"), Some(&json!(0)));
+    for (id, _number) in &accounts {
+        assert_eq!(engine_processes(&data_dir(&temp, id)), 0);
+        assert!(!data_dir(&temp, id).exists(), "the slot directory is gone");
+    }
     runtime.shutdown().await.unwrap();
 }
 

@@ -78,6 +78,14 @@
   `store::probe_account_rows`：immutable 只读、未 checkpoint 的 WAL 直接拒绝），不建目录/库文件/
   锁文件、不改 pid、不 chmod。无 wire 变更，
   `ENGINE_CONTRACT_MAX_REVISION` 保持 1.286。)
+- Contract revision: 1.293 (2026-11-12; §4.282 账号终态不杀死域：`runtime.start` 在
+  「零可服务账号」（全部槽 parked 于 `device_unlinked`）时**成功返回**，不再答
+  `ACCOUNT_UNLINKED/retryable=false` —— 账号的终态是账号属性，域的 ready/failed 是
+  进程与引擎可用性属性，一个 parked 账号不该把整个 domain 判失败。可服务的账号数经
+  additive 顶层 `serviceableAccountCount`（pooled 恒在、0 合法；legacy 键缺席，形状
+  逐字节不变）随 `runtime.status`/`runtime.start`/`runtime.stop` 与每帧
+  `runtime.stateChanged` 上报。账号寻址调用照旧答 ACCOUNT_UNLINKED；`engines[].needsRelink`
+  仍是槽级机读位。桌面半边（域门禁 / 恢复遮罩）见桌面仓。）
 - Login-window sync projection (2026-11-12, wire additive, engine-compat —
   §4.281 `accounts.getSyncState`; no new contract revision number is claimed here: the
   engine's shared revision constant is still 1.285 and the next bump belongs to the
@@ -21666,9 +21674,11 @@ bindings 仍然 active；watchdog 看到 engine 的 `listAccounts` 不再列这�
   `account_is_device_unlinked`：命中即停 watchdog、停引擎、清 resident，返回
   `SlotWakeRefusal::DeviceUnlinked` → `into_service_error` = ACCOUNT_UNLINKED retryable=false。
   判定同时看**进程内锁存**与**store 行**，所以连接器重启后冷发现的槽答同一句话。
-- `start_or_schedule` 对终态槽直接跳过（不排迁移、不起引擎），
-  `runtime.start` 在「全部槽都是终态」时走 `StartFailure::AccountUnlinked` →
-  `ACCOUNT_UNLINKED, retryable=false`，而不是可重试的 RUNTIME_START_FAILED。
+- `start_or_schedule` 对终态槽直接跳过（不排迁移、不起引擎）。
+  > §4.282（契约 1.293）修订：`runtime.start` 在「全部槽都是终态」时**不再**答
+  > `ACCOUNT_UNLINKED` —— 那让一个 parked 账号杀死整个域（桌面判
+  > `ENGINE_RECOVERY_FAILED`、卡「正在恢复连接」）。现在它成功返回并报
+  > `serviceableAccountCount: 0`；账号面照旧答 ACCOUNT_UNLINKED。
 - `accounts.deleteLocalData` 是这条终态唯一允许的补救动作（"delete its local data and link it again"）：
   `SlotWakeRefusal::permits_engine_free_flow()`（迁移闸 + 终态）让它走 §4.276 的纯 store 出口，
   否则死引擎会把删除也拒掉，账号从此既删不掉也链不回来。
@@ -21706,7 +21716,7 @@ bindings 仍然 active；watchdog 看到 engine 的 `listAccounts` 不再列这�
 | device_unlinked_stops_the_slot_engine_and_parks_the_slot | 401 后引擎进程消失、status 报 stopped/pid 缺省/needsRelink=true/resident=false、store 行 device_unlinked |
 | device_unlinked_account_is_not_silently_excluded_by_the_watchdog | store 已终态但 `account.changed` 丢失、引擎不再列该号：watchdog 自己停槽，之后多拍不再重启 |
 | device_unlinked_account_answers_a_terminal_wake | 账号寻址调用答 ACCOUNT_UNLINKED 且 retryable=false，且不留下引擎 |
-| runtime_start_answers_terminal_when_every_account_is_unlinked | 全槽终态时 runtime.start 答 StartFailure::AccountUnlinked（wire 为 ACCOUNT_UNLINKED/retryable=false）且不 spawn |
+| runtime_start_stays_ready_when_every_account_is_unlinked（§4.282 改写；原名 runtime_start_answers_terminal_when_every_account_is_unlinked） | 全槽终态时 runtime.start **成功**、报 `serviceableAccountCount: 0`、不 spawn；账号寻址调用仍答 ACCOUNT_UNLINKED |
 | relink_clears_the_terminal_unlink_and_the_slot_runs_again | link.start 清锁存 + link.finish 落 ready 后，同一槽引擎重新起来，needsRelink 键缺席 |
 
 > 真实重链（桌面的死绑定释放 + 一号一行接管）见 §4.279。
@@ -21761,8 +21771,6 @@ bindings 仍然 active；watchdog 看到 engine 的 `listAccounts` 不再列这�
 | relink_over_a_parked_terminal_account_takes_the_number_over | 终态号码可重链：finish 成功、一号一行、行回 `ready`（active）、旧槽与目录被清、新引擎 Running | 删掉接管块 → `ACCOUNT_ALREADY_LINKED` 红；删掉 reap 调用 → 「旧目录已删」红 |
 | parked_terminal_account_still_deletes_its_local_data | 终态槽仍可 engine-free 删除（行、目录、槽全清），且幂等 | `permits_engine_free_flow` 去掉 `DeviceUnlinked` → `ACCOUNT_UNLINKED` 红 |
 | `stale_engine_fallback_keeps_only_an_authoritative_terminal_unlink`（lib 单测） | 权威终态存活 / 无 origin 仍降级 | 同上投影变异红 |
-\n## §4.280 链接尝试租约与终止态回收（内部实现，零 wire 变更）\n\n**问题**： 预分配引擎槽，失败/取消/超时的尝试会把“有凭据、无账号行”的槽留在\n 下。启动对账曾直接拒绝启动（一个泄漏槽拖垮整个 connector），\n后改为“隔离后继续”兜底，但 live 路径仍会误杀“手机已批准、connector 没拿到回执”的槽。\n\n**租约**：槽所有权挂在  租约上（），不挂未提交的账号 id。\n 用 Drop 兜住所有提前返回/panic 旁路；/ 消费 self，\n禁止双结算。\n\n**唯一回收漏斗** ：finish 失败、、\nfinish 超时、guard Drop、30s reaper 五条路径全部走它，幂等（重放返回 ）。\n回收前先做一次**有界只读**  探测（，默认 3s）：\n命中本槽预分配 id 的账号 = provisioning 已在引擎侧落成 → 物化账号行并 \n（不隔离、不删目录、不停引擎）；探测失败/超时/不支持 → 原有回收\n（ / ）。 对外语义不变。\n\n**启动兜底**： 对残留槽执行隔离并继续启动，打\n 告警； 对同一槽报\n（与 apply 双向诚实）。\n\n**未覆盖窄窗**：registration 已写但  从未执行——只读探测看不到，维持回收\n（凭据进 ，字节可审计）。要可 promote 需引擎侧提交语义，属另一决策。\n
-
 ## §4.280 链接尝试租约与终止态回收（内部实现，零 wire 变更）
 
 **问题**：link.start 预分配引擎槽，失败/取消/超时的尝试会把「有凭据、无账号行」的槽留在
@@ -21830,3 +21838,75 @@ sinceMs 全拒，未知兄弟键忽略）；`tests/schema_consistency.rs` 要求
 
 **门禁**：`cargo fmt` / `cargo clippy --all-targets -- -D warnings` / `cargo test` /
 release build。
+
+## §4.282 账号终态不杀死域：`runtime.start` 成功 + `serviceableAccountCount`（契约 1.293 · wire additive）
+
+**问题（BUG-9，2026-11-12 现场实证）**：default 域唯一账号被手机解绑 → 连接器按 §4.278
+把槽 parked 并**拒绝启动 runtime**（`runtime.start` 答 `ACCOUNT_UNLINKED`）→ 桌面判
+`ENGINE_RECOVERY_FAILED` → 工作区整屏卡「正在恢复 Signal 连接」。根因是把**账号终态**
+与**域健康**压进同一个状态机：实现要求「域至少有一个可服务账号才能 ready」，于是单账号
+的终态杀死整个域；桌面又把「域 failed」渲染成全局恢复遮罩。
+
+**正确语义**：
+
+- 账号：`ready | device_unlinked | parked | deleting | deleted | hibernated`（账号自己的
+  状态，页面显示重链/删除提示）；
+- 域：`ready` + `serviceableAccountCount = 0` 是**合法组合**（引擎可以不起，域不能 failed）；
+- 会话/槽：生命周期跟随账号（删除→删槽、休眠→休眠槽、解绑→槽 parked，§4.278/§4.279/
+  D4 执行臂），**不反噬域**。
+
+**实现**：
+
+1. **`runtime.start`（pooled）**：`start_resident` 仍跳过终态槽（不为死凭据 spawn 引擎）；
+   当 `!any_running && !pool.is_empty()` 且 `every_slot_device_unlinked()` 时返回
+   `Ok(self.status())`，不再返回启动失败。**账号寻址调用**（`listConversations` 等）照旧
+   答 `ACCOUNT_UNLINKED retryable=false`（§4.275/§4.278 的闸不动）。
+   `StartFailure::AccountUnlinked` 与该 wire 映射一并删除（无其他生产者）。
+2. **可服务账号数**：`AggregateEngineStatus` 新增 additive 顶层
+   `serviceableAccountCount`（pooled 恒序列化，0 合法；legacy 省略整键 → 形状逐字节不变）。
+   定义 = 注册槽里**没有被上游 `device_unlinked` 判终态**的那些（冷槽算可服务：首个请求
+   会唤醒）。它在 `runtime.status` / `runtime.start` / `runtime.stop` 与每一帧
+   `runtime.stateChanged` 上都带 —— 事件帧自带该数，宿主无需为「这次 stop 是不是账号终态
+   引起的」再跑一次往返。
+3. **D4 对齐（无新代码，已有路径核实）**：删除 → `delete_local_account` 同调用 discard
+   槽（§4.276/§4.279）；解绑 → 槽 parked（§4.278）；休眠 → `ownership.hibernateSlot` 停
+   引擎、目录原地留（1-5c）。三条都不会留下「账号没了槽还在 / 槽没了账号还在」。
+
+**边界（如实记档）**：
+
+- `serviceableAccountCount` 只把 `device_unlinked` 从可服务集合里扣掉；store 迁移闸
+  （§4.277）锁存的槽仍计入——那是一个**可修复的部署问题**，且 `runtime.start` 对全槽
+  migration-blocked 仍按 §4.277 答终态 `STORE_MIGRATION_BLOCKED`。混合形态（部分 parked、
+  部分 migration-blocked）沿用既有顺序：全槽 parked → 成功；否则 block 优先于
+  `RUNTIME_START_FAILED`。
+- legacy 组引擎拓扑不变：没有 `engines[]`、没有该计数，一个引擎服务整组账号；
+  `runtime.start` 的聚合规则逐字节不变。
+- 该计数是**域级读数**，不是「账号数」：`accountCount` 仍是 store 里的账号行数，
+  两者在多账号域里可以不等（parked 账号仍在 `accountCount` 里，因为它的行、目录、媒体
+  都还在，供重链或删除）。
+
+**wire 增量**（append-only）：
+
+```jsonc
+// runtime.status / runtime.start / runtime.stop（pooled）
+{ "state": "stopped", "resourcePressure": false, "serviceableAccountCount": 0,
+  "engines": [ { "accountId": "…", "state": "stopped", "resident": false,
+                 "needsRelink": true } ] }
+// runtime.stateChanged（pooled，同样带该键）
+```
+
+**测试**（`tests/per_account_pool.rs`，均配变异验证）：
+
+| 用例 | 钉住的行为 | 变异 |
+|---|---|---|
+| runtime_start_stays_ready_when_every_account_is_unlinked | 全槽终态：start 成功、`serviceableAccountCount: 0`（wire 键在场且为 0）、不 spawn 引擎、账号寻址调用仍 ACCOUNT_UNLINKED | 还原 `Err(StartFailure::AccountUnlinked)` → `expect` 红 |
+| a_parked_account_leaves_the_rest_of_the_domain_serving | 2 账号一 parked 一健康：start 成功、计数=1、健康账号引擎照常、健康调用成功、parked 调用答 ACCOUNT_UNLINKED | 把 parked 计入可服务（或任一 parked 即失败）→ 计数/start 断言红 |
+| deleting_every_account_leaves_a_ready_domain_with_zero_serviceable | 删光账号：槽随账号消失（D4）、start 成功、计数=0 | 删账号留槽（半截状态）→ 槽目录/计数断言红 |
+
+lib 单测 `engines_is_present_exactly_on_the_pooled_status_shape` 追加 wire 锁：
+legacy 帧**不得**出现 `serviceableAccountCount`；pooled 空池帧必须出现且为 `0`。
+
+**桌面半边**（另一仓，契约 1.293 消费面）：池化聚合 stop 不再无条件进恢复态 —— 帧自带
+计数为 0（旧 connector 则回读一次 `runtime.status`，用逐槽 `needsRelink` 兜底）时域留
+在 ready，账号面出重链提示；`needsRelink` 槽不再算引擎故障/降级。渲染层 runtime gate
+对「域 ready + 0 可服务账号」直接放行，「正在恢复连接」只留给域真不可用。

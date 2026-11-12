@@ -118,6 +118,16 @@ pub struct AggregateEngineStatus {
     /// and omitted from the wire, so the flag-off shape stays byte-identical.
     #[serde(skip_serializing_if = "is_false")]
     pub degraded: bool,
+    /// Contract 1.293 (§4.282): how many accounts this runtime could serve
+    /// **right now** — every registered pool slot except the ones parked by an
+    /// upstream `device_unlinked` verdict. `Some(0)` is a legal, domain-ready
+    /// answer: every account is terminal (unlinked/deleted), so the domain has
+    /// nothing to serve and no engine to run — it is not a domain failure.
+    /// Present exactly in pooled mode (the pre-pool path omits the key, so that
+    /// wire shape stays byte-identical) and carried by `runtime.status`,
+    /// `runtime.start`/`stop` and every `runtime.stateChanged` frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serviceable_account_count: Option<u32>,
 }
 
 /// Serde helper: omit `degraded` unless it is true.
@@ -133,6 +143,7 @@ impl From<EngineStatus> for AggregateEngineStatus {
             rss_bytes: status.rss_bytes,
             resource_pressure: status.resource_pressure,
             degraded: false,
+            serviceable_account_count: None,
         }
     }
 }
@@ -260,11 +271,6 @@ pub enum StartFailure {
     /// fault is latched on the supervisor and the same binary answers the same
     /// revision on every restart.
     ContractMismatch(crate::engine_contract::EngineContractFault),
-    /// Contract 1.275: every pooled slot is parked in the terminal
-    /// `device_unlinked` state. No retry can revive a dead credential, so the
-    /// answer is the terminal ACCOUNT_UNLINKED face, never a retryable start
-    /// failure that would invite one more doomed spawn.
-    AccountUnlinked,
 }
 
 /// Why `runtime.stop` failed.
@@ -911,6 +917,7 @@ impl ProxyGroupRuntime {
         parts: &[EngineStatus],
         pid: Option<u32>,
         pool_enabled: bool,
+        serviceable_account_count: Option<u32>,
     ) -> AggregateEngineStatus {
         let running = parts.iter().any(|part| part.state == EngineState::Running);
         let faulted = parts.iter().any(|part| part.state == EngineState::Faulted);
@@ -936,6 +943,11 @@ impl ProxyGroupRuntime {
             degraded: pool_enabled
                 && running
                 && parts.iter().any(|part| part.state != EngineState::Running),
+            // Contract 1.293 (§4.282): pooled mode always names the number
+            // (0 is the legal "every account is terminal" reading); the
+            // pre-pool path omits the key so its shape stays byte-identical.
+            serviceable_account_count: pool_enabled
+                .then_some(serviceable_account_count.unwrap_or_default()),
         }
     }
 
@@ -980,7 +992,14 @@ impl ProxyGroupRuntime {
     async fn aggregate_status(&self) -> AggregateEngineStatus {
         let statuses = self.slot_statuses().await;
         let pid = self.single_group_pid(&statuses);
-        Self::aggregate_from(&statuses, pid, self.pool.is_some())
+        Self::aggregate_from(
+            &statuses,
+            pid,
+            self.pool.is_some(),
+            self.pool
+                .as_ref()
+                .map(|pool| pool.serviceable_account_count()),
+        )
     }
 
     pub async fn status(&self) -> RuntimeStatusResult {
@@ -1017,7 +1036,14 @@ impl ProxyGroupRuntime {
             None
         };
         RuntimeStatusResult {
-            aggregate: Self::aggregate_from(&statuses, pid, self.pool.is_some()),
+            aggregate: Self::aggregate_from(
+                &statuses,
+                pid,
+                self.pool.is_some(),
+                self.pool
+                    .as_ref()
+                    .map(|pool| pool.serviceable_account_count()),
+            ),
             proxy_groups,
             engines,
             // Pooled mode always names the key (an empty pool answers `[]`);
@@ -1102,11 +1128,15 @@ impl ProxyGroupRuntime {
             // desktop still gets an honest stopped aggregate); only a pool
             // whose slots all failed answers RUNTIME_START_FAILED.
             if !any_running && !pool.is_empty() {
-                // Contract 1.275: a pool whose every account was unlinked by
-                // the holder has a terminal answer of its own. Retrying the same
-                // runtime.start cannot heal a dead credential.
+                // Contract 1.293 (§4.282): an account's terminal state is an
+                // **account** attribute, never the domain's. A pool whose every
+                // account the holder unlinked is a legal domain-ready shape with
+                // `serviceableAccountCount: 0` - there is nothing to serve and
+                // no engine to spawn, but the runtime itself is up. Answering a
+                // start failure here made one parked account kill the whole
+                // domain (desktop: ENGINE_RECOVERY_FAILED + the recovery gate).
                 if pool.every_slot_device_unlinked() {
-                    return Err(StartFailure::AccountUnlinked);
+                    return Ok(self.status().await);
                 }
                 // A terminal store refusal is not a retryable start failure: it
                 // already names the account-level reason a human has to act on.
@@ -4380,13 +4410,14 @@ mod tests {
     fn pooled_aggregate_is_degraded_while_the_legacy_shape_is_unchanged() {
         let mut statuses = vec![running(); 9];
         statuses.push(faulted());
-        let pooled = ProxyGroupRuntime::aggregate_from(&statuses, None, true);
+        let pooled =
+            ProxyGroupRuntime::aggregate_from(&statuses, None, true, Some(statuses.len() as u32));
         assert_eq!(pooled.state, EngineState::Running);
         assert!(pooled.degraded);
         let wire = serde_json::to_value(&pooled).unwrap();
         assert_eq!(wire["degraded"], true);
 
-        let legacy = ProxyGroupRuntime::aggregate_from(&statuses, None, false);
+        let legacy = ProxyGroupRuntime::aggregate_from(&statuses, None, false, None);
         assert_eq!(legacy.state, EngineState::Running);
         assert!(!legacy.degraded);
         let wire = serde_json::to_value(&legacy).unwrap();
@@ -4714,7 +4745,7 @@ mod tests {
     #[test]
     fn engines_is_present_exactly_on_the_pooled_status_shape() {
         let legacy = RuntimeStatusResult {
-            aggregate: ProxyGroupRuntime::aggregate_from(&[running()], Some(1), false),
+            aggregate: ProxyGroupRuntime::aggregate_from(&[running()], Some(1), false, None),
             proxy_groups: Vec::new(),
             engines: Vec::new(),
             engines_pooled: false,
@@ -4725,9 +4756,13 @@ mod tests {
             "a legacy answer must not gain the key: {wire}"
         );
         assert!(wire.get("degraded").is_none());
+        assert!(
+            wire.get("serviceableAccountCount").is_none(),
+            "contract 1.293: the pre-pool shape must not gain the count: {wire}"
+        );
 
         let empty_pool = RuntimeStatusResult {
-            aggregate: ProxyGroupRuntime::aggregate_from(&[], None, true),
+            aggregate: ProxyGroupRuntime::aggregate_from(&[], None, true, Some(0)),
             proxy_groups: Vec::new(),
             engines: Vec::new(),
             engines_pooled: true,
@@ -4738,9 +4773,19 @@ mod tests {
             Some(&json!([])),
             "a pooled answer with no accounts must still name engines as []: {wire}"
         );
+        assert_eq!(
+            wire.get("serviceableAccountCount"),
+            Some(&json!(0)),
+            "contract 1.293: pooled mode always names the count (0 is legal): {wire}"
+        );
 
         let sized = RuntimeStatusResult {
-            aggregate: ProxyGroupRuntime::aggregate_from(&[running(), running()], None, true),
+            aggregate: ProxyGroupRuntime::aggregate_from(
+                &[running(), running()],
+                None,
+                true,
+                Some(2),
+            ),
             proxy_groups: Vec::new(),
             engines: vec![
                 account_engine("00000000000000000000000000000001"),

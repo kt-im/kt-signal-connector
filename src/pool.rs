@@ -2064,10 +2064,11 @@ impl AccountPool {
         slot: &Arc<AccountSlot>,
     ) -> Option<StoreMigrationBlock> {
         // Contract 1.275: a terminal unlink is not a start failure to retry -
-        // `runtime.start` must not spawn an engine that can only answer 401,
-        // and it must not report a retryable aggregate failure for it either
-        // (the caller sees ACCOUNT_UNLINKED from the status face's
-        // `needsRelink` and from `every_slot_device_unlinked`).
+        // `runtime.start` must not spawn an engine that can only answer 401.
+        // Contract 1.293 (§4.282): the skip is also how a domain with zero
+        // serviceable accounts stays *ready* - the start reports
+        // `serviceableAccountCount: 0` instead of failing, and the account face
+        // carries the re-link prompt.
         if slot
             .supervisor()
             .account_is_device_unlinked(&slot.account_id)
@@ -2787,9 +2788,32 @@ impl AccountPool {
         self.get(account_id).and_then(|slot| slot.migration_block())
     }
 
+    /// How many accounts this pool could serve **right now** (contract 1.293,
+    /// §4.282): every registered slot except the ones parked by an upstream
+    /// `device_unlinked` verdict. Zero is a legal, domain-ready reading - all
+    /// accounts are terminal, so there is nothing to serve and no engine to
+    /// spawn - and `runtime.start` answers success with it instead of a start
+    /// failure. Read-only, memory-only (the supervisor latch + the store row),
+    /// same face as `every_slot_device_unlinked`.
+    pub fn serviceable_account_count(&self) -> u32 {
+        self.slots()
+            .iter()
+            .filter(|slot| {
+                !slot
+                    .supervisor()
+                    .account_is_device_unlinked(&slot.account_id)
+            })
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX)
+    }
+
     /// Whether every registered slot is parked in the terminal unlink state
-    /// (contract 1.275). `runtime.start` answers that state's own code instead
-    /// of a retryable start failure: no retry can revive a dead credential.
+    /// (contract 1.275, re-read by contract 1.293 §4.282). This is a **state**
+    /// question, not a start verdict: since §4.282 `runtime.start` answers
+    /// success with `serviceableAccountCount: 0` here (the account face owns
+    /// the re-link prompt), while every account-addressed call keeps answering
+    /// the terminal ACCOUNT_UNLINKED.
     pub fn every_slot_device_unlinked(&self) -> bool {
         let slots = self.slots();
         !slots.is_empty()
