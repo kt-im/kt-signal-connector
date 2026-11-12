@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod engine;
 pub mod engine_contract;
 pub(crate) mod event_publisher;
+pub(crate) mod gate_trace;
 pub mod groups;
 pub mod history_attachment;
 pub mod history_import;

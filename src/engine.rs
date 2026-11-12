@@ -4238,6 +4238,9 @@ async fn handle_upstream_line(
                     });
                 }
                 _ => {
+                    // SIGNAL-GATE-TRACE-PLAN §2: the connector's shape gate
+                    // dropped an initial-sync notification before any forward.
+                    crate::gate_trace::line("initial-sync", account, "fail", "shape-gate");
                     let _ = events.send(EngineEvent::ProtocolWarning {
                         kind: "unknownNotification",
                     });
@@ -4322,6 +4325,9 @@ async fn handle_upstream_line(
                     });
                 }
                 _ => {
+                    // SIGNAL-GATE-TRACE-PLAN §2: the connector's shape gate
+                    // dropped a storage-pull notification before any forward.
+                    crate::gate_trace::line("storage-pull", account, "fail", "shape-gate");
                     let _ = events.send(EngineEvent::ProtocolWarning {
                         kind: "unknownNotification",
                     });
@@ -7890,7 +7896,20 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
 
     // Typing and body-less reaction / remote-delete receives carry no message
     // row; they route as control events and never persist.
-    if let Some(routing) = control_routing(envelope) {
+    let routing = control_routing(envelope);
+    // SIGNAL-GATE-TRACE-PLAN §2: a `syncMessage.contacts` face that failed
+    // the shape gates (or carried no records and no complete flag) never
+    // reaches the contacts arm; one connector-hop drop line records the
+    // shape-gate loss with the same account fingerprint the engine emits.
+    if routing.is_none()
+        && envelope
+            .get("syncMessage")
+            .and_then(Value::as_object)
+            .is_some_and(|sync| sync.contains_key("contacts"))
+    {
+        crate::gate_trace::line("contact-sync", account.as_deref(), "fail", "shape-gate");
+    }
+    if let Some(routing) = routing {
         let ControlRouting {
             direction,
             source,

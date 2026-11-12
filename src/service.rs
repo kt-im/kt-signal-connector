@@ -10966,10 +10966,33 @@ impl ConnectorService {
         contacts_ok: bool,
         groups_ok: bool,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
-        let Some(account) = self.resolve_account_transient(signal_account, "engine.storagePull")?
-        else {
-            return Ok(Vec::new());
+        let account = match self.resolve_account_transient(signal_account, "engine.storagePull") {
+            Ok(Some(account)) => account,
+            Ok(None) => {
+                crate::gate_trace::line(
+                    "storage-pull",
+                    Some(signal_account),
+                    "fail",
+                    "account-unresolved",
+                );
+                return Ok(Vec::new());
+            }
+            Err(error) => {
+                crate::gate_trace::line(
+                    "storage-pull",
+                    Some(signal_account),
+                    "fail",
+                    "store-error",
+                );
+                return Err(error);
+            }
         };
+        crate::gate_trace::line(
+            "storage-pull",
+            Some(signal_account),
+            "ok",
+            &format!("forwarded trigger={trigger} contactsOk={contacts_ok} groupsOk={groups_ok}"),
+        );
         Ok(vec![HostSideEvent::StoragePull {
             account_id: account.id.clone(),
             trigger: trigger.to_string(),
@@ -10987,11 +11010,34 @@ impl ConnectorService {
         manifest_ok: bool,
         profiles_ok: bool,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
-        let Some(account) =
-            self.resolve_account_transient(signal_account, "engine.initialSyncComplete")?
-        else {
-            return Ok(Vec::new());
-        };
+        let account =
+            match self.resolve_account_transient(signal_account, "engine.initialSyncComplete") {
+                Ok(Some(account)) => account,
+                Ok(None) => {
+                    crate::gate_trace::line(
+                        "initial-sync",
+                        Some(signal_account),
+                        "fail",
+                        "account-unresolved",
+                    );
+                    return Ok(Vec::new());
+                }
+                Err(error) => {
+                    crate::gate_trace::line(
+                        "initial-sync",
+                        Some(signal_account),
+                        "fail",
+                        "store-error",
+                    );
+                    return Err(error);
+                }
+            };
+        crate::gate_trace::line(
+            "initial-sync",
+            Some(signal_account),
+            "ok",
+            &format!("forwarded manifestOk={manifest_ok} profilesOk={profiles_ok}"),
+        );
         Ok(vec![HostSideEvent::InitialSyncComplete {
             account_id: account.id.clone(),
             manifest_ok,
@@ -12584,23 +12630,68 @@ impl ConnectorService {
         let Some(control) = receive.control else {
             return Ok(Vec::new());
         };
+        // SIGNAL-GATE-TRACE-PLAN §2: only the contacts sync shares this
+        // attribution entry with every other control face; its drops below
+        // must be visible (the inbox gate waits on contactSync:complete).
+        let trace_contact_sync = matches!(&control, ControlReceive::SyncContacts { .. });
         // Route to the account the same way messages do.
         let signal_account = match receive.account.as_deref().filter(|s| !s.is_empty()) {
             Some(account) => account.to_string(),
             None => {
                 let accounts = self.store.list_accounts_in_group(owner_group)?;
                 if accounts.len() != 1 {
+                    if trace_contact_sync {
+                        crate::gate_trace::line(
+                            "contact-sync",
+                            None,
+                            "fail",
+                            "account-unresolved group-ambiguous",
+                        );
+                    }
                     return Ok(Vec::new());
                 }
                 match self.store.account_by_id(&accounts[0].id)? {
                     Some(row) => row.signal_account,
-                    None => return Ok(Vec::new()),
+                    None => {
+                        if trace_contact_sync {
+                            crate::gate_trace::line(
+                                "contact-sync",
+                                None,
+                                "fail",
+                                "account-unresolved row-missing",
+                            );
+                        }
+                        return Ok(Vec::new());
+                    }
                 }
             }
         };
-        let account = match self.store.account_by_signal(&signal_account).ok().flatten() {
-            Some(account) => account,
-            None => return Ok(Vec::new()),
+        let account = match self.store.account_by_signal(&signal_account) {
+            Ok(Some(account)) => account,
+            Ok(None) => {
+                if trace_contact_sync {
+                    crate::gate_trace::line(
+                        "contact-sync",
+                        Some(signal_account.as_str()),
+                        "fail",
+                        "account-unresolved unbound",
+                    );
+                }
+                return Ok(Vec::new());
+            }
+            Err(_) => {
+                // The store hiccup already ends the face silently on this
+                // attribution entry; the gate-trace line names it honestly.
+                if trace_contact_sync {
+                    crate::gate_trace::line(
+                        "contact-sync",
+                        Some(signal_account.as_str()),
+                        "fail",
+                        "store-error",
+                    );
+                }
+                return Ok(Vec::new());
+            }
         };
         // §4.37: the view-once open sync names its target by (author ACI,
         // timestamp) across conversations — the envelope's own source is our
@@ -15047,14 +15138,23 @@ impl ConnectorService {
                     account_id = %account.id,
                     "contactSync complete consumed (empty final blob)"
                 );
-            }
-            return Ok(if complete {
-                vec![HostSideEvent::ContactSyncCompleted {
+                crate::gate_trace::line(
+                    "contact-sync",
+                    Some(account.signal_account.as_str()),
+                    "ok",
+                    "forwarded records=0 complete=true",
+                );
+                return Ok(vec![HostSideEvent::ContactSyncCompleted {
                     account_id: account.id.clone(),
-                }]
-            } else {
-                Vec::new()
-            });
+                }]);
+            }
+            crate::gate_trace::line(
+                "contact-sync",
+                Some(account.signal_account.as_str()),
+                "-",
+                "partial records=0 complete=false",
+            );
+            return Ok(Vec::new());
         }
         let mut synced: Vec<(String, String, String)> = Vec::new();
         // Contract 1.259 (§4.243): the bindings this batch writes, collected
@@ -15151,9 +15251,22 @@ impl ConnectorService {
                 records = contacts.len(),
                 "contactSync complete consumed"
             );
+            crate::gate_trace::line(
+                "contact-sync",
+                Some(account.signal_account.as_str()),
+                "ok",
+                &format!("forwarded records={} complete=true", contacts.len()),
+            );
             events.push(HostSideEvent::ContactSyncCompleted {
                 account_id: account.id.clone(),
             });
+        } else {
+            crate::gate_trace::line(
+                "contact-sync",
+                Some(account.signal_account.as_str()),
+                "-",
+                &format!("partial records={} complete=false", contacts.len()),
+            );
         }
         Ok(events)
     }
@@ -21953,6 +22066,36 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
         (temp, ConnectorService::new(Arc::new(store)))
+    }
+
+    #[derive(Clone, Default)]
+    struct GateTraceBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for GateTraceBuffer {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for GateTraceBuffer {
+        type Writer = GateTraceBuffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured_gate_trace(log: impl FnOnce()) -> String {
+        let buffer = GateTraceBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, log);
+        String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
     }
 
     /// A minimal incoming `MessageRecord` for report-spam preparation tests;
@@ -38785,6 +38928,65 @@ mod tests {
             counters[crate::perf_metrics::keys::ACCOUNT_TRANSIENT_UNATTRIBUTED],
             2
         );
+    }
+
+    /// SIGNAL-GATE-TRACE-PLAN §2: the connector forwarding arms emit exactly
+    /// one fixed-shape line per storage-pull / initial-sync / contact-sync
+    /// forward or drop, and no line carries the signal number.
+    #[test]
+    fn gate_trace_covers_forward_and_drop_faces() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let output = captured_gate_trace(|| {
+            service
+                .forward_storage_pull("+15555550100", "fetchLatest", true, false)
+                .unwrap();
+            service
+                .forward_storage_pull("+15555550999", "fetchLatest", true, false)
+                .unwrap();
+            service
+                .forward_initial_sync_complete("+15555550100", true, true)
+                .unwrap();
+            service
+                .forward_initial_sync_complete("+15555550999", true, true)
+                .unwrap();
+            let account_row = service
+                .store_ref()
+                .account_by_id(&account.id)
+                .unwrap()
+                .expect("account row");
+            service
+                .apply_sync_contacts(&account_row, &[], true)
+                .unwrap();
+            service
+                .apply_sync_contacts(&account_row, &[], false)
+                .unwrap();
+            let unbound = control_receive(
+                "+15555550999",
+                "+15555550999",
+                ControlReceive::SyncContacts {
+                    contacts: Vec::new(),
+                    complete: true,
+                },
+            );
+            service
+                .ingest_receive(unbound, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap();
+        });
+        let expected = [
+            "[gate-trace] hop=conn event=storage-pull account=0cbf0194 face=ok detail=forwarded trigger=fetchLatest contactsOk=true groupsOk=false",
+            "[gate-trace] hop=conn event=storage-pull account=ebe4f53b face=fail detail=account-unresolved",
+            "[gate-trace] hop=conn event=initial-sync account=0cbf0194 face=ok detail=forwarded manifestOk=true profilesOk=true",
+            "[gate-trace] hop=conn event=initial-sync account=ebe4f53b face=fail detail=account-unresolved",
+            "[gate-trace] hop=conn event=contact-sync account=0cbf0194 face=ok detail=forwarded records=0 complete=true",
+            "[gate-trace] hop=conn event=contact-sync account=0cbf0194 face=- detail=partial records=0 complete=false",
+            "[gate-trace] hop=conn event=contact-sync account=ebe4f53b face=fail detail=account-unresolved unbound",
+        ];
+        for line in expected {
+            assert!(output.contains(line), "missing {line:?} in {output}");
+        }
+        assert!(!output.contains("+15555550100"), "{output}");
+        assert!(!output.contains("+15555550999"), "{output}");
     }
 
     /// The story receive projection is a verbatim pipe (contract 1.91,
