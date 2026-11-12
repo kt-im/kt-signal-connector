@@ -50,6 +50,7 @@
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -1104,7 +1105,11 @@ impl Journal {
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis())
             .unwrap_or_default();
-        let path = dir.join(format!("{stamp}-{}.jsonl", std::process::id()));
+        // 同一毫秒内两次 run() 会撞名：create_new 直接失败。序号与 pid 一起
+        // 保证唯一（journal 是追加审计面，文件名只承载唯一性）。
+        static JOURNAL_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = JOURNAL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{stamp}-{}-{seq}.jsonl", std::process::id()));
         let file = fs::OpenOptions::new()
             .create_new(true)
             .append(true)
