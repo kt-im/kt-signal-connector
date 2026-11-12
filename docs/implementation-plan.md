@@ -20417,6 +20417,12 @@ remoteDelete 只改 status，正文仍留在库里。
   `stale`（false 不上 wire）。
 - engine 不可用 / store-only 投影：全部标 `stale=true`、`stateEvidence='cache'`；
   `device_unlinked` 投影为 `unknown`，直到本次进程收到 live 证据。
+  > **supersede（§4.279, 2026-11-12）**：终态槽被 §4.278 停引擎后**只剩**
+  > store 投影；把它洗成 `unknown` 等于对 host 隐藏死亡判决，桌面的死绑定
+  > 释放/重链入口永远收不到 `device_unlinked`，重链被
+  > `session_already_bound` 永久拒绝。现口径：`state_origin` 为
+  > upstream/engine 的终态在 store-only 投影里**保留** `device_unlinked`
+  > （仍标 `stale=true`）；无 origin 的存量行继续降级为 `unknown`。
 - inventory upsert 不覆盖 `device_unlinked`；finish 成功调用
   `mark_account_ready_by_id(..., "engine")` 显式清终态；upstream 401 写
   `state_origin='upstream'`。
@@ -21676,6 +21682,8 @@ bindings 仍然 active；watchdog 看到 engine 的 `listAccounts` 不再列这�
   §4.259 保留 `device_unlinked`，看一眼引擎列表不能复活一个死凭据。
 - 槽本身不删除（数据目录、媒体、凭据都留给用户删除或重链），所以 `needsRelink` 的语义是
   「停在那儿等 re-link」，不是「已清理」。
+  > §4.279 补：用户真的重链成功时，被取代的终态槽才被 reap（连同目录/媒体/文件面）；
+  > 解绑本身绝不清理。
 
 ### 测试
 
@@ -21688,3 +21696,56 @@ bindings 仍然 active；watchdog 看到 engine 的 `listAccounts` 不再列这�
 | device_unlinked_account_answers_a_terminal_wake | 账号寻址调用答 ACCOUNT_UNLINKED 且 retryable=false，且不留下引擎 |
 | runtime_start_answers_terminal_when_every_account_is_unlinked | 全槽终态时 runtime.start 答 StartFailure::AccountUnlinked（wire 为 ACCOUNT_UNLINKED/retryable=false）且不 spawn |
 | relink_clears_the_terminal_unlink_and_the_slot_runs_again | link.start 清锁存 + link.finish 落 ready 后，同一槽引擎重新起来，needsRelink 键缺席 |
+
+> 真实重链（桌面的死绑定释放 + 一号一行接管）见 §4.279。
+
+## §4.279 device_unlinked 死绑定重链：状态面保留 + 终态行接管（契约 1.292 补 · 桌面契约 1.21 消费面）
+
+**问题（用户实证）**：手机端解绑后 connector 已把该号写成 `device_unlinked` 并按 §4.278
+停槽，但桌面 `session-bindings.json` 的绑定行仍是 `active`，`beginSessionLink` 被
+`session_already_bound` 永久拒绝，二维码不出。链路上有两处连接器侧断点：
+
+1. **store-only 投影把终态洗成 `unknown`**：§4.278 停槽后该槽的 `accounts.list` 只能读
+   store，`apply_stale_account_evidence` 无条件把 `device_unlinked` 改成 `unknown`；而
+   桌面的死绑定释放门（`releaseDeadSelfBinding`）只认 `state === "device_unlinked"`，
+   于是绑定永不解、重链永不达。
+2. **池化 link.finish 撞上终态行**：store 对同一号码只保留一行且 upsert 故意保留
+   `device_unlinked`；`complete_link_session_with_id` 仍按旧行返回 account id，
+   `registry.finish_link` 判定 `summary.id != slot.accountId` → `ACCOUNT_ALREADY_LINKED`
+   回滚刚链上的新设备——而且回滚前该终态行已被 `mark_account_ready_by_id` 翻成
+   `ready`（停着的槽 + ready 行 = 既不可服务也不可重链的僵尸）。
+
+**实现**：
+
+1. **状态面**：`apply_stale_account_evidence` 只对**非权威**终态（`state_origin` 缺席 /
+   非 upstream/engine）降级为 `unknown`；权威终态保留 `device_unlinked` 且
+   `stateEvidence` 保留原 origin，`stale=true` 如实标注「记忆而非 live」。
+2. **重链接管**：池化路径（`preferred_account_id` 在场）的 `link.finish` 提交前，若该号码
+   现有行处于终态 `device_unlinked` 且 id ≠ 预分配槽 id，按「人类显式重链意图」接管：
+   `complete_account_delete_recorded(旧id)` 在同一提交内清掉死行，upsert 把号码绑到
+   预分配槽 id，`mark_account_ready_by_id(..., "engine")` 回落 `ready`。
+3. **善后**：`registry.finish_link` 成功分支调 `reap_replaced_terminal_accounts`——把
+   仍报终态锁存但 store 行已不存在的槽（只可能是被接管的行；显式删除会在同一调用里
+   discard 槽）连带目录、媒体句柄、§4.197 文件面、明文备份残留一起清掉。
+   `link.start` 清锁存/二维码由 §4.278 第 4 条承担，不改。
+4. **删除面不变**：终态槽仍走 engine-free 删除（§4.276），"删本地数据再重链" 仍是
+   唯一补救动作之一。
+
+**边界（如实记档）**：
+
+- 只接管**终态** `device_unlinked`；`unlinking`（登出在飞）与非终态行保持原语义，
+  未完成的删除操作仍按 §9.10 item 7 先于接管被拒（要求先重试删除）。
+- legacy 组引擎不变：无预分配槽 id，同一号码的 relink 继续按「保留旧行」的老路。
+- 接管会删除被取代账号的连接器本地行与目录（桌面在 `releaseDeadSelfBinding` 里本来就
+  会先删这两个）；这是「一号一行」不变的代价，不是新增的数据销毁面。
+- 桌面侧绑定文件不归本仓：`session-bindings.json` 的降级/回 active 由桌面契约 1.21 消费
+  本节的 `device_unlinked` 行与 `needsRelink` 后完成。
+
+**测试**（`tests/per_account_pool.rs`，均配变异验证）：
+
+| 用例 | 钉住的行为 | 变异 |
+|---|---|---|
+| parked_terminal_account_still_reads_device_unlinked_and_needs_relink | 停槽后 `accounts.list` 仍报 `device_unlinked`（origin=upstream、stale=true），status 报 `needsRelink` | 还原投影洗白 → 断言 `unknown` vs `device_unlinked` 红 |
+| relink_over_a_parked_terminal_account_takes_the_number_over | 终态号码可重链：finish 成功、一号一行、行回 `ready`（active）、旧槽与目录被清、新引擎 Running | 删掉接管块 → `ACCOUNT_ALREADY_LINKED` 红；删掉 reap 调用 → 「旧目录已删」红 |
+| parked_terminal_account_still_deletes_its_local_data | 终态槽仍可 engine-free 删除（行、目录、槽全清），且幂等 | `permits_engine_free_flow` 去掉 `DeviceUnlinked` → `ACCOUNT_UNLINKED` 红 |
+| `stale_engine_fallback_keeps_only_an_authoritative_terminal_unlink`（lib 单测） | 权威终态存活 / 无 origin 仍降级 | 同上投影变异红 |

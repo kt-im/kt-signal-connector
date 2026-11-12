@@ -1477,3 +1477,309 @@ async fn relink_clears_the_terminal_unlink_and_the_slot_runs_again() {
     );
     runtime.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// §4.279 (contract 1.292 follow-up): the device_unlinked dead-binding re-link.
+//
+// The user-visible shape this pins: the phone unlinks the device, the store
+// carries the terminal `device_unlinked` row and the slot is parked
+// (contract 1.292), but the desktop still holds an ACTIVE session binding.
+// Its dead-binding release keys on the account list reporting
+// `state == "device_unlinked"`; while the parked slot's store-only
+// projection laundered that into `unknown`, the binding stayed active and
+// `beginSessionLink` answered `session_already_bound` forever — the QR
+// never appeared. The five faces below are the connector half of that root
+// fix (the binding file itself is the desktop's).
+// ---------------------------------------------------------------------------
+
+/// §4.279 requirement 1 + 4 (connector half): a parked terminal account keeps
+/// its `device_unlinked` state on the store-only listing, and the slot keeps
+/// the machine-readable `needsRelink` verdict. Together these are what let
+/// the host release the dead session binding and render "re-link" instead of
+/// "still running".
+///
+/// Mutation: reverting `apply_stale_account_evidence` to launder every
+/// terminal row to `unknown` makes this test fail on the first assertion.
+#[tokio::test]
+async fn parked_terminal_account_still_reads_device_unlinked_and_needs_relink() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let accounts = seed_accounts(&temp, 1);
+    let (id, number) = accounts[0].clone();
+    let runtime = open_pool(
+        &temp,
+        pool_options(1, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    runtime.start().await.unwrap();
+
+    // The accountUnbound lane wrote the terminal, then the slot was parked.
+    store_for(&temp)
+        .mark_account_device_unlinked(&number)
+        .unwrap()
+        .expect("account row");
+    {
+        let pool = runtime.account_pool().expect("pooled runtime").clone();
+        let slot = pool.get(&id).expect("slot");
+        assert!(
+            slot.supervisor().retire_device_unlinked().await,
+            "the slot enters the terminal parked state"
+        );
+    }
+    assert_eq!(
+        engine_processes(&data_dir(&temp, &id)),
+        0,
+        "a parked slot owns no engine (contract 1.292)"
+    );
+
+    // The listing the desktop's dead-binding gate consumes: state must be the
+    // terminal verdict, not `unknown`.
+    let listed = runtime
+        .list_accounts()
+        .await
+        .expect("accounts.list answers from the parked slot's store rows");
+    let parked = listed
+        .iter()
+        .find(|account| account.id == id)
+        .expect("a parked terminal account stays listed");
+    assert_eq!(
+        parked.state, "device_unlinked",
+        "the authoritative unlink must survive the store-only projection: {parked:?}"
+    );
+    assert_eq!(parked.state_evidence.as_deref(), Some("upstream"));
+    assert!(
+        parked.stale,
+        "the verdict is remembered, not invented live: {parked:?}"
+    );
+
+    // The status face carries the machine-readable re-link half.
+    let status = runtime.status().await;
+    let slot = status
+        .engines
+        .iter()
+        .find(|engine| engine.account_id == id)
+        .expect("the parked slot stays registered");
+    assert!(
+        slot.needs_relink,
+        "the desktop renders re-link on this flag"
+    );
+    let wire = serde_json::to_value(&status).unwrap();
+    let parked_wire = wire["engines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|engine| engine["accountId"] == json!(id))
+        .unwrap();
+    assert_eq!(parked_wire["needsRelink"], json!(true), "{wire}");
+
+    // A connector restart discovers the dead slot cold (no live event): the
+    // terminal latch must be seeded from the store verdict, which is what
+    // lets a later re-link reap exactly this slot.
+    let _ = runtime.stop().await;
+    runtime.shutdown().await.unwrap();
+    let reopened = open_pool(
+        &temp,
+        pool_options(1, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    let cold = reopened
+        .account_pool()
+        .expect("pooled runtime")
+        .get(&id)
+        .expect("cold-discovered slot");
+    assert!(
+        cold.supervisor().is_device_unlinked(),
+        "cold discovery latches the terminal verdict instead of waiting for an event"
+    );
+    let _ = reopened.stop().await;
+    reopened.shutdown().await.unwrap();
+}
+
+/// §4.279 requirements 2 + 3: a fresh link may take a parked terminal number
+/// over. `link.start` is not refused by the dead slot, and `link.finish`
+/// rebinds the number to the freshly linked device — one row per number, the
+/// pre-allocated slot owns it, the state is back to `ready` (active), the
+/// replaced slot and directory are reaped, and the fresh engine runs.
+///
+/// Before the fix the commit answered ACCOUNT_ALREADY_LINKED (after flipping
+/// the dead row to `ready` behind a parked engine — an unrecoverable
+/// zombie); the registry rolled the freshly linked device back.
+///
+/// Mutation: dropping the takeover block in `complete_link_session_with_id`
+/// makes the finish assertion fail with ACCOUNT_ALREADY_LINKED.
+#[tokio::test]
+async fn relink_over_a_parked_terminal_account_takes_the_number_over() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    let runtime = open_pool(
+        &temp,
+        pool_options(3, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    runtime.start().await.expect("an empty pool starts");
+
+    // First link: the fixture hands out its first ladder number.
+    let link = runtime
+        .start_link("relink-first".to_string(), Some("default".into()))
+        .await
+        .expect("first link.start");
+    let session = link["linkSessionId"].as_str().unwrap().to_string();
+    let first = runtime
+        .finish_link(session)
+        .await
+        .expect("first link.finish");
+    let number = "+15565550001".to_string();
+    assert_eq!(
+        store_for(&temp)
+            .account_by_signal(&number)
+            .unwrap()
+            .expect("first link row")
+            .id,
+        first.id
+    );
+
+    // The phone unlinks that device: terminal store row + parked slot.
+    store_for(&temp)
+        .mark_account_device_unlinked(&number)
+        .unwrap()
+        .expect("account row");
+    {
+        let pool = runtime.account_pool().expect("pooled runtime").clone();
+        let slot = pool.get(&first.id).expect("first slot");
+        assert!(slot.supervisor().retire_device_unlinked().await);
+    }
+    assert!(
+        runtime
+            .status()
+            .await
+            .engines
+            .iter()
+            .any(|engine| engine.account_id == first.id && engine.needs_relink),
+        "the dead account is parked before the re-link"
+    );
+
+    // The same phone number re-links (the fixture ladder is rewound so the
+    // engine answers the number the user actually owns).
+    fs::remove_file(
+        temp.path()
+            .join("signal-data")
+            .join("engines")
+            .join(".fixture-linked-numbers"),
+    )
+    .unwrap();
+    let link = runtime
+        .start_link("relink-second".to_string(), Some("default".into()))
+        .await
+        .expect("a parked terminal account must not refuse a fresh QR");
+    let session = link["linkSessionId"].as_str().unwrap().to_string();
+    let replacement = runtime
+        .finish_link(session)
+        .await
+        .expect("the re-link takes the parked number over");
+    assert_ne!(
+        replacement.id, first.id,
+        "the fresh device owns the new slot identity"
+    );
+
+    let store = store_for(&temp);
+    let row = store
+        .account_by_signal(&number)
+        .unwrap()
+        .expect("exactly one row for the number");
+    assert_eq!(
+        row.id, replacement.id,
+        "the number is rebound to the freshly linked slot"
+    );
+    let summary = store
+        .account_summary(&replacement.id)
+        .unwrap()
+        .expect("fresh row");
+    assert_eq!(
+        summary.state, "ready",
+        "link.finish returns the account to active"
+    );
+    assert!(
+        store.account_summary(&first.id).unwrap().is_none(),
+        "the dead row is gone, not left ready behind a parked engine"
+    );
+
+    // The superseded slot, its directory, and its status entry are reaped;
+    // the fresh slot runs and no longer advertises re-link.
+    assert!(
+        !data_dir(&temp, &first.id).exists(),
+        "the replaced account directory is removed"
+    );
+    let status = runtime.status().await;
+    assert!(
+        !status
+            .engines
+            .iter()
+            .any(|engine| engine.account_id == first.id),
+        "the replaced slot is gone"
+    );
+    let live = status
+        .engines
+        .iter()
+        .find(|engine| engine.account_id == replacement.id)
+        .expect("the fresh slot");
+    assert_eq!(live.state, EngineState::Running);
+    assert!(!live.needs_relink);
+    assert_eq!(engine_processes(&data_dir(&temp, &replacement.id)), 1);
+    let _ = runtime.stop().await;
+    runtime.shutdown().await.unwrap();
+}
+
+/// §4.279 requirement 5: the terminal state keeps the delete face open.
+/// "Delete its local data and link it again" is the remedy the terminal state
+/// itself names; refusing it would make the account both unservable and
+/// undeletable (the permanent-hang shape). The engine-free delete path must
+/// still complete and remove the slot directory.
+///
+/// Mutation: taking `DeviceUnlinked` out of
+/// `SlotWakeRefusal::permits_engine_free_flow` makes the delete answer
+/// ACCOUNT_UNLINKED and this test fail.
+#[tokio::test]
+async fn parked_terminal_account_still_deletes_its_local_data() {
+    let _guard = POOL_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let accounts = seed_accounts(&temp, 1);
+    let (id, number) = accounts[0].clone();
+    let runtime = open_pool(
+        &temp,
+        pool_options(1, Duration::from_secs(3), Duration::from_secs(8)),
+    );
+    runtime.start().await.unwrap();
+    store_for(&temp)
+        .mark_account_device_unlinked(&number)
+        .unwrap()
+        .expect("account row");
+    {
+        let pool = runtime.account_pool().expect("pooled runtime").clone();
+        let slot = pool.get(&id).expect("slot");
+        assert!(slot.supervisor().retire_device_unlinked().await);
+    }
+    assert_eq!(engine_processes(&data_dir(&temp, &id)), 0);
+
+    runtime
+        .delete_local_account(id.clone(), None)
+        .await
+        .expect("a parked terminal account must stay deletable");
+    assert!(
+        store_for(&temp).account_summary(&id).unwrap().is_none(),
+        "the row is gone"
+    );
+    assert!(!data_dir(&temp, &id).exists(), "the slot directory is gone");
+    assert!(
+        !runtime
+            .status()
+            .await
+            .engines
+            .iter()
+            .any(|engine| engine.account_id == id),
+        "the slot is gone"
+    );
+    // The delete is idempotent: the absent-account replay still answers.
+    runtime
+        .delete_local_account(id, None)
+        .await
+        .expect("the absent-account replay stays green");
+    runtime.shutdown().await.unwrap();
+}

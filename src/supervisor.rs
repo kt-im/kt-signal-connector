@@ -13088,12 +13088,30 @@ fn avatar_from_engine(result: &Value) -> Result<AvatarDownload, ServiceError> {
     })
 }
 
+/// Store-only (stale) projection (contract 1.292 §4.278, widened by §4.279).
+///
+/// A terminal `device_unlinked` row whose origin is the upstream verdict is
+/// the one authority a parked slot has left: its engine is stopped by design,
+/// so every listing of that slot is a store read. Laundering the state to
+/// `unknown` here hid the death verdict from the host — the desktop keyed its
+/// dead-session-binding release and its "re-link" entry on `device_unlinked`,
+/// so the binding stayed active and the re-link answered
+/// `session_already_bound` forever (the permanent deadlock this revision
+/// fixes). Rows without an authoritative origin (pre-origin cache) keep the
+/// pre-fix downgrade: an unverified terminal is not evidence.
 fn apply_stale_account_evidence(account: &mut AccountSummary) {
     account.stale = true;
-    account.state_evidence = Some("cache".to_owned());
     if account.state == "device_unlinked" {
+        let trusted = matches!(
+            account.state_evidence.as_deref(),
+            Some("upstream") | Some("engine")
+        );
+        if trusted {
+            return;
+        }
         account.state = "unknown";
     }
+    account.state_evidence = Some("cache".to_owned());
 }
 
 fn apply_live_account_evidence(account: &mut AccountSummary) {
@@ -13542,13 +13560,31 @@ mod tests {
         );
     }
 
+    /// §4.279: the store-only fallback is the ONLY face a parked terminal
+    /// slot has left (its engine is stopped by design). An authoritative
+    /// upstream unlink must survive it — laundering it to `unknown` hid the
+    /// death verdict from the host, whose dead-binding release keys on
+    /// `device_unlinked`, so the re-link answered `session_already_bound`
+    /// forever. An origin-less legacy terminal keeps the pre-fix downgrade.
     #[test]
-    fn stale_engine_fallback_never_renders_a_terminal_unlink() {
-        let mut account = account_for_evidence("device_unlinked", Some("upstream"));
-        apply_stale_account_evidence(&mut account);
-        assert_eq!(account.state, "unknown");
-        assert_eq!(account.state_evidence.as_deref(), Some("cache"));
-        assert!(account.stale);
+    fn stale_engine_fallback_keeps_only_an_authoritative_terminal_unlink() {
+        let mut trusted = account_for_evidence("device_unlinked", Some("upstream"));
+        apply_stale_account_evidence(&mut trusted);
+        assert_eq!(trusted.state, "device_unlinked");
+        assert_eq!(trusted.state_evidence.as_deref(), Some("upstream"));
+        assert!(trusted.stale, "the evidence is remembered, not live");
+
+        let mut legacy = account_for_evidence("device_unlinked", None);
+        apply_stale_account_evidence(&mut legacy);
+        assert_eq!(legacy.state, "unknown");
+        assert_eq!(legacy.state_evidence.as_deref(), Some("cache"));
+        assert!(legacy.stale);
+
+        let mut ready = account_for_evidence("ready", Some("inventory"));
+        apply_stale_account_evidence(&mut ready);
+        assert_eq!(ready.state, "ready");
+        assert_eq!(ready.state_evidence.as_deref(), Some("cache"));
+        assert!(ready.stale);
     }
 
     #[test]

@@ -1536,6 +1536,13 @@ impl ProxyGroupRuntime {
                             group_id = %slot.proxy_group(),
                             "per-account link committed"
                         );
+                        // §4.279: the commit takes a parked terminal number
+                        // over; the replaced account's slot and files must not
+                        // outlive the fresh link (an explicit delete already
+                        // discards its slot in the same call, so a parked
+                        // terminal slot with no store row is exactly the
+                        // takeover residue).
+                        self.reap_replaced_terminal_accounts(&summary.id).await;
                         Ok(summary)
                     }
                     Ok(summary) => {
@@ -1803,6 +1810,58 @@ impl ProxyGroupRuntime {
             handles.clear_account(account_id);
         }
         crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), account_id);
+    }
+
+    /// §4.279: reap what a re-link takeover replaced.
+    ///
+    /// The commit dropped the parked `device_unlinked` account's rows and
+    /// rebound the number to the freshly linked slot. The replaced account's
+    /// per-account engine slot, media handles, §4.197 file half, and
+    /// plaintext-backup residue must not outlive it — that slot can never
+    /// serve again (its credential is dead) and its directory is exactly the
+    /// stale data the re-link superseded.
+    ///
+    /// The scan is safe by construction: an explicit local-data delete
+    /// discards its slot in the same call, so a slot that still reports the
+    /// terminal `device_unlinked` verdict while holding **no** store row can
+    /// only be a replaced row (a store hiccup leaves the row in place and is
+    /// skipped). Idempotent: a second pass finds nothing.
+    async fn reap_replaced_terminal_accounts(&self, keep_account_id: &str) {
+        let Some(pool) = &self.pool else {
+            return;
+        };
+        for slot in pool.slots() {
+            let account_id = slot.account_id().to_string();
+            if account_id == keep_account_id {
+                continue;
+            }
+            if !slot.supervisor().account_is_device_unlinked(&account_id) {
+                continue;
+            }
+            match self.store.account_summary(&account_id) {
+                Ok(None) => {}
+                // The row is still there (or the store could not answer):
+                // nothing was taken over, never touch the slot.
+                Ok(Some(_)) | Err(_) => continue,
+            }
+            {
+                let service = self.router_service().lock().await;
+                service.clear_media_for_account(&account_id);
+            }
+            self.clear_account_delete_files(&account_id);
+            let store = Arc::clone(&self.store);
+            let scrub_id = account_id.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || store.finish_account_delete_residue(&scrub_id))
+                    .await;
+            pool.discard(&account_id, true).await;
+            self.forget_account_forwarders(&account_id);
+            tracing::info!(
+                account_id = %account_id,
+                replacement_account_id = %keep_account_id,
+                "a re-link reaped the replaced terminal account"
+            );
+        }
     }
 
     pub async fn delete_local_account(

@@ -1335,6 +1335,21 @@ impl AccountPool {
                             modified_instant(&entry.path()),
                             lock,
                         );
+                        // §4.279: seed the terminal latch from the store's
+                        // authoritative verdict, not only from a live event.
+                        // A connector restart discovers the dead slot cold; the
+                        // latch is what lets the re-link takeover reap exactly
+                        // this slot once the row has been replaced, and it
+                        // keeps the parked verdict honest before any wake.
+                        if config
+                            .store
+                            .account_summary(&slot.account_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|row| row.state == "device_unlinked")
+                        {
+                            slot.supervisor().note_device_unlinked();
+                        }
                         slots.insert(slot.account_id.clone(), slot);
                     }
                 }

@@ -2782,6 +2782,36 @@ impl ConnectorService {
                 "link commit accepted a code a rotation retired while the finish was in flight"
             );
         }
+        // Re-link takeover (§4.279, contract 1.292 follow-up): the number's
+        // row can still be parked in the terminal `device_unlinked` state —
+        // the host may have skipped its purge, or the purge failed. The store
+        // keeps exactly one row per number and keeps a terminal row on
+        // upsert, so leaving it in place let the pooled commit answer the OLD
+        // account and the registry roll the freshly linked device back with
+        // ACCOUNT_ALREADY_LINKED — after flipping the dead row to `ready`
+        // behind a parked engine (a zombie the desktop could never re-link).
+        // A fresh `link.finish` is the one explicit human intent the terminal
+        // state names ("link it again"), so the commit takes the number over:
+        // the dead rows go now, the files are reaped by the registry once the
+        // commit lands, and the pre-allocated slot owns the row. Only the
+        // pooled path carries a pre-allocated id; the legacy group engine
+        // keeps its immutable re-key behavior unchanged.
+        if let Some(preferred) = preferred_account_id
+            && let Some(existing) = self.store.account_by_signal(number)?
+            && existing.id != preferred
+            && self
+                .store
+                .account_summary(&existing.id)?
+                .is_some_and(|row| row.state == "device_unlinked")
+        {
+            self.store
+                .complete_account_delete_recorded(&existing.id, None, now_ms())?;
+            tracing::info!(
+                account_id = %existing.id,
+                replacement_account_id = %preferred,
+                "a re-link replaced a parked device_unlinked account row"
+            );
+        }
         // The binding is fixed here, at link.finish success, and immutable for
         // the life of the account (ADR 0001 R3).
         let summary = self.store.upsert_account_from_signal_with_id(
