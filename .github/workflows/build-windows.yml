@@ -181,7 +181,6 @@ jobs:
                       "sizeBytes": size,
                       "sha256": sha,
                       "primaryUrl": f"{BASE}/{VERSION}/kt-signal-connector-windows-x64.exe",
-                      "fallbackUrl": f"https://github.com/kt-im/kt-signal-connector/releases/download/connector-v{VERSION}/kt-signal-connector.exe",
                   }
               },
               # 与 engine 的契约区间：跟随已发布的 engine 记录；没有则用当前基线。
@@ -192,7 +191,9 @@ jobs:
           allowed = ('https://download.ktai.im/kt/signal-runtime/', 'https://github.com/kt-im/')
           for art in entry['artifacts'].values():
               for field in ('primaryUrl', 'fallbackUrl'):
-                  url = art[field]
+                  url = art.get(field)
+                  if url is None:
+                      continue
                   if not url.startswith(allowed):
                       raise SystemExit(f"FATAL: {field} not in allowlist: {url}")
 
