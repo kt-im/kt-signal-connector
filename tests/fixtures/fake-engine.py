@@ -401,7 +401,16 @@ SIGNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
 # carries one).
 try:
     (SIGNAL_DATA_DIR / ".fixture-env.json").write_text(
-        json.dumps({"KT_ENGINE_SINGLE_ACCOUNT": os.environ.get("KT_ENGINE_SINGLE_ACCOUNT")})
+        json.dumps(
+            {
+                "KT_ENGINE_SINGLE_ACCOUNT": os.environ.get("KT_ENGINE_SINGLE_ACCOUNT"),
+                # M6 C phase (contract revision 1.289, §4.275): the store key
+                # the connector handed this child. Present only when the
+                # connector derived one for this account; never for a legacy
+                # group engine, and never the connector's root key.
+                "KT_SIGNAL_STORE_KEY": os.environ.get("KT_SIGNAL_STORE_KEY"),
+            }
+        )
     )
 except OSError:
     pass

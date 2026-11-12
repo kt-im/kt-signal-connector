@@ -130,6 +130,16 @@ pub struct EngineConfig {
     /// the connector's own environment is never the child's authority on which
     /// topology it serves.
     pub single_account_guard: bool,
+    /// This child's own store-key decision (M6 C phase). `Account(key)` is
+    /// handed over as `KT_SIGNAL_STORE_KEY` in canonical 64-hex form — a pooled
+    /// slot's HKDF derivation **for that account**
+    /// (`store::engine_store_key_for_account`), never the root itself. The two
+    /// keyless states keep the engine on its plaintext legacy store and are not
+    /// the same thing: `RootKeyMissing` is a real downgrade (no root key is
+    /// configured, so nothing is derived from thin air), while
+    /// `GroupEngineNoAccountKey` is the deliberate legacy topology — one process
+    /// serving several accounts carries no single account's key.
+    pub store_key: crate::store::EngineStoreKey,
     pub line_limit: usize,
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -169,6 +179,7 @@ impl EngineConfig {
             data_dir,
             media_ingest: false,
             single_account_guard: false,
+            store_key: crate::store::EngineStoreKey::RootKeyMissing,
             line_limit: DEFAULT_UPSTREAM_LINE_LIMIT,
             history_cdn_base: None,
             request_timeout: Duration::from_secs(15),
@@ -2891,10 +2902,42 @@ impl EngineHandle {
             .stdin(Stdio::piped())
             .stdout(stdout_writer)
             .stderr(Stdio::piped())
-            // The dev/test store-key override must never leak into the child's
-            // environment (Phase 3: keys travel the bootstrap channel only).
-            .env_remove(crate::store::STORE_KEY_ENV)
             .kill_on_drop(true);
+        // M6 C phase: the child's store key is a connector decision, exactly
+        // like the single-account guard below — an inherited `KT_SIGNAL_STORE_KEY`
+        // (the dev/test override this process may itself be running on) is never
+        // the child's authority. A pooled slot hands over that account's own
+        // HKDF derivation; every keyless child removes the variable, so neither
+        // the root nor an account's key can stand for a process that serves
+        // several. The log line names the decision only, and the two keyless
+        // decisions stay distinct: `root_key_missing` is a downgrade the
+        // operator must see, `group_engine_no_account_key` is the legacy
+        // topology doing exactly what it promises. Neither the key nor the
+        // derivation is ever printed.
+        match &config.store_key {
+            crate::store::EngineStoreKey::Account(key) => {
+                let encoded = key.to_hex();
+                command.env(crate::store::STORE_KEY_ENV, encoded.as_str());
+                tracing::info!(
+                    engine_store_key = config.store_key.decision(),
+                    "engine child store key injected"
+                );
+            }
+            crate::store::EngineStoreKey::RootKeyMissing => {
+                command.env_remove(crate::store::STORE_KEY_ENV);
+                tracing::info!(
+                    engine_store_key = config.store_key.decision(),
+                    "engine child runs without a store key: no root key is configured"
+                );
+            }
+            crate::store::EngineStoreKey::GroupEngineNoAccountKey => {
+                command.env_remove(crate::store::STORE_KEY_ENV);
+                tracing::info!(
+                    engine_store_key = config.store_key.decision(),
+                    "legacy group engine carries no account store key"
+                );
+            }
+        }
         // The single-account guard is a connector decision, never something the
         // child inherits (P1 runtime isolation, contract revision 1.288
         // §4.274): armed pooled slots pin `=1`, every other engine removes the

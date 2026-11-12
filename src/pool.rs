@@ -203,6 +203,13 @@ pub struct EnginePoolConfig {
     pub single_account_guard: bool,
     /// Watchdog cadence override (tests); `None` keeps the production 30 s.
     pub watchdog_interval: Option<Duration>,
+    /// The connector's root store key, kept only as the HKDF root for each
+    /// account's engine key (M6 C phase). The root itself never reaches a child:
+    /// every slot derives `HKDF(salt = accountId, info =
+    /// store::ENGINE_STORE_KEY_INFO)` at build time. `None` means no root key is
+    /// configured — no slot gets one, the plaintext legacy engine store stands,
+    /// and the operator hears about it once.
+    pub root_store_key: Option<crate::store::StoreKey>,
 }
 
 /// One `runtime.status` `engines[]` entry (design §7.3, additive): the
@@ -851,6 +858,12 @@ fn build_slot(
     engine_config.media_ingest = config.media_ingest;
     engine_config.single_account_guard = config.single_account_guard;
     engine_config.expire_sweep_interval = config.expire_sweep_interval;
+    // M6 C phase: this slot's engine gets its own account's derivation of the
+    // connector root key, so two engines of the same connector never share key
+    // material. Without a root key the slot builds unkeyed (never a generated
+    // stand-in): the engine keeps its plaintext legacy store.
+    engine_config.store_key =
+        crate::store::engine_store_key_for_account(config.root_store_key.as_ref(), &account_id);
     if let Some(interval) = config.watchdog_interval {
         engine_config.watchdog_interval = interval;
     }
@@ -1086,6 +1099,7 @@ mod tests {
             policy: EnginePoolPolicy::default(),
             single_account_guard: false,
             watchdog_interval: None,
+            root_store_key: Some(StoreKey::from_bytes([0x5A; 32])),
         }
     }
 

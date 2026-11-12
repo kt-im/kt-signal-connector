@@ -3385,6 +3385,11 @@ pub fn open_group_runtime_with_options(
                 .to_string(),
         ));
     }
+    // M6 C phase: `Store::open` takes the root key over, but the per-account
+    // engine keys are HKDF derivations of it, so one clone survives as that root
+    // for as long as this runtime lives. It stays inside this process: a child
+    // only ever receives its own account's derivation.
+    let engine_store_root = store_key.clone();
     let store = Arc::new(Store::open(state_dir, store_key)?);
     let media_handles = std::sync::Arc::new(crate::media::MediaHandleTable::new());
     // §4.46: one process-wide backup file-handle table for every group —
@@ -3466,6 +3471,7 @@ pub fn open_group_runtime_with_options(
             policy: options.pool_policy.clone(),
             single_account_guard: options.single_account_guard,
             watchdog_interval: options.watchdog_interval,
+            root_store_key: engine_store_root,
         });
         if pool.len() > rows.len() {
             return Err(StoreError::EnginePoolInvalid(format!(
@@ -3519,6 +3525,14 @@ pub fn open_group_runtime_with_options(
         let mut config = EngineConfig::new(engine_bin.clone(), entry.data_dir.clone());
         config.media_ingest = media_ingest;
         config.expire_sweep_interval = expire_sweep_interval;
+        config.store_key = crate::store::EngineStoreKey::GroupEngineNoAccountKey;
+        // M6 C phase: a legacy group engine serves every account of its group
+        // from one process, so no single account's key may be injected here —
+        // one account's key would silently unlock another's store. The plaintext
+        // legacy store stands until the engine contract defines a group-scoped
+        // key; the decision is therefore the explicit
+        // `GroupEngineNoAccountKey` — not `RootKeyMissing`, which would claim
+        // the connector has no root key when it may well have one.
         if let Some(interval) = options.watchdog_interval {
             config.watchdog_interval = interval;
         }
@@ -3765,6 +3779,7 @@ mod tests {
             policy: crate::pool::EnginePoolPolicy::default(),
             single_account_guard: false,
             watchdog_interval: None,
+            root_store_key: Some(StoreKey::from_bytes([0x5A; 32])),
         });
         let slot = pool.provision_slot(DEFAULT_PROXY_GROUP_ID).unwrap();
         let runtime = ProxyGroupRuntime::full_pool_with_running(

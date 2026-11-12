@@ -3778,10 +3778,15 @@ secret, exactly 64 lowercase hexadecimal characters, unchanged; line 2 is the 32
 also exactly 64 lowercase hexadecimal characters, generated once by the desktop and persisted via
 Electron `safeStorage`. Read-and-delete (file) and zeroization (memory) cover both lines. The store
 key never crosses the socket, never enters the wire protocol or the schema, and is never logged;
-the connector holds it in `Zeroizing` memory only. `KT_SIGNAL_STORE_KEY` is a dev/test override and
-never set in production. A single-line legacy payload is still parsed, but without a store key the
-connector fails closed: an existing plaintext store is never opened without a key, and with no
-store at all startup is refused until the desktop generates and delivers the key (first run).
+the connector holds it in `Zeroizing` memory only. `KT_SIGNAL_STORE_KEY` is a dev/test override
+for the connector's **own process**, and the production connector process itself never has it set:
+it learns the key from bootstrap line 2, not from its environment. The same variable name is also
+the engine child's contract (contract 1.289, §4.275): for a pooled slot the connector injects that
+account's HKDF derivation into the child's environment, so a pooled engine process does carry
+`KT_SIGNAL_STORE_KEY` — its own account's derivation, never the root. A single-line legacy payload
+is still parsed, but without a store key the connector fails closed: an existing plaintext store is
+never opened without a key, and with no store at all startup is refused until the desktop generates
+and delivers the key (first run).
 
 The server sends a random
 32-byte hexadecimal `serverNonce`; KT answers with a random 32-byte hexadecimal `clientNonce` and:
@@ -21167,3 +21172,120 @@ signal-data 字节不变）、`src/store.rs` 单测（URI 转义、缺库返回�
 **桌面**：D1 传 `--per-account-engines` 与 `KT_ENGINE_SINGLE_ACCOUNT=1`，按
 `coldStarts` / `residentCap` 展示常驻预算；混合布局与被挡住的迁移文案直接复用本节的
 命令与字段。本仓不拥有桌面 UI，另报。
+
+## §4.275 M6 C 阶段（connector 半边）：按账号注入 engine store key（契约 1.289 · 无 wire 变更）
+
+**背景**：M6 是 engine 的 `accounts/lk-*/store.db` 静态加密（engine 侧记录见
+`kt-signal-engine/docs/plan/engine-store-encryption.md`）。C 之前的 connector 在 spawn 时
+**无条件**把 `KT_SIGNAL_STORE_KEY` 从子进程环境里删掉（Phase 3 的「key 只走 bootstrap
+通道」），engine 侧因此没有任何 key 输入。C 阶段把这条通道建起来：connector 不再「一律
+删掉」，而是**按账号决定**——派生一把只属于该账号的 key 注入，或者明确地不注入。engine
+契约是子进程 env `KT_SIGNAL_STORE_KEY`（32 字节，canonical 64 位小写 hex；engine 侧亦可
+接受 base64，connector 只发 hex 一种形态）。
+
+**实现（connector 半边）**：
+
+- **派生（零新增 crate）**：`store::derive_engine_store_key(root, accountId)` =
+  `HKDF-SHA256(ikm = root store key, salt = accountId, info =
+  "kt-signal-engine-store-key", L = 32)`。HKDF 用本仓既有的 `hmac` + `sha2` 手写
+  （RFC 5869 §2.2 extract + §2.3 expand；`HashLen = 32 = L`，因此只有一轮 expand），
+  未引入 `hkdf` 等新依赖。算法本身由 RFC 5869 A.1 官方向量自证（见测试）。
+  `root` 是 connector 自己那把 store key（bootstrap 第 2 行 / `KT_SIGNAL_STORE_KEY`
+  dev 覆盖），派生物与 `root` 不同，`root` 永不出本进程。
+- **注入点**：`EngineConfig.store_key` 是显式三态
+  `store::EngineStoreKey::{Account(key), RootKeyMissing, GroupEngineNoAccountKey}`；
+  `EngineHandle::start` 按状态决定子进程环境：`Account(k)` →
+  `env(KT_SIGNAL_STORE_KEY, k.to_hex())`，另外两态一律 `env_remove`。与单账号护栏同一
+  纪律：**子进程的 key 是 connector 的决定，不靠继承**，本进程被 dev 覆盖导出的变量不能
+  悄悄变成某个引擎的 key。
+- **池化槽位**：`pool::build_slot` 在装配 `EngineConfig` 时用 `accountId` 派生
+  （`EnginePoolConfig.root_store_key` 是唯一载体）。一账号一把、稳定（同一 root + 同一
+  账号恒等）且互不相同，所以一个账号的 key 解不开另一个账号的 engine store。
+- **legacy 组引擎不注入**：legacy 一个进程服务整组账号，「某个账号的 key」在这个进程里
+  等于把该账号的 key 摊给同组所有账号，因此 `registry` 的 legacy 分支显式装配
+  `GroupEngineNoAccountKey`（明文 legacy，与本节之前的行为一致）。组级 key 需要 engine
+  契约另行定义，本阶段不做，也不假装做了。这个状态**不是** `RootKeyMissing`：connector
+  很可能持有 root，只是不允许把它交给一个服务多账号的进程。
+- **未配置根密钥时绝不凭空造**：`store::engine_store_key_for_account(None, _)` 返回
+  `RootKeyMissing` 并 `warn` **一次**（进程级 `Once`），engine 侧保持无 key（明文
+  legacy）。如实记档：connector 自己的 `Store::open` 在无 key 时先 fail-closed
+  （`StoreKeyRequired` / `PlaintextStoreRequiresKey`），因此 `serve` 拓扑下这条分支今天
+  走不到——它是防御性的「不再静默启用」闸门，而不是一条可用的明文运行模式。
+- **日志纪律（三值，不合并）**：只记决定，不记材料。每个子进程一行 info，字段
+  `engine_store_key` 取三个值之一：`injected`（池化槽位拿到自己的派生，消息
+  `engine child store key injected`）、`group_engine_no_account_key`（legacy 组引擎有
+  root 也不注入，是拓扑决定，消息 `legacy group engine carries no account store key`）、
+  `root_key_missing`（确实没有 root，属降级，消息
+  `engine child runs without a store key: no root key is configured`）。旧实现把后两者
+  合并成 `not_configured`，于是在 connector 持有 root 的正常 legacy 拓扑上误报「未配置」
+  ——拆分后操作员能一眼分清「拓扑如此」与「真的缺 key」。
+  key、派生结果、指纹一律不打印。`StoreKey` 的 `Debug` 显式打码
+  （`StoreKey(<redacted>)`），避免哪天整份配置被 `{:?}` 带进日志；`to_hex()` 返回
+  `Zeroizing<String>`，交给 `Command::env` 之后即随作用域擦除。
+
+**回滚：engine C 上线后是单向门（如实记档）**：connector 侧本身不改任何落盘格式，但本阶段
+把 key 第一次送进 engine。engine C 上线后，它一旦把收到的 key 用于 `accounts/lk-*/store.db`，
+库就迁成加密形态——这件事不随 connector 回滚而回退。三条事实决定回滚只能向前：
+
+1. **不注入的 binary 打不开已加密的库**：C 之前的 binary 一律 `env_remove`，engine 拿到无
+   key，面对加密库是 fail-closed 终态（`StoreKeyRequired` / `Rejected`），不是明文回退，
+   也不会「下次启动再说」。
+2. **connector 侧没有可恢复副本**：root 从 bootstrap 第 2 行进入本进程，只在 `Zeroizing`
+   内存里；派生 key 只交给子进程 env，**root 与派生物都不落盘**。旧 binary 即使回滚也没有
+   任何路径把 key 重新送进 engine；本进程退出后 root 即消失（正常重启由桌面重新下发同一
+   root，但那需要桌面侧的持久副本还在）。
+3. **root 丢了整机都打不开**：所有账号的 engine key 都是 `HKDF(root, accountId)`，
+   root 是唯一 ikm；**connector 自己的 state-dir 库也用同一把 root 打开**
+   （`src/registry.rs` 打开组运行时传 root、无 key 是 `StoreKeyRequired`、换 root 是
+   `StoreKeyRejected`）。所以 root 一丢，connector 先起不来，engine 也逐个
+   `StoreKeyRequired` / `Rejected`——删 engine store 不够，必须连 state dir 一起重建，
+   代价是**该客户端全部账号**的本地历史与已下载媒体，而不是单个账号。
+
+**root key 从哪来、怎么持久化、丢了会怎样**：
+
+- **来源**：桌面（Electron Main）生成一次 32 字节随机 key，持久化在 `safeStorage`，作为
+  bootstrap payload 第 2 行下发给 connector。**每台客户端一份**，不是全局共享，也不经任何
+  服务端通道。
+- **持久化/备份**：权威副本只有桌面的 `safeStorage` 记录。因为 connector 侧没有任何落盘
+  副本，C 上线前必须另外留一份**独立备份**（受控凭据台账或离线保管），内容就是 64 位小写
+  hex 的 **root**；不要备份派生值——派生值可由 root + accountId 重算，单存派生对别的账号
+  无用，还会让人误以为「有备份」。备份不进仓库、不进日志、不进工单附件/截图。
+- **取回**：从桌面 `safeStorage` 读回，或从上述独立备份按客户端实例取出 root，再由桌面按
+  正常 bootstrap 通道下发；connector 侧没有取回工具，也不会从派生结果反推 root。
+- **丢失后果**：见上第 3 条——该客户端所有已加密库（connector state dir + 每个账号的
+  engine store）永久不可开，唯一出路是重建 state dir 与 engine store 并逐个重新 link，
+  丢**全部账号**的本地历史与媒体。因此 root 的独立备份是 C 上线的**前置条件**，不是可选项。
+
+**回滚选项（只有前向）**：回滚目标必须是 ≥ C 的 binary（继续按账号注入）；或者接受 engine
+停摆；或者接受重建 state dir + engine store 并逐个重新 link（有全量数据损失）。没有
+「回滚成明文」这条路，也没有「只删 engine store 就够」这条路。
+
+**测试**：`tests/engine_store_key.rs`（新测试二进制，自带一次性日志捕获订阅器）——
+两个账号的池化子进程各自拿到**自己**的派生（等于 `HKDF(root, accountId)`、64 位小写 hex、
+不等于 root）、两把 key 不同、每个子进程的环境里都**没有**兄弟账号的 key 也没有 root；
+`kill -9` 掉一个槽位后 watchdog 重启的子进程仍拿到同一把（稳定）；legacy 组引擎即便
+connector 持有 root 也**不带**任何账号 key，且日志值必须是 `group_engine_no_account_key`，
+不得是 `root_key_missing`，也不得再出现旧的合并值 `not_configured`；无 root 时
+`engine_store_key_for_account` 返回 `RootKeyMissing`、警告只发一次且字段值为
+`root_key_missing`；整个过程捕获的日志里既无 root 也无任何派生 key。
+
+`tests/engine_store_key_inheritance.rs`（独立测试二进制，照 `tests/engine_child_env.rs` 的
+范式）：父进程 `set_var(KT_SIGNAL_STORE_KEY, root_hex)` 先导出 root，再开两种拓扑并读子进程
+探针——池化子进程拿到的是自己的派生（且不等于 root），legacy 子进程该变量为 `null`。
+父进程的导出是这条断言的前提：不导出时 legacy 的 `null` 只证明「父进程本来也没有」，测试
+是空转的。同一测试还直接驱动 `EngineHandle::start` + `RootKeyMissing`（`serve` 拓扑在无
+key 时先被 connector 自己的 store fail-closed 挡住，走不到这条分支），断言这个防御性缺省
+同样不继承 root。变异验证（手工执行，未留进代码）：删掉 legacy 分支的 `env_remove` →
+探针里出现 root，测试红；删掉池化分支的 `env()` → 子进程回落到继承的 root，测试红；
+删掉 `RootKeyMissing` 分支的 `env_remove` → 同上，测试红。
+
+`src/store.rs` 单测：HKDF-SHA256 对齐 RFC 5869 A.1 向量、同账号派生恒等 / 跨账号不等 /
+不等于 root / 64 位小写 hex、`StoreKey` 的 `Debug` 打码、三个 `engine_store_key` 日志值
+与本节的字面量一致（防止文档承诺与代码漂移）。
+`tests/engine_child_env.rs`、`tests/runtime_isolation.rs` 同时覆盖「子进程 env 由 connector
+显式决定、不靠继承」的同一纪律（护栏面），本阶段不改变它们的断言。
+
+**边界（如实记档）**：本阶段只交付 connector 半边与 engine 的 env 契约；engine 侧的
+「没有 key 就不工作」硬语义、明文 → SQLCipher 迁移、fail-closed 锚词都在 engine 仓，另报。
+root key 的生成、持久化、备份与取回都在桌面/运维侧，connector 只做通道，不持有任何可恢复
+副本。legacy 组引擎的组级 key 不在本阶段范围内。

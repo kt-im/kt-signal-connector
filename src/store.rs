@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, Once};
 use std::time::{Duration, SystemTime};
 
+use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -172,6 +173,10 @@ pub enum ReceiptResupply {
 const SQLITE_PLAINTEXT_HEADER: &[u8; 16] = b"SQLite format 3\0";
 /// Dev/test key override (optimization-plan Phase 3 contract): production keys
 /// arrive over the bootstrap secret channel, never through the environment.
+/// The same name is also the **engine child's** contract (M6 C phase): the
+/// connector injects that child's own per-account derivation there, so the
+/// variable is a seam on both sides of the boundary — dev/test on this side,
+/// the engine's store-key input on the other. The root key never rides it.
 pub const STORE_KEY_ENV: &str = "KT_SIGNAL_STORE_KEY";
 
 /// §4.123 auto send-retry queue constants. The window and the backoff curve
@@ -1051,9 +1056,18 @@ const STORE_KEY_BYTES: usize = 32;
 /// The 32-byte SQLCipher store key (optimization-plan Phase 3 contract). Owned
 /// by the desktop, delivered as line 2 of the bootstrap payload, held only in
 /// zeroizing memory, and never logged, persisted, or sent over the socket.
-#[derive(Zeroize)]
+#[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct StoreKey([u8; STORE_KEY_BYTES]);
+
+impl std::fmt::Debug for StoreKey {
+    /// Redacted on purpose. A derived `Debug` on key material is how a key ends
+    /// up in a log line the first time someone prints a whole configuration
+    /// struct; the shape of the value is public knowledge, the value never is.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoreKey(<redacted>)")
+    }
+}
 
 impl StoreKey {
     pub fn from_bytes(bytes: [u8; STORE_KEY_BYTES]) -> Self {
@@ -1081,6 +1095,21 @@ impl StoreKey {
     fn raw_key_spec(&self) -> Zeroizing<String> {
         Zeroizing::new(format!("x'{}'", hex::encode(self.0)))
     }
+
+    /// HKDF-SHA256 derivation from this key (RFC 5869). The result is key
+    /// material in its own right and carries the same zeroize-on-drop
+    /// discipline; the root is never weakened by having been derived from.
+    pub fn derive(&self, salt: &[u8], info: &[u8]) -> Self {
+        Self(hkdf_sha256(&self.0, salt, info))
+    }
+
+    /// Canonical encoding: exactly 64 lowercase hexadecimal characters — the
+    /// engine child's env form (M6 C phase) and the same shape the bootstrap
+    /// channel already uses. Zeroized on drop: the caller hands it to
+    /// `Command::env` and drops it.
+    pub fn to_hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(self.0))
+    }
 }
 
 /// Dev/test override only: read the store key from `KT_SIGNAL_STORE_KEY`.
@@ -1092,6 +1121,99 @@ pub fn store_key_from_env() -> Result<Option<StoreKey>, StoreKeyError> {
         Err(std::env::VarError::NotUnicode(_)) => return Err(StoreKeyError::Invalid),
     };
     Ok(Some(StoreKey::from_hex(&value)?))
+}
+
+/// HKDF `info` for the per-account engine store key (M6 C phase). Changing
+/// this literal changes every derived engine key, so it is a fixed contract
+/// word, not a log label: the engine child receives only its derivation.
+pub const ENGINE_STORE_KEY_INFO: &[u8] = b"kt-signal-engine-store-key";
+
+/// HKDF-SHA256 (RFC 5869) written with the crate's existing `hmac`/`sha2`
+/// primitives — no new dependency. Only a 32-byte output is ever needed, and
+/// `HashLen = 32 = L`, so exactly one expand round is generated
+/// (`T(1) = HMAC(PRK, info || 0x01)`).
+fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; STORE_KEY_BYTES] {
+    let mut extract = Hmac::<Sha256>::new_from_slice(salt).expect("HMAC accepts any key length");
+    extract.update(ikm);
+    let prk = extract.finalize().into_bytes();
+    let mut expand = Hmac::<Sha256>::new_from_slice(&prk).expect("HMAC accepts any key length");
+    expand.update(info);
+    expand.update(&[1]);
+    let mut key = [0_u8; STORE_KEY_BYTES];
+    key.copy_from_slice(&expand.finalize().into_bytes());
+    key
+}
+
+/// The engine's own store key for one account: HKDF with **salt = accountId**
+/// and `info = ENGINE_STORE_KEY_INFO` over the connector's root store key.
+/// Stable for the same (root, accountId) pair and different across accounts,
+/// which is what makes one account's key useless against another account's
+/// engine store.
+pub fn derive_engine_store_key(root: &StoreKey, account_id: &str) -> StoreKey {
+    root.derive(account_id.as_bytes(), ENGINE_STORE_KEY_INFO)
+}
+
+/// The store-key decision for one engine child (M6 C phase). Three outcomes,
+/// deliberately distinguishable in the logs, because "no key" means two
+/// different things and only one of them is a downgrade:
+///
+/// - `Account(key)`: a pooled slot's own HKDF derivation — the only state in
+///   which `KT_SIGNAL_STORE_KEY` reaches a child;
+/// - `RootKeyMissing`: the connector holds no root key at all, so no derivation
+///   exists and none is invented (the engine keeps its plaintext legacy store);
+/// - `GroupEngineNoAccountKey`: a legacy proxy-group engine serves every account
+///   of its group from one process, so no single account's key may ride along
+///   even though a root key exists.
+///
+/// Collapsing the last two into one `not_configured` line told an operator who
+/// does have a root key that the key was missing: the distinction is exactly
+/// the difference between a deliberate topology and a real downgrade.
+#[derive(Clone, Debug)]
+pub enum EngineStoreKey {
+    Account(StoreKey),
+    RootKeyMissing,
+    GroupEngineNoAccountKey,
+}
+
+impl EngineStoreKey {
+    /// The `engine_store_key` log value for this decision (contract revision
+    /// 1.289 §4.275). A label, never key material — the key and every
+    /// derivation stay out of every log line.
+    pub fn decision(&self) -> &'static str {
+        match self {
+            Self::Account(_) => "injected",
+            Self::RootKeyMissing => "root_key_missing",
+            Self::GroupEngineNoAccountKey => "group_engine_no_account_key",
+        }
+    }
+}
+
+/// The per-account `KT_SIGNAL_STORE_KEY` decision (M6 C phase). With a root
+/// key the account gets exactly its own derivation; without one nothing is
+/// invented, and the operator is told once per process that the engine stays on
+/// the plaintext legacy store. A legacy group engine never calls this: several
+/// accounts behind one process is `GroupEngineNoAccountKey`, and a group-scoped
+/// key needs an engine contract that does not exist yet.
+pub fn engine_store_key_for_account(root: Option<&StoreKey>, account_id: &str) -> EngineStoreKey {
+    match root {
+        Some(root) => EngineStoreKey::Account(derive_engine_store_key(root, account_id)),
+        None => {
+            warn_engine_store_key_unconfigured_once();
+            EngineStoreKey::RootKeyMissing
+        }
+    }
+}
+
+/// One warning per process: an unkeyed engine is announced, never a silent
+/// downgrade — and the line carries no key material of any kind.
+fn warn_engine_store_key_unconfigured_once() {
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            engine_store_key = EngineStoreKey::RootKeyMissing.decision(),
+            "no root store key is configured; engine children stay on the plaintext legacy store"
+        );
+    });
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -31429,6 +31551,69 @@ mod tests {
         assert!(StoreKey::from_hex(&valid[..62]).is_err());
         assert!(StoreKey::from_hex(&valid.to_uppercase()).is_err());
         assert!(StoreKey::from_hex(&format!("{valid}\n")).is_err());
+    }
+
+    /// RFC 5869 A.1 (HKDF-SHA256): the first 32 bytes of the published OKM are
+    /// this crate's whole expand round (`L = 32`, so `T(1)` is that prefix).
+    #[test]
+    fn hkdf_sha256_matches_rfc_5869_test_vector() {
+        let ikm = [0x0b_u8; 22];
+        let salt = hex::decode("000102030405060708090a0b0c").unwrap();
+        let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        assert_eq!(
+            hex::encode(hkdf_sha256(&ikm, &salt, &info)),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+        );
+    }
+
+    /// M6 C phase: one account's engine key is stable for that account and
+    /// unusable as another account's key — including the root it came from.
+    #[test]
+    fn engine_store_key_is_stable_per_account_and_distinct_across_accounts() {
+        let root = test_store_key();
+        let account_a = format!("{:032x}", 1);
+        let account_b = format!("{:032x}", 2);
+        let first = derive_engine_store_key(&root, &account_a);
+        let again = derive_engine_store_key(&root, &account_a);
+        let other = derive_engine_store_key(&root, &account_b);
+        assert_eq!(first.to_hex().as_str(), again.to_hex().as_str());
+        assert_ne!(first.to_hex().as_str(), other.to_hex().as_str());
+        assert_ne!(first.to_hex().as_str(), root.to_hex().as_str());
+        let encoded = first.to_hex();
+        assert_eq!(encoded.len(), STORE_KEY_BYTES * 2);
+        assert!(
+            encoded
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        );
+    }
+
+    /// Nothing in this crate may print key material: the derived `Debug` would.
+    #[test]
+    fn store_key_debug_is_redacted() {
+        let key = test_store_key();
+        let rendered = format!("{key:?}");
+        assert_eq!(rendered, "StoreKey(<redacted>)");
+        assert!(!rendered.contains(key.to_hex().as_str()));
+    }
+
+    /// The three `engine_store_key` log values are a documented contract
+    /// (§4.275): an operator greps them, so they are pinned here and not only in
+    /// the integration test that reads the captured lines.
+    #[test]
+    fn engine_store_key_decisions_are_the_documented_log_values() {
+        assert_eq!(
+            EngineStoreKey::Account(test_store_key()).decision(),
+            "injected"
+        );
+        assert_eq!(
+            EngineStoreKey::RootKeyMissing.decision(),
+            "root_key_missing"
+        );
+        assert_eq!(
+            EngineStoreKey::GroupEngineNoAccountKey.decision(),
+            "group_engine_no_account_key"
+        );
     }
 
     #[test]
