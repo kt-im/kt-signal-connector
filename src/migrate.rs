@@ -95,6 +95,11 @@ pub struct MigrationEntry {
     pub account_id: String,
     pub proxy_group: String,
     pub action: String,
+    /// Terminal intent for the row, when the action name alone is ambiguous
+    /// (e.g. a quarantined slot that still lets the connector start). Additive:
+    /// older consumers ignore the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 /// How the signal data directory is laid out right now (contract revision
@@ -602,6 +607,7 @@ fn migrate_account(
             account_id: row.id.clone(),
             proxy_group: row.proxy_group.clone(),
             action: "alreadyMigrated".to_string(),
+            outcome: None,
         });
     }
 
@@ -660,6 +666,7 @@ fn migrate_account(
             account_id: row.id.clone(),
             proxy_group: row.proxy_group.clone(),
             action: "unprovisioned".to_string(),
+            outcome: None,
         });
     };
     let Some(relative) = entry.dir.as_deref() else {
@@ -698,6 +705,7 @@ fn migrate_account(
             account_id: row.id.clone(),
             proxy_group: row.proxy_group.clone(),
             action: "wouldMigrate".to_string(),
+            outcome: None,
         });
     }
 
@@ -782,6 +790,7 @@ fn migrate_account(
         account_id: row.id.clone(),
         proxy_group: row.proxy_group.clone(),
         action: "migrated".to_string(),
+        outcome: None,
     })
 }
 
@@ -834,6 +843,12 @@ fn reconcile_orphans(
                 if let Err(error) = fs::rename(&path, &target) {
                     return Err(pool_invalid_io(error));
                 }
+                report.entries.push(MigrationEntry {
+                    account_id: name.clone(),
+                    proxy_group: String::new(),
+                    action: "quarantine".to_string(),
+                    outcome: Some("quarantined".to_string()),
+                });
                 tracing::warn!(
                     target: "connector.pool",
                     // The invariant witness: a slot that holds credentials
@@ -850,16 +865,20 @@ fn reconcile_orphans(
                 );
                 continue;
             }
-            return Err(pool_invalid(format!(
-                "engine slot {} has credentials but no account row; refusing to start",
-                name
-            )));
+            report.entries.push(MigrationEntry {
+                account_id: name,
+                proxy_group: String::new(),
+                action: "quarantine".to_string(),
+                outcome: Some("would-continue".to_string()),
+            });
+            continue;
         }
         if dry_run {
             report.entries.push(MigrationEntry {
                 account_id: name,
                 proxy_group: String::new(),
                 action: "wouldRemoveOrphan".to_string(),
+                outcome: None,
             });
             continue;
         }
@@ -870,6 +889,7 @@ fn reconcile_orphans(
             account_id: name,
             proxy_group: String::new(),
             action: "removedOrphan".to_string(),
+            outcome: None,
         });
     }
     Ok(())
@@ -1437,6 +1457,58 @@ mod tests {
     /// removed; a directory that still carries credentials with no account
     /// row is a leaked link-attempt slot and is quarantined (bytes stay
     /// auditable, never a live slot) instead of blocking startup.
+    #[test]
+    fn dry_run_reports_the_same_quarantine_it_would_apply() {
+        // 双向诚实（11-11 dry-run 谎报案立的规矩）：apply 会隔离后继续，
+        // dry-run 必须报同一件事，不能用 Err 把人吓退。
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("signal-data");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&root).unwrap();
+        let store = test_store(&state_dir);
+        let orphan = root.join(ENGINE_SLOT_SUBDIR).join(account_id(8));
+        fs::create_dir_all(orphan.join(ACCOUNTS_DIR).join("lk-eight")).unwrap();
+        fs::write(
+            orphan
+                .join(ACCOUNTS_DIR)
+                .join("lk-eight")
+                .join(STORE_DB_FILE),
+            b"credentials",
+        )
+        .unwrap();
+        fs::write(
+            orphan.join(STATE_FILE),
+            serde_json::to_vec_pretty(&json!({
+                "version": 2,
+                "accounts": [{"number": "+15550000008", "dir": "accounts/lk-eight"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = run(&store, &root, &state_dir, true, 8)
+            .expect("a dry run must not turn a recoverable quarantine into an error");
+        let entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.account_id == account_id(8))
+            .expect("the leaked slot appears in the dry-run plan");
+        assert_eq!(entry.action, "quarantine");
+        assert_eq!(entry.outcome.as_deref(), Some("would-continue"));
+        assert!(orphan.exists(), "a dry run never moves bytes");
+
+        let applied =
+            run(&store, &root, &state_dir, false, 8).expect("apply quarantines and continues");
+        let applied_entry = applied
+            .entries
+            .iter()
+            .find(|entry| entry.account_id == account_id(8))
+            .expect("apply reports the quarantine too");
+        assert_eq!(applied_entry.action, "quarantine");
+        assert_eq!(applied_entry.outcome.as_deref(), Some("quarantined"));
+        assert!(!orphan.exists());
+    }
+
     #[test]
     fn removes_empty_orphans_and_quarantines_orphan_credentials() {
         let temp = TempDir::new().unwrap();
