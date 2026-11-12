@@ -1652,12 +1652,18 @@ impl AccountPool {
     ///    finds nothing and answers [`LinkReclaimOutcome::AlreadySettled`]);
     /// 2. refuse to touch a slot a committed account row already owns
     ///    (promotion wins any race with a late cleanup);
-    /// 3. stop the engine process through [`Self::discard_with`] (slot map
+    /// 3. ask the engine once — one bounded, read-only `listAccounts` — whether
+    ///    the provisioning completed after all (BUG-1 soften): the engine
+    ///    registers an account only after the phone approval committed, so a
+    ///    listed number materializes the missing account row and promotes the
+    ///    slot. A failed, unsupported or timed-out probe falls through: the
+    ///    pre-softening reclaim is unchanged;
+    /// 4. stop the engine process through [`Self::discard_with`] (slot map
     ///    removal, session-map purge, supervisor shutdown);
-    /// 4. delete the directory when it holds no credentials, or move it into
+    /// 5. delete the directory when it holds no credentials, or move it into
     ///    `engines/.quarantine-<id>-<token>` when it does (auditable bytes,
     ///    never a live slot);
-    /// 5. the sidecar and every session mapping for the slot are cleared.
+    /// 6. the sidecar and every session mapping for the slot are cleared.
     pub async fn reclaim_link_attempt(self: &Arc<Self>, attempt_id: &str) -> LinkReclaimOutcome {
         let lease = self
             .leases
@@ -1688,6 +1694,40 @@ impl AccountPool {
                 account = %account_fingerprint(&lease.account_id),
                 "link attempt lease was promoted: a committed account row owns the slot"
             );
+            return LinkReclaimOutcome::Promoted;
+        }
+        // BUG-1 softening: the engine may have committed the link after the
+        // connector's finish budget expired — the phone approved under the
+        // engine's own deadline, but the answer never reached this process.
+        // Before calling the slot abandoned, ask the engine **once**: a
+        // bounded, read-only `listAccounts`. The engine registers an account
+        // only after its provisioning flow wrote the registration and the
+        // commit landed, so a listed number is the durable proof the connector
+        // is missing. A completed link is promoted: the account row is
+        // materialized through the same sync the account list uses, the slot
+        // is marked provisioned (sidecar included) and the credential-bearing
+        // directory stays exactly where it is. A failed, unsupported or
+        // timed-out probe keeps the pre-softening reclaim.
+        let probe_budget = self.config.policy.list_accounts_budget;
+        if let Some(account) = slot
+            .supervisor()
+            .adopt_engine_completed_link(probe_budget)
+            .await
+        {
+            tracing::info!(
+                target: "connector.pool",
+                account = %account_fingerprint(&lease.account_id),
+                engine_account = %account.id,
+                budget_ms = probe_budget.as_millis().min(u64::MAX as u128) as u64,
+                "link attempt lease was promoted: the engine reports the provisioning completed"
+            );
+            if let Ok(mut sessions) = self.sessions.lock() {
+                // The finish session is spent: no host call may route to this
+                // slot through the pre-commit link id any more.
+                sessions.retain(|_, owner| owner != &lease.account_id);
+            }
+            self.mark_provisioned(&slot);
+            self.note_activity(&slot);
             return LinkReclaimOutcome::Promoted;
         }
         let credentials = slot_has_credentials(&slot);

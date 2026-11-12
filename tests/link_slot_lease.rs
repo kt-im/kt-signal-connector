@@ -42,6 +42,14 @@ fn key() -> StoreKey {
 }
 
 fn open_pool(temp: &TempDir) -> Arc<ProxyGroupRuntime> {
+    open_pool_with_list_budget(temp, Duration::from_secs(3))
+}
+
+/// Same runtime assembly with an explicit `listAccounts` budget: the
+/// post-commit probe reuses the pool policy's bound (one knob for every
+/// engine account list the connector issues), so the probe-timeout case can
+/// shrink it instead of waiting out the production budget.
+fn open_pool_with_list_budget(temp: &TempDir, list_budget: Duration) -> Arc<ProxyGroupRuntime> {
     let signal_data = temp.path().join("signal-data");
     fs::create_dir_all(&signal_data).unwrap();
     let plan = groups::build_group_plan(&[], None, None, &signal_data).unwrap();
@@ -60,13 +68,29 @@ fn open_pool(temp: &TempDir) -> Arc<ProxyGroupRuntime> {
                 max_engines: 8,
                 max_resident: 8,
                 shutdown_budget: Duration::from_secs(8),
-                list_accounts_budget: Duration::from_secs(3),
+                list_accounts_budget: list_budget,
                 demote_idle_after: Duration::from_secs(60),
             },
             watchdog_interval: Some(Duration::from_millis(50)),
         },
     )
     .unwrap()
+}
+
+/// How many `listAccounts` requests this slot's engine actually received.
+/// The fixture appends one line per request beside the slot (the slot's own
+/// data directory does not survive a reclaim). The reclaim probe is one of
+/// them; an assertion of "at least one" proves the soften path asked the
+/// engine instead of tearing the slot down blindly.
+fn list_account_calls(temp: &TempDir, account: &str) -> usize {
+    let path = temp
+        .path()
+        .join("signal-data")
+        .join("engines")
+        .join(format!(".fixture-list-accounts-calls-{account}"));
+    fs::read_to_string(path)
+        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0)
 }
 
 /// Restores an env var the fake engine reads at spawn time, even when the
@@ -358,6 +382,160 @@ async fn a_committed_link_is_promoted_never_deleted() {
     assert!(pool.link_lease("late-cleanup-attempt").is_none());
     assert_eq!(pool.open_link_leases(), 0);
     assert_eq!(engines_count(&status_value(&runtime).await), 1);
+    runtime.shutdown().await.unwrap();
+}
+
+/// BUG-1 softening, arm 1 — the engine committed the link, the connector's
+/// finish budget expired first. The reclaim must ask the engine once (one
+/// bounded, read-only `listAccounts`) and **promote** the provisioned slot:
+/// the missing account row is materialized, the credential-bearing directory
+/// and its engine stay, and nothing is quarantined.
+#[tokio::test]
+async fn a_finish_timeout_after_the_engine_commit_promotes_the_provisioned_slot() {
+    let _guard = LINK_LEASE_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let _timeout = EnvGuard::set("KT_FAKE_FINISH_ENGINE_TIMEOUT", "1");
+    let _committed = EnvGuard::set("KT_FAKE_FINISH_TIMEOUT_AFTER_COMMIT", "1");
+    let runtime = open_pool(&temp);
+    runtime.start().await.expect("an empty pool starts");
+    let (attempt, session, account) = start_link(&runtime, "lease-provisioned-device").await;
+
+    let error = runtime
+        .finish_link(session)
+        .await
+        .expect_err("the engine's dispatch budget expires before its answer");
+    assert_eq!(error.into_api().code, "LINK_OUTCOME_UNKNOWN");
+
+    // The reclaim asked the engine before touching the slot (the fixture
+    // records every listAccounts request in this slot's own data dir).
+    assert!(
+        list_account_calls(&temp, &account) >= 1,
+        "the reclaim must ask the engine whether provisioning completed"
+    );
+    // Promoted, not reclaimed: the account row the connector never wrote now
+    // exists (store-only read — this call must not materialize it itself)...
+    assert_eq!(
+        runtime.account_state(&account).await.expect("store read"),
+        Some("ready"),
+        "a completed provisioning is materialized into an account row"
+    );
+    // ...the slot, its directory and its engine all stay...
+    let dir = data_dir(&temp, &account);
+    assert!(dir.is_dir(), "a promoted slot keeps its directory");
+    let pool = runtime.account_pool().expect("full pooling");
+    let slot = pool
+        .get(&account)
+        .expect("the promoted slot stays resident");
+    assert!(
+        slot.is_provisioned(),
+        "the promoted slot carries the durable provisioned marker"
+    );
+    assert_eq!(pool.open_link_leases(), 0, "the attempt was settled");
+    assert!(
+        !has_quarantine(&temp),
+        "a completed provisioning must never be quarantined"
+    );
+    assert_eq!(
+        engines_count(&status_value(&runtime).await),
+        1,
+        "the promoted slot keeps its engine"
+    );
+    // The host's account list answers the same row (with the engine's ACI).
+    let accounts = runtime.list_accounts().await.expect("account list");
+    let row = accounts
+        .iter()
+        .find(|row| row.id == account)
+        .expect("the promoted account rides the account list");
+    assert_eq!(row.state, "ready");
+    assert!(
+        row.aci.is_some(),
+        "the engine's own ACI rides the promoted row"
+    );
+    // Idempotent: the settled attempt reclaims nothing further.
+    assert_eq!(
+        pool.reclaim_link_attempt(&attempt).await,
+        LinkReclaimOutcome::AlreadySettled
+    );
+    assert!(dir.is_dir());
+    runtime.shutdown().await.unwrap();
+}
+
+/// BUG-1 softening, arm 2 — the probe cannot answer (the engine refuses the
+/// read call). The pre-softening reclaim stays: the slot is torn down and no
+/// account row is invented from a failed query.
+#[tokio::test]
+async fn a_failed_provisioning_probe_keeps_the_reclaim() {
+    let _guard = LINK_LEASE_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let _timeout = EnvGuard::set("KT_FAKE_FINISH_ENGINE_TIMEOUT", "1");
+    let _fail = EnvGuard::set("KT_FAKE_LIST_ACCOUNTS_FAIL", "1");
+    let runtime = open_pool(&temp);
+    runtime.start().await.expect("an empty pool starts");
+    let (attempt, session, account) = start_link(&runtime, "lease-probe-failure-device").await;
+
+    let error = runtime
+        .finish_link(session)
+        .await
+        .expect_err("the finish budget expires before the engine answers");
+    assert_eq!(error.into_api().code, "LINK_OUTCOME_UNKNOWN");
+
+    // The probe was attempted (the reclaim is not allowed to skip the query),
+    // and its failure kept the pre-softening teardown.
+    assert!(
+        list_account_calls(&temp, &account) >= 1,
+        "the reclaim must still ask the engine before tearing the slot down"
+    );
+    assert_zero_orphan_slot(&runtime, &temp, &attempt, &account).await;
+    assert!(
+        !has_quarantine(&temp),
+        "a credential-less slot is deleted, not quarantined"
+    );
+    assert!(
+        runtime
+            .list_accounts()
+            .await
+            .expect("account list")
+            .is_empty(),
+        "a failed probe must not materialize an account row"
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+/// BUG-1 softening, arm 3 — the probe never answers. Its budget must expire
+/// **inside** the reclaim (the link path must not stretch), and the slot is
+/// still torn down: an unbounded query would be a liveness bug of its own.
+#[tokio::test]
+async fn a_hung_provisioning_probe_expires_and_keeps_the_reclaim() {
+    let _guard = LINK_LEASE_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let _timeout = EnvGuard::set("KT_FAKE_FINISH_ENGINE_TIMEOUT", "1");
+    let _hang = EnvGuard::set("KT_FAKE_LIST_ACCOUNTS_HANG", "1");
+    // Short listAccounts budget: the probe reuses the pool policy's bound, so
+    // this test shrinks it instead of waiting out the production budget.
+    let runtime = open_pool_with_list_budget(&temp, Duration::from_millis(250));
+    runtime.start().await.expect("an empty pool starts");
+    let (attempt, session, account) = start_link(&runtime, "lease-probe-timeout-device").await;
+
+    let started = std::time::Instant::now();
+    let error = runtime
+        .finish_link(session)
+        .await
+        .expect_err("the finish budget expires before the engine answers");
+    let elapsed = started.elapsed();
+    assert_eq!(error.into_api().code, "LINK_OUTCOME_UNKNOWN");
+    assert!(
+        list_account_calls(&temp, &account) >= 1,
+        "the reclaim must still ask the engine before tearing the slot down"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the probe is bounded and must not stall the reclaim: {elapsed:?}"
+    );
+    assert_zero_orphan_slot(&runtime, &temp, &attempt, &account).await;
+    assert!(
+        !has_quarantine(&temp),
+        "a credential-less slot is deleted, not quarantined"
+    );
     runtime.shutdown().await.unwrap();
 }
 

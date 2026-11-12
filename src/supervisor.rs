@@ -430,6 +430,47 @@ fn arm_pending_restart(pending: &mut Option<PendingRestart>, candidate: PendingR
     true
 }
 
+/// One `listAccounts` answer projected for the store sync: each entry's
+/// number, its optional own-ACI (contract 1.142 §4.138: the engine reports
+/// the account's identity beside the number; the connector never invents one
+/// from the opaque local row id), and the optional own-profile capabilities
+/// bit (contract 1.194 §4.194: only the backfill bit the desktop gate
+/// consumes rides; absent/ill-typed = absent, never folded to false).
+///
+/// A non-array answer projects to no rows: an engine that answers the wrong
+/// shape is "could not report an account", never an empty-but-valid list.
+fn project_engine_account_rows(
+    result: &Value,
+) -> Vec<(
+    String,
+    Option<String>,
+    Option<crate::store::AccountCapabilities>,
+)> {
+    result
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let number = item.get("number")?.as_str()?;
+                    let capabilities = item
+                        .get("capabilities")
+                        .and_then(|caps| caps.get("attachmentBackfill"))
+                        .and_then(Value::as_bool)
+                        .map(|attachment_backfill| crate::store::AccountCapabilities {
+                            attachment_backfill,
+                        });
+                    Some((
+                        number.to_string(),
+                        item.get("aci").and_then(Value::as_str).map(str::to_string),
+                        capabilities,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 /// The engine's own account list as a number set, or `None` when the engine
 /// could not answer (or answered a shape that is not an array). Unverified
 /// is deliberately NOT the same as "no accounts": the caller must never
@@ -2988,33 +3029,7 @@ impl RuntimeSupervisor {
             .call("listAccounts", json!({}), CallClass::ReadOnly)
             .await
         {
-            Ok(result) => result
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| {
-                            let number = item.get("number")?.as_str()?;
-                            // Contract 1.194 (§4.194): the engine's own-profile
-                            // capabilities projection. Only the backfill bit the
-                            // desktop gate consumes rides; absent/ill-typed =
-                            // absent (honest unknown, never folded to false).
-                            let capabilities = item
-                                .get("capabilities")
-                                .and_then(|caps| caps.get("attachmentBackfill"))
-                                .and_then(Value::as_bool)
-                                .map(|attachment_backfill| crate::store::AccountCapabilities {
-                                    attachment_backfill,
-                                });
-                            Some((
-                                number.to_string(),
-                                item.get("aci").and_then(Value::as_str).map(str::to_string),
-                                capabilities,
-                            ))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
+            Ok(result) => project_engine_account_rows(&result),
             Err(_) => {
                 let rows = self
                     .service
@@ -3046,6 +3061,55 @@ impl RuntimeSupervisor {
         self.backfill_memo_identities(&accounts).await;
         let _ = engine;
         Ok(accounts)
+    }
+
+    /// BUG-1 softening: one bounded, read-only `listAccounts` probe the pool
+    /// runs **before** a terminal link reclaim, so a link the engine really
+    /// committed is promoted instead of quarantined.
+    ///
+    /// Why the engine's account list is the right face: `finishLink` inserts
+    /// the account into the engine registry only after the provisioning flow
+    /// wrote its registration and the commit itself succeeded. So an answer
+    /// that lists this slot's number is durable proof that the phone approval
+    /// landed engine-side — exactly the state the connector's own store has
+    /// no row for (its finish budget expired first).
+    ///
+    /// Disciplines:
+    /// - **one RPC, bounded**: the caller passes the budget; a wedged engine
+    ///   answers nothing and the probe expires like any other read-only call
+    ///   (the pool's pre-softening reclaim then runs unchanged);
+    /// - **no store fallback**: unlike [`Self::list_accounts`], an engine
+    ///   failure is *not* answered from local rows. The local row is the very
+    ///   evidence this probe exists to obtain, so falling back would prove
+    ///   nothing and could promote an abandoned slot;
+    /// - **materialize only this slot's row**: the engine answer goes through
+    ///   the same sync the routine list path uses (engine number + ACI +
+    ///   capabilities), and only a row carrying this slot's preallocated id is
+    ///   returned — a number that already belongs to another local account
+    ///   answers `None` here and keeps the reclaim (the finish commit would
+    ///   have answered ACCOUNT_ALREADY_LINKED for it).
+    pub async fn adopt_engine_completed_link(&self, budget: Duration) -> Option<AccountSummary> {
+        let preferred = self.preferred_account_id.clone()?;
+        let engine = self.running_engine().await.ok()?;
+        let result = engine
+            .call_with_timeout("listAccounts", json!({}), CallClass::ReadOnly, budget)
+            .await
+            .ok()?;
+        let numbers = project_engine_account_rows(&result);
+        if numbers.is_empty() {
+            return None;
+        }
+        let rows = self
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers_with_capabilities_and_id(
+                &numbers,
+                &self.group_id,
+                Some(preferred.as_str()),
+            )
+            .ok()?;
+        rows.into_iter().find(|row| row.id == preferred)
     }
 
     /// Whether this slot currently owns a non-expired link session. The

@@ -1069,6 +1069,25 @@ for line in sys.stdin:
         # prove the fold to the link-class unknown outcome without waiting out
         # a real budget.
         if os.environ.get("KT_FAKE_FINISH_ENGINE_TIMEOUT") == "1":
+            # BUG-1 soften fixture: the phone approved just under the engine's
+            # own dispatch deadline, so the commit landed engine-side while the
+            # -32000 answer is the face the connector sees. The account
+            # registry (the durable proof the reclaim probe asks for) is
+            # written first; only then does the budget expire.
+            if (
+                os.environ.get("KT_FAKE_FINISH_TIMEOUT_AFTER_COMMIT") == "1"
+                and POOL_ACCOUNT_MODE
+            ):
+                ACCOUNT_LINKED = True
+                committed_number = next_multi_number()
+                OWN_NUMBER_MARKER.write_text(committed_number + "\n")
+                (SIGNAL_DATA_DIR / "engine-state.json").write_text(json.dumps({
+                    "version": 2,
+                    "accounts": [{
+                        "number": committed_number,
+                        "dir": "accounts/lk-fixture",
+                    }],
+                }))
             emit_json({
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -1125,6 +1144,33 @@ for line in sys.stdin:
         result = account_entry(number)
         emit_receive_after = True
     elif method == "listAccounts":
+        # BUG-1 soften fixture: per-engine witness that a reclaim asked the
+        # engine once before tearing a slot down. A pooled slot's own data dir
+        # does not survive a reclaim, so the witness lives beside it in the
+        # engines root and is keyed by the slot name (sibling engines stay
+        # independent).
+        probe_log = (
+            LADDER_DIR / (".fixture-list-accounts-calls-" + SIGNAL_DATA_DIR.name)
+            if POOL_ACCOUNT_MODE
+            else SIGNAL_DATA_DIR / ".fixture-list-accounts-calls"
+        )
+        try:
+            with probe_log.open("a") as calls:
+                calls.write("1\n")
+        except OSError:
+            pass
+        # Probe-failure arms: an engine that cannot answer at all (the
+        # pre-softening reclaim must stay) and one that never answers (the
+        # caller's probe budget must expire instead of stalling the reclaim).
+        if os.environ.get("KT_FAKE_LIST_ACCOUNTS_HANG") == "1":
+            continue
+        if os.environ.get("KT_FAKE_LIST_ACCOUNTS_FAIL") == "1":
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            })
+            continue
         if POOL_ACCOUNT_MODE:
             number = own_number() or state_file_number()
             result = (
