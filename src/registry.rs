@@ -231,6 +231,17 @@ fn engine_not_provisioned_error() -> ServiceError {
     ))
 }
 
+/// What one BUG-8 startup reconcile settled (counts only, for the log line).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AccountDeleteSettle {
+    /// Ledgers whose account row was already gone (stamp only).
+    pub(crate) orphaned: usize,
+    /// Row-without-slot deletes finished through the engine-free path.
+    pub(crate) converged: usize,
+    /// Row-without-slot deletes left alone because the data directory exists.
+    pub(crate) broken_pool: usize,
+}
+
 /// The v1-shaped delete answer (a recorded receipt under `deleted`, or an
 /// empty object).
 fn account_delete_result(receipt: Option<crate::store::AccountDeleteReceipt>) -> Value {
@@ -1097,6 +1108,19 @@ impl ProxyGroupRuntime {
     /// per-account pool enabled, the resident window (top-K most recently
     /// used dynamic slots) starts here too.
     pub async fn start(&self) -> Result<RuntimeStatusResult, StartFailure> {
+        // BUG-8: the ready edge settles local-data deletes whose engine data is
+        // already gone. It runs before any engine is started, so the pass never
+        // races a live delete in this process; it is idempotent, so every later
+        // start re-runs the same (empty) reconcile for free.
+        let settled = self.settle_unfinished_account_deletes().await;
+        if settled.orphaned > 0 || settled.converged > 0 {
+            tracing::info!(
+                orphaned = settled.orphaned,
+                converged = settled.converged,
+                broken_pool = settled.broken_pool,
+                "runtime.start settled unfinished account deletes"
+            );
+        }
         self.running.store(true, Ordering::Release);
         self.publish_running();
         if let Some(pool) = &self.pool {
@@ -1910,11 +1934,25 @@ impl ProxyGroupRuntime {
             })
     }
 
-    /// The v1-compatible delete of an account that has no local row (or an
-    /// idempotent replay of an already-completed delete) in full-pool mode.
+    /// The v1-compatible delete of an account that has no engine slot in
+    /// full-pool mode: an account row whose engine data is gone, a row that no
+    /// longer exists, or an idempotent replay of an already-completed delete.
     /// There is no group supervisor to borrow, so the store-only plan runs
-    /// through the shared routing service. A row that exists without a slot
-    /// is a broken pool and fails closed.
+    /// through the shared routing service.
+    ///
+    /// BUG-8: a row without a slot *and* without a slot directory is the stuck
+    /// tombstone's home shape — the engine data is gone (a quarantined or
+    /// reclaimed slot, BUG-1 recovery), so there is nothing an engine could
+    /// ever do for this delete. Refusing it left a `started` ledger behind on
+    /// every attempt and the same number unlinkable forever. It converges
+    /// through the engine-free path instead, which is exactly the "delete its
+    /// local data and link it again" remedy the terminal states name.
+    ///
+    /// A directory that still exists without a slot is a broken pool (an
+    /// unreadable engine root, a held occupancy lock): its data must not be
+    /// written off as gone, so it keeps failing closed — and it does so
+    /// *before* the ledger records an operation, so a refusal never invents a
+    /// tombstone.
     async fn delete_absent_account(
         &self,
         account_id: &str,
@@ -1923,36 +1961,66 @@ impl ProxyGroupRuntime {
         if let Some(operation_id) = operation_id.as_deref() {
             crate::service::validate_account_delete_operation_id(operation_id)?;
         }
-        let mut service = self.router_service().lock().await;
-        if let Some(operation_id) = operation_id.as_deref() {
-            match service.prepare_account_delete(account_id, operation_id)? {
-                AccountDeletePlan::Completed => {
-                    return Ok(account_delete_result(
-                        service
-                            .store_ref()
-                            .account_delete_receipt(account_id)
-                            .ok()
-                            .flatten(),
-                    ));
-                }
-                AccountDeletePlan::Dispatch { .. } => {
-                    return Err(engine_not_provisioned_error());
-                }
-            }
-        }
-        if service
-            .account_signal_number_optional(account_id)?
-            .is_some()
-        {
+        let row_present = {
+            let service = self.router_service().lock().await;
+            service
+                .account_signal_number_optional(account_id)?
+                .is_some()
+        };
+        let slot_dir_present = self
+            .pool
+            .as_ref()
+            .is_some_and(|pool| pool.slot_dir_present(account_id));
+        if row_present && slot_dir_present {
             return Err(engine_not_provisioned_error());
         }
-        Ok(account_delete_result(
-            service
-                .store_ref()
-                .account_delete_receipt(account_id)
-                .ok()
-                .flatten(),
-        ))
+        if row_present {
+            tracing::warn!(
+                account = %crate::pool::account_fingerprint(account_id),
+                "this account has no engine slot and no slot directory; converging the local-data delete without an engine"
+            );
+            return self
+                .delete_account_without_engine(account_id, operation_id)
+                .await;
+        }
+        // The rows are already gone: the deletion fact is achieved. An
+        // operation id still settles its ledger through the store plan.
+        // `None` = the plan came back as a dispatch, which can only mean the
+        // account row reappeared between the check above and the ledger write
+        // (a concurrent link commit): fall through to the engine-free path
+        // instead of leaving that ledger `started` behind.
+        let planned = {
+            let mut service = self.router_service().lock().await;
+            let mut dispatch = false;
+            if let Some(operation_id) = operation_id.as_deref() {
+                dispatch = matches!(
+                    service.prepare_account_delete(account_id, operation_id)?,
+                    AccountDeletePlan::Dispatch { .. }
+                );
+            }
+            if dispatch {
+                None
+            } else {
+                Some(
+                    service
+                        .store_ref()
+                        .account_delete_receipt(account_id)
+                        .ok()
+                        .flatten(),
+                )
+            }
+        };
+        match planned {
+            Some(receipt) => Ok(account_delete_result(receipt)),
+            None => {
+                tracing::warn!(
+                    account = %crate::pool::account_fingerprint(account_id),
+                    "the account row reappeared while the delete was planned; converging without an engine"
+                );
+                self.delete_account_without_engine(account_id, operation_id)
+                    .await
+            }
+        }
     }
 
     /// The shared routing service over the one per-instance store.
@@ -2035,6 +2103,95 @@ impl ProxyGroupRuntime {
         }
         self.forget_account_forwarders(account_id);
         Ok(account_delete_result(receipt))
+    }
+
+    /// BUG-8: settle every local-data delete whose engine data is already
+    /// gone, at the one moment with no delete in flight (the ready edge).
+    ///
+    /// Two shapes are unfinished ledgers here:
+    ///
+    /// - the account row is gone — the deletion fact is achieved and only the
+    ///   stamp is missing (`orphaned`);
+    /// - the row is still there but its engine slot and slot directory are not
+    ///   (`converged`): the delete lost its executor when the slot was
+    ///   quarantined/reclaimed, which made `started` permanent and the number
+    ///   unlinkable forever. The engine-free delete finishes it.
+    ///
+    /// A row that still owns a slot is not touched — that delete is not this
+    /// pass's to finish (its owner may be mid-flight). A directory that exists
+    /// without a slot is a broken pool and is left alone: "the pool cannot see
+    /// it" is not evidence that the data is gone.
+    async fn settle_unfinished_account_deletes(&self) -> AccountDeleteSettle {
+        let mut settled = AccountDeleteSettle::default();
+        match self
+            .store
+            .settle_orphaned_account_delete_operations(crate::link::now_ms())
+        {
+            Ok(count) => settled.orphaned = count,
+            Err(error) => {
+                tracing::warn!(
+                    error_class = error.class(),
+                    "the account-delete ledger reconcile failed; nothing is written off"
+                );
+                return settled;
+            }
+        }
+        let unfinished = match self.store.list_unfinished_account_deletes() {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    error_class = error.class(),
+                    "unfinished account deletes could not be listed"
+                );
+                return settled;
+            }
+        };
+        for row in unfinished {
+            // Settled by the pass above (the listing is a snapshot that can
+            // still carry row-less entries) — never count or touch them twice.
+            if !row.account_row_present {
+                continue;
+            }
+            let Some(pool) = &self.pool else {
+                // Legacy topology: a group engine owns every row, so a
+                // row-without-slot shape cannot be classified here.
+                continue;
+            };
+            if pool.get(&row.account_id).is_some() {
+                continue;
+            }
+            if pool.slot_dir_present(&row.account_id) {
+                settled.broken_pool += 1;
+                tracing::warn!(
+                    account = %crate::pool::account_fingerprint(&row.account_id),
+                    state = %row.state,
+                    "unfinished account delete left alone: the slot table has no entry but the data directory is still there"
+                );
+                continue;
+            }
+            match self
+                .delete_account_without_engine(&row.account_id, Some(row.operation_id.clone()))
+                .await
+            {
+                Ok(_) => {
+                    settled.converged += 1;
+                    tracing::info!(
+                        account = %crate::pool::account_fingerprint(&row.account_id),
+                        state = %row.state,
+                        "startup reconcile finished a local-data delete whose engine slot is gone"
+                    );
+                }
+                // Another pass already settled the same ledger: nothing to do,
+                // never an error.
+                Err(ServiceError::Store(StoreError::OperationConflict)) => {}
+                Err(error) => tracing::warn!(
+                    account = %crate::pool::account_fingerprint(&row.account_id),
+                    error_class = error.class(),
+                    "startup reconcile could not finish an account delete; the next start retries"
+                ),
+            }
+        }
+        settled
     }
 
     /// The §4.197 file half of an account delete, for the engine-free path
@@ -3926,6 +4083,24 @@ pub fn open_group_runtime_with_options(
     // only ever receives its own account's derivation.
     let engine_store_root = store_key.clone();
     let store = Arc::new(Store::open(state_dir, store_key)?);
+    // BUG-8: sign the delete ledgers whose account row is already gone before
+    // any engine exists. The boot path is the one place with no delete in
+    // flight, so an orphaned ledger here can only be an unsigned receipt of a
+    // deletion that already happened (the row transaction committed, the
+    // operation update did not, or the rows left through an operation-id-less
+    // path). Leaving it unfinished made the number look "still deleting" to
+    // every later reader and fed the relink gate for nothing.
+    match store.settle_orphaned_account_delete_operations(crate::link::now_ms()) {
+        Ok(0) => {}
+        Ok(settled) => tracing::info!(
+            settled,
+            "startup reconcile completed orphaned account-delete ledgers"
+        ),
+        Err(error) => tracing::warn!(
+            error_class = error.class(),
+            "startup reconcile of orphaned account-delete ledgers failed; the runtime.start pass retries"
+        ),
+    }
     let media_handles = std::sync::Arc::new(crate::media::MediaHandleTable::new());
     // §4.46: one process-wide backup file-handle table for every group —
     // `readChunk`/`closeHandle` carry no accountId, so handle resolution must

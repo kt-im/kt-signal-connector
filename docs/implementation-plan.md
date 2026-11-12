@@ -21910,3 +21910,67 @@ legacy 帧**不得**出现 `serviceableAccountCount`；pooled 空池帧必须出
 计数为 0（旧 connector 则回读一次 `runtime.status`，用逐槽 `needsRelink` 兜底）时域留
 在 ready，账号面出重链提示；`needsRelink` 槽不再算引擎故障/降级。渲染层 runtime gate
 对「域 ready + 0 可服务账号」直接放行，「正在恢复连接」只留给域真不可用。
+
+---
+
+## §4.283 删除墓碑自愈：无主/无槽的本地数据删除收敛到 `completed`（BUG-8 · 无 wire 变更）
+
+**问题（BUG-8，2026-11-12 现场）**：21:02 用户删除两个会话 → 槽随后被 BUG-1 回收纪律
+隔离（`invariant=link_attempt_slot_leaked`）→ 删除执行侧失去引擎对象 → `account_delete_operations`
+永久停在 `started`。`link.finish` 的重链门（§9.10 item 7）对这个号码每次答
+`ACCOUNT_DELETE_IN_PROGRESS`，而引擎侧设备已注册：**手机显示「已连接的设备」，桌面一无所有**，
+且没有任何用户可达的「重试删除」出口 —— 该号码再也链不上。
+
+**正确语义**：`account_delete_operations` 是一张**删除事实的收据**，不是「正在删除」的
+永久锁。
+
+- 账号行已不存在 → 删除事实已达成，墓碑缺的只是签字：置 `completed`；
+- 账号行还在、但槽与槽目录都不在 → 删除丢了执行者，删除事实仍可达成：用**无引擎删除**
+  （`delete_account_without_engine`）收敛，一次调用即 `completed`；
+- 账号行还在、槽目录还在（池看不见但数据在，例如占用锁/根目录不可读）→ **fail closed**
+  保留 `ENGINE_NOT_PROVISIONED`，且在写账本之前就拒绝（拒绝绝不新造墓碑）；
+- 账号行还在且槽在 → 不归本对账管（删除可能正在飞，也可能是用户还没点重试）。
+
+**实现**：
+
+1. **store**：`list_unfinished_account_deletes()`（`LEFT JOIN accounts` 一并带回
+   `account_row_present`，**不带号码**，日志永不出现号码）+
+   `settle_orphaned_account_delete_operations(now_ms)`（单事务把「`state != completed` 且
+   `NOT EXISTS accounts`」置 `completed`，沿用既有完成环形裁剪；幂等）。
+2. **启动对账**：`open_group_runtime_with_options` 在 `Store::open` 之后、任何引擎存在之前
+   跑一次无主账本签字（legacy / pooled 同一处，启动期没有删除在飞，无主账本只可能是漏签收据）；
+   `runtime.start`（ready 边）再跑一次完整对账：无主签字 + 「行在、槽与目录都不在」的收敛。
+   全部计数只进日志（`orphaned` / `converged` / `broken_pool`），失败只告警、下次 start 重试。
+3. **删除面**：池化 `delete_absent_account` 不再无条件 `ENGINE_NOT_PROVISIONED`；行在而
+   槽目录不在时走无引擎删除（与 §4.277 M2 / §4.278 同一条「删本地数据再重链」出路）。
+   隔离目录**不动**（BUG-1 可恢复线索）。
+4. **link.finish 有界等待**：引擎 `finishLink` 已返回（设备已注册）之后、提交之前，若同一
+   号码还有 `started` 删除，等待 **3 × 5 s** 让其落定再提交；`unknown` 不等待（只有显式
+   重试删除能解），预算耗尽仍由既有重链门如实答 `ACCOUNT_DELETE_IN_PROGRESS`。这样
+   「删会话」与「扫码确认」撞车时，提交会等删除收尾，而不是把设备留成幽灵。
+
+**边界（如实记档）**：
+
+- 无主签字只动**账本**，不动任何账号行/目录/媒体；收敛只发生在「删除事实可达」的形状上。
+- 槽目录存在而池无槽属**破损池**：本对账只记 `broken_pool` 并保留 fail closed；不把
+  「池看不见」当「数据没了」。
+- 无引擎删除走既有 `delete_account_without_engine`（删除行、清媒体句柄、擦明文备份、清
+  state-dir 导出物），与 §4.277 M2 / §4.278 的路径逐条一致；隔离区字节不动。
+- wire 无变更：错误码集合、`accounts.deleteLocalData` 答案形状、`runtime.*` 帧均不变。
+
+**测试**（`tests/account_delete_tombstone.rs`，真实 runtime + fake engine，均配变异验证）：
+
+| 用例 | 钉住的行为 | 变异 |
+|---|---|---|
+| `a_restart_settles_the_orphaned_delete_ledger_and_the_same_number_relinks` | 行已消失的 `started` 墓碑，重启后被签字；同号 `link.start`+`finish` 成功 | 把签字 UPDATE 改成 `WHERE 0` → 账本未完成断言红 |
+| `a_restart_converges_a_delete_whose_engine_slot_is_gone` | 槽被隔离（目录移出 live 命名空间）后重启：ready 边收敛删除、行消失、同号重链成功；隔离字节保留 | 对账在无主签字后提前 `return` → 「ready 边完成删除」断言红（行仍 `ready`） |
+| `a_delete_of_an_account_whose_slot_was_quarantined_converges_without_an_engine` | 槽被隔离后显式删除一次收敛到 `completed`，不产生新墓碑 | 恢复「行在即 `ENGINE_NOT_PROVISIONED`」→ 用例红 |
+| `a_delete_that_still_owns_its_data_directory_fails_closed` | 行在、槽目录在：删除答 `ENGINE_NOT_PROVISIONED`，行保留 | `slot_dir_present` 恒 `false`（把「池看不见」当「数据没了」）→ 删除成功断言红 |
+| `a_link_finish_waits_for_a_concurrent_delete_of_the_same_number_then_commits` | 删除在飞（fake engine `KT_FAKE_DELETE_MODE=hold`）+ 同号 finish：等待后提交成功，耗时 ≥ 4.5 s | 去掉有界等待 → finish 答 `ACCOUNT_DELETE_IN_PROGRESS`（幽灵设备形状） |
+
+lib 单测 `store::tests::orphaned_account_delete_ledgers_settle_completed_and_live_ones_do_not`
+钉住：列表形状（含 `account_row_present`、不含号码）、只签无主行、活的 pending 删除不动、幂等。
+
+**桌面半边**（另一仓）：`signalErrorCopy.ts` 两个删除码改成可执行文案（重开客户端让删除收尾 /
+换号），`useSignalLinkFlow.ts` 的 `friendlyLinkError` 在 finish 兜底之前显式命中这两个码，
+不再把它们画成「本二维码已失效」。

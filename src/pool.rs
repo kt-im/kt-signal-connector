@@ -1525,6 +1525,31 @@ impl AccountPool {
             .and_then(|slots| slots.get(account_id).cloned())
     }
 
+    /// BUG-8: whether this account's engine data directory still exists on
+    /// disk when the slot table has no entry for it. The pool is rebuilt from
+    /// that directory at startup, so "no slot" normally means "no data"; a
+    /// directory that is there anyway is a broken pool (an unreadable root, a
+    /// held occupancy lock, a name the pool refuses) and must never be read as
+    /// "the data is gone" — the delete reconcile fails closed on it.
+    ///
+    /// A symlink counts as present: the entry is something this process does
+    /// not own, and following it would cross the account boundary.
+    pub(crate) fn slot_dir_present(&self, account_id: &str) -> bool {
+        if !is_account_id(account_id) {
+            // Not addressable as a slot: never evidence that the data is gone.
+            return true;
+        }
+        let path = self
+            .config
+            .signal_data_dir
+            .join(ENGINE_SLOT_SUBDIR)
+            .join(account_id);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(error) => error.kind() != io::ErrorKind::NotFound,
+        }
+    }
+
     pub fn slots(&self) -> Vec<Arc<AccountSlot>> {
         self.slots
             .read()

@@ -3330,6 +3330,20 @@ pub enum AccountDeletePlan {
     },
 }
 
+/// One local-data delete that has not settled yet (BUG-8): the operation
+/// ledger row, the account it belongs to, and whether that account row still
+/// exists. The phone number is deliberately **not** carried here — the
+/// startup reconcile only needs the ids and must never log a number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnfinishedAccountDelete {
+    pub operation_id: String,
+    pub account_id: String,
+    pub state: String,
+    /// `false` = the account row is already gone, so the deletion fact is
+    /// achieved and only the ledger stamp is missing.
+    pub account_row_present: bool,
+}
+
 /// Contract 1.197 (§4.197, D4): what one local account deletion removed.
 ///
 /// This is a deletion proof, not content: opaque account id, the completion
@@ -5503,6 +5517,75 @@ impl Store {
             )
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Every local-data delete that has not settled (BUG-8), oldest first.
+    /// `account_row_present` is read in the same statement, so a reconcile
+    /// pass sees one consistent snapshot instead of a row-then-ledger race.
+    pub fn list_unfinished_account_deletes(
+        &self,
+    ) -> Result<Vec<UnfinishedAccountDelete>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT o.operation_id, o.account_id, o.state, a.id IS NOT NULL
+                   FROM account_delete_operations o
+                   LEFT JOIN accounts a ON a.id = o.account_id
+                  WHERE o.state != 'completed'
+                  ORDER BY o.created_at, o.operation_id",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(UnfinishedAccountDelete {
+                    operation_id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    state: row.get(2)?,
+                    account_row_present: row.get(3)?,
+                })
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
+    /// BUG-8 startup reconcile: a ledger row whose account row is already gone
+    /// describes a deletion that has already happened — the account row left
+    /// in the same transaction that should have stamped the ledger, or the
+    /// rows were removed by a path that did not carry this operation id. The
+    /// tombstone is only an unsigned receipt, so sign it (`completed`) instead
+    /// of letting it stand.
+    ///
+    /// One transaction; returns how many ledgers settled. Completed rows keep
+    /// the same bounded ring discipline every other completion uses.
+    pub fn settle_orphaned_account_delete_operations(
+        &self,
+        now_ms: u64,
+    ) -> Result<usize, StoreError> {
+        let mut conn = self.lock_conn()?;
+        let transaction = conn
+            .transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let changed = transaction
+            .execute(
+                "UPDATE account_delete_operations
+                    SET state='completed', updated_at=?1
+                  WHERE state != 'completed'
+                    AND NOT EXISTS (
+                      SELECT 1 FROM accounts
+                       WHERE accounts.id = account_delete_operations.account_id
+                    )",
+                params![now_ms as i64],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if changed > 0 {
+            prune_completed_account_deletes(&transaction)?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed)
     }
 
     pub fn mark_account_delete_unknown(
@@ -28762,6 +28845,75 @@ mod tests {
             AccountDeletePlan::Completed,
         );
         assert!(store.account_by_id(&account.id).unwrap().is_none());
+    }
+
+    /// BUG-8: the delete ledger of an account row that is already gone is an
+    /// unsigned receipt, not a pending deletion — a startup pass signs it
+    /// (`completed`) and leaves a live pending delete alone.
+    #[test]
+    fn orphaned_account_delete_ledgers_settle_completed_and_live_ones_do_not() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let gone = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let live = store
+            .upsert_account_from_signal("+15555550101", Some(2), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(matches!(
+            store
+                .prepare_account_delete(&gone.id, "orphan-op", 10)
+                .unwrap(),
+            AccountDeletePlan::Dispatch { .. },
+        ));
+        assert!(matches!(
+            store
+                .prepare_account_delete(&live.id, "live-op", 11)
+                .unwrap(),
+            AccountDeletePlan::Dispatch { .. },
+        ));
+        // The engine-free/logout tail removes the rows without carrying this
+        // operation id: the account row is gone, the ledger row is not.
+        assert!(store.complete_account_delete(&gone.id, None, 12).unwrap());
+
+        let pending = store.list_unfinished_account_deletes().unwrap();
+        assert_eq!(pending.len(), 2, "both ledgers are unfinished: {pending:?}");
+        let orphan = pending
+            .iter()
+            .find(|row| row.operation_id == "orphan-op")
+            .expect("the orphaned ledger is listed");
+        assert!(!orphan.account_row_present);
+        let live_row = pending
+            .iter()
+            .find(|row| row.operation_id == "live-op")
+            .expect("the live ledger is listed");
+        assert!(live_row.account_row_present);
+        assert_eq!(live_row.state, "started");
+        // Privacy: the listing must not carry the phone number anywhere.
+        assert!(!format!("{pending:?}").contains("+15555550100"));
+
+        assert_eq!(
+            store.settle_orphaned_account_delete_operations(13).unwrap(),
+            1,
+            "exactly the row-less account's ledger settles",
+        );
+        let after = store.list_unfinished_account_deletes().unwrap();
+        assert_eq!(after.len(), 1, "the live delete is untouched: {after:?}");
+        assert_eq!(after[0].operation_id, "live-op");
+        // The settled number is free for a re-link: the relink gate joins the
+        // account row, and the ledger no longer answers for it.
+        assert_eq!(
+            store
+                .unfinished_account_delete_state("+15555550100")
+                .unwrap(),
+            None
+        );
+        assert!(store.account_by_signal("+15555550100").unwrap().is_none());
+        // Idempotent: a second pass has nothing to sign.
+        assert_eq!(
+            store.settle_orphaned_account_delete_operations(14).unwrap(),
+            0,
+        );
     }
 
     #[test]

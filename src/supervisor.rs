@@ -84,6 +84,14 @@ use crate::store::{
 /// answer is therefore the link-class unknown outcome (the desktop's adopt
 /// path), never a retryable `UPSTREAM_TIMEOUT`.
 const LINK_FINISH_TIMEOUT: Duration = Duration::from_secs(370);
+/// BUG-8: a `link.finish` whose number still has a `started` local-data
+/// delete waits this long (3 × 5 s) for it to settle before committing.
+/// Committing over the delete would erase the fresh link, refusing at once
+/// would leave the phone-approved device registered with no desktop account
+/// (the phantom-device field shape) — a bounded wait is the only answer that
+/// keeps a genuinely concurrent delete honest and still lets the link land.
+const LINK_FINISH_DELETE_SETTLE_ATTEMPTS: u32 = 3;
+const LINK_FINISH_DELETE_SETTLE_INTERVAL: Duration = Duration::from_secs(5);
 const RECEIVE_STORE_RETRY_MIN: Duration = Duration::from_millis(100);
 const RECEIVE_STORE_RETRY_MAX: Duration = Duration::from_secs(5);
 const WATCHDOG_PING_TIMEOUT: Duration = Duration::from_secs(15);
@@ -3420,6 +3428,47 @@ impl RuntimeSupervisor {
         ))
     }
 
+    /// BUG-8: a fresh link and a local-data delete of the **same number** may
+    /// overlap (the user deleted a session while the QR was on screen). The
+    /// commit gate refuses that link (ACCOUNT_DELETE_IN_PROGRESS), and by then
+    /// the engine has already registered the phone's device — the phone shows
+    /// a connected device, the desktop shows an error and holds nothing.
+    ///
+    /// This waits, bounded (3 × 5 s), for the delete to settle and answers the
+    /// state that is still unfinished when the budget runs out (`None` =
+    /// settled). Only `started` is worth waiting for: `unknown` cannot settle
+    /// without an explicit delete retry, so the honest answer is immediate.
+    async fn await_account_delete_settled(&self, number: &str) -> Option<String> {
+        let mut waited = false;
+        for attempt in 1..=LINK_FINISH_DELETE_SETTLE_ATTEMPTS {
+            let state = match self.store.unfinished_account_delete_state(number) {
+                Ok(state) => state,
+                // A store hiccup is not a delete in flight: do not invent a
+                // wait, and let the commit surface the store error itself.
+                Err(_) => return None,
+            };
+            match state {
+                None => {
+                    if waited {
+                        tracing::info!(
+                            "a concurrent local-data delete settled before the link commit"
+                        );
+                    }
+                    return None;
+                }
+                Some(state) if state != "started" => return Some(state),
+                Some(_) if attempt == LINK_FINISH_DELETE_SETTLE_ATTEMPTS => {
+                    return Some("started".to_string());
+                }
+                Some(_) => {
+                    waited = true;
+                    tokio::time::sleep(LINK_FINISH_DELETE_SETTLE_INTERVAL).await;
+                }
+            }
+        }
+        Some("started".to_string())
+    }
+
     pub async fn finish_link(
         &self,
         link_session_id: String,
@@ -3645,6 +3694,17 @@ impl RuntimeSupervisor {
                 ))
             })?;
         let aci = result.get("aci").and_then(Value::as_str);
+        // BUG-8: the engine registered this device a moment ago; a delete of
+        // the same number that is still with us must settle before the commit
+        // or the link is refused into the phantom-device shape (phone has the
+        // device, desktop has nothing). The commit gate still owns the final
+        // word — this only removes the avoidable race.
+        if let Some(state) = self.await_account_delete_settled(number).await {
+            tracing::warn!(
+                state = %state,
+                "the link commit still sees an unfinished local-data delete for this number"
+            );
+        }
         let mut account = {
             let mut service = self.service.lock().await;
             service.complete_link_session_with_id(
