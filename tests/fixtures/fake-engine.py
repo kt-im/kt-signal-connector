@@ -452,6 +452,11 @@ FAIL_USER_STATUS_COUNT_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status-cou
 AUTH_FAILED_MARKER = SIGNAL_DATA_DIR / ".fixture-auth-failed-user-status"
 UNREGISTERED_MARKER = SIGNAL_DATA_DIR / ".fixture-unregistered-user-status"
 USERNAME_UNSET_MARKER = SIGNAL_DATA_DIR / ".fixture-username-unset"
+# Contract 1.286 §4.281 login-window sync projection fixture (SIGNAL-STAGE1
+# §二 P-B-3). The default arm answers the mixed face; the bad-shape marker
+# answers a phase outside the closed vocabulary (the connector's shape gate
+# must refuse it instead of projecting a guessed word).
+SYNC_STATE_BAD_MARKER = SIGNAL_DATA_DIR / ".fixture-sync-state-bad"
 SEND_LOG = SIGNAL_DATA_DIR / ".fixture-send-log.jsonl"
 DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
 # §4.123 test hook: one-shot server-unavailable send answer. A test arms it
@@ -2802,6 +2807,31 @@ for line in sys.stdin:
                 {"deviceId": "3", "name": "ghost"},
             ]
         }
+    elif method == "getSyncState":
+        # Contract 1.286 §4.281: the login-window sync projection read
+        # (SIGNAL-STAGE1-DESIGN §二 P-B-3). Record the exact upstream params
+        # (the test asserts the resolved account key) — a repeated call lands a
+        # second identical line, which is the idempotency evidence the face
+        # promises. Default: the three halves on three different words so a
+        # passthrough defect is visible; the bad marker answers a phase
+        # outside the vocabulary so the connector's shape gate can be pinned.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if SYNC_STATE_BAD_MARKER.exists():
+            result = {
+                "contacts": "settled",
+                "storage": "done",
+                "profile": "idle",
+                "sinceMs": 1760000000000,
+            }
+        else:
+            result = {
+                "contacts": "done",
+                "storage": "inflight",
+                "profile": "failed",
+                "sinceMs": 1760000000000,
+            }
     elif method == "unlinkDevice":
         # Contract 1.122 §4.103: the server-side unlink write. Record the
         # exact upstream params (the test asserts the resolved account and the

@@ -105,6 +105,7 @@
             "accounts.getUsername",
             "accounts.deviceCapabilities",
             "accounts.getDevices",
+            "accounts.getSyncState",
             "accounts.unlinkDevice",
             "username.lookup",
             "phone.lookup",
@@ -432,6 +433,25 @@
             "properties": {
               "params": {
                 "$ref": "#/$defs/accountsGetDevicesParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "accounts.getSyncState"
+              }
+            },
+            "required": [
+              "method"
+            ]
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/accountsGetSyncStateParams"
               }
             }
           }
@@ -3074,6 +3094,19 @@
         "accountId"
       ],
       "description": "List the account's linked devices (contract revision 1.122, §4.103, capability device-management): the engine GET v1/devices projection — the server list in server order, including the account's own primary device — with the engine-side device-name decryption (the official encryptDeviceName pair, decrypted with the account's own ACI identity key; an encrypted name that is absent or undecryptable answers no `name` key — the honest no-name face, the official decrypt-failure domain). The result is {devices: [{deviceId, name?, registrationId?, lastSeenMs?, createdAtCiphertext?}]}: deviceId is the positive server id (1..4294967295), lastSeenMs is the epoch-ms server stamp, createdAtCiphertext is the server's opaque base64 flag material riding verbatim. Bounded projection: at most 32 entries (entries beyond truncate); an entry whose deviceId is non-numeric drops; a projected deviceId of 0 fails the whole face INVALID_REQUEST — 0 is the libsignal no-device hole, never a real server device, and a list claiming it must not cross the connector. Unknown account answers ACCOUNT_NOT_FOUND. Structured engine errors: DEVICES_FAILED (server refusal, retryable=false; error.data.status carries the server HTTP status verbatim when the server gave one), DEVICES_UNAVAILABLE (network/transport, retryable=true). Read lane, non-mutating; no local persistence, no logging.",
+      "properties": {
+        "accountId": {
+          "$ref": "#/$defs/opaqueId"
+        }
+      }
+    },
+    "accountsGetSyncStateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accountId"
+      ],
+      "description": "Read the account's login-window sync projection (contract revision 1.286, §4.281; the engine face is `getSyncState`, SIGNAL-STAGE1-DESIGN §二 P-B-3). The face is the engine's own process-memory window book projected read-only: `{contacts, storage, profile, sinceMs}` where each half is one of the closed vocabulary idle | inflight | done | failed — idle = no window (or the one-shot window already elapsed), inflight = window open and that half unsettled, done / failed = the observed settle face — and `sinceMs` is the current window's opening epoch-ms, the caller's freshness anchor (a window opened before the caller's own gate/activation is a stale face to be ignored, not a settle). The face answers {contacts, storage, profile, sinceMs} verbatim behind the connector's shape gate: a phase outside the vocabulary or a non-numeric sinceMs is UPSTREAM_PROTOCOL_ERROR (a protocol defect, never a guessed face); unknown sibling keys are ignored (additive tolerance). Unknown account answers ACCOUNT_NOT_FOUND; engine down answers the usual not-running family. Read lane, non-mutating, no local persistence, no logging: the call is a pure snapshot, so a repeated call answers the same face — the idempotency contract the desktop's bounded gate polling (`useSignalLinkFlow`) rides. An engine that predates the face answers the upstream error class; the desktop then keeps the event path only.",
       "properties": {
         "accountId": {
           "$ref": "#/$defs/opaqueId"

@@ -78,6 +78,18 @@
   `store::probe_account_rows`：immutable 只读、未 checkpoint 的 WAL 直接拒绝），不建目录/库文件/
   锁文件、不改 pid、不 chmod。无 wire 变更，
   `ENGINE_CONTRACT_MAX_REVISION` 保持 1.286。)
+- Login-window sync projection (2026-11-12, wire additive, engine-compat —
+  §4.281 `accounts.getSyncState`; no new contract revision number is claimed here: the
+  engine's shared revision constant is still 1.285 and the next bump belongs to the
+  release batch that ships the engine leg, so the connector's
+  `ENGINE_CONTRACT_MAX_REVISION` stays 1.286): the engine's login-window sync arm now
+  exposes its own bookkeeping as a read-only, idempotent, account-domain query —
+  `{contacts, storage, profile, sinceMs}` with the closed phase vocabulary
+  `idle|inflight|done|failed`. The connector forwards it behind a shape gate
+  (unknown phase / non-numeric `sinceMs` = protocol defect, never a guessed word).
+  This is the desktop inbox gate's *pull* fallback (`SIGNAL-STAGE1-DESIGN.md` §二
+  P-B-3): bounded polling (5 s × 24) settles a half the event path lost; the event
+  path stays the fast route. No local persistence, no logging, no new state machine.
 - Contract revision: 1.283 (2026-11-10; §4.267 thin event ledger: the
   `event_log` table loses its `payload` column and becomes a five-column
   change ledger (seq/epoch/account_id/type/created_at) in schema v50 — a row
@@ -21773,3 +21785,48 @@ action=quarantine, outcome=would-continue（与 apply 双向诚实）。
 
 **未覆盖窄窗**：registration 已写但 add_account 从未执行——只读探测看不到，维持回收
 （凭据进 .quarantine-*，字节可审计）。要可 promote 需引擎侧提交语义，属另一决策。
+
+## §4.281 登录窗同步投影读面：`accounts.getSyncState`（契约 1.286 批内增补，wire additive）
+
+**来源**：`/Users/tanye/test/kt/SIGNAL-STAGE1-DESIGN.md` §二 P-B-3「gate 改拉」——桌面
+收件箱 gate 目前纯靠事件（`engine.storagePull` / `engine.initialSyncComplete`），四跳
+管道任何一处丢帧就只剩 2min 半边超时；本面给 gate 一条**有界轮询兜底**（每 5s，上限
+24 次 = 120s），事件路径不变、仍是快路径。
+
+**引擎腿**：`getSyncState {account}`（kt-signal-engine，见其 `docs/jsonrpc-compat.md`
+的阶段 1-1 块）。应答四键恒在：
+
+```jsonc
+{ "contacts": "idle|inflight|done|failed",
+  "storage":  "idle|inflight|done|failed",
+  "profile":  "idle|inflight|done|failed",
+  "sinceMs":  1760000000000 }
+```
+
+`sinceMs` = 当前窗口开窗时刻（epoch ms），消费方的新鲜度锚：窗口开在调用方自己的
+gate 激活之前 = 上一次链接/启动留下的旧面，按陈旧处理而不是当成落定。
+
+**connector 面**：`accounts.getSyncState {accountId}` → `{contacts, storage, profile,
+sinceMs}`（引擎的 bare `account` 标识永不过界；未知兄弟键被忽略，只投影钉定四键）。
+
+- **形状闸**（`service::sync_state_from_engine`，storagePull 同款纪律）：三个相位必须
+  是封闭词表 `idle|inflight|done|failed` 的字符串，`sinceMs` 必须是非负整数；任一不符
+  = 协议缺陷 → `UPSTREAM_PROTOCOL_ERROR`（绝不猜一个相位词）、可重试。
+- **纯读幂等**：不落库、不打日志、不触发引擎侧任何状态迁移；重复调用逐字节同面——
+  轮询兜底的硬前提。
+- **车道**：read lane，非账号串行（不占账号互斥；轮询不得和发送互锁）；account 归属
+  走 `slot_for_account` → 该账号自有引擎（池化与 legacy 两种拓扑同路）。
+- **错误面**：未知账号 `ACCOUNT_NOT_FOUND`（prepare 阶段）；引擎不在
+  `RUNTIME_NOT_RUNNING`；旧引擎无该面 = 上游错误类（桌面据此只留事件路径）。
+- **fake-engine 臂**（`tests/fixtures/fake-engine.py`）：`getSyncState` 记录精确上游
+  params 并答 `{contacts:done, storage:inflight, profile:failed, sinceMs:1760000000000}`；
+  `.fixture-sync-state-bad` 标记改答词表外相位（`contacts:settled`），钉形状闸。
+
+**测试**：`tests/sync_state.rs`——透传 + 两连调的幂等证据（两条逐字节相同的上游
+frame）+ 宿主面恰四键 + 坏形状 `UPSTREAM_PROTOCOL_ERROR`；`src/service.rs` 单测
+`sync_state_projection_gates_the_closed_vocabulary`（词表外/类型错/缺键/负数/字符串
+sinceMs 全拒，未知兄弟键忽略）；`tests/schema_consistency.rs` 要求 schema 方法 enum
+与派发表一致（本面已登记 `accountsGetSyncStateParams` 与 if/then 块）。
+
+**门禁**：`cargo fmt` / `cargo clippy --all-targets -- -D warnings` / `cargo test` /
+release build。

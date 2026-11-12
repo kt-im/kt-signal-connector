@@ -6681,6 +6681,15 @@ impl ConnectorService {
         Ok(json!({ "account": account.signal_account }))
     }
 
+    /// accounts.getSyncState (contract revision 1.286, §4.281): account bounds
+    /// and existence — the sync-window projection is the engine's own
+    /// process-memory book, the service reads nothing locally.
+    pub fn prepare_accounts_get_sync_state(&self, account_id: &str) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({ "account": account.signal_account }))
+    }
+
     /// accounts.getDevices (contract revision 1.122, §4.103): account bounds
     /// and existence — the device list is the account's own upstream state,
     /// the service reads nothing locally.
@@ -17504,6 +17513,28 @@ pub struct DeviceList {
     pub devices: Vec<DeviceEntry>,
 }
 
+/// The closed phase vocabulary of the engine's `getSyncState` projection
+/// (contract revision 1.286, §4.281): the login-window sync arm's three
+/// halves. `idle` = no window (or the one-shot window already elapsed),
+/// `inflight` = window open and that half unsettled, `done`/`failed` = the
+/// observed settle face. The connector never invents a fifth word.
+pub const SYNC_STATE_PHASES: [&str; 4] = ["idle", "inflight", "done", "failed"];
+
+/// The §4.281 result of `accounts.getSyncState` (contract revision 1.286):
+/// the engine's read-only login-window projection verbatim — the three half
+/// phases plus `sinceMs` (the current window's opening epoch-ms, the
+/// consumer's freshness anchor: a window opened before the caller's own
+/// gate/activation is a stale face). Purely read-only: nothing persisted,
+/// nothing logged, repeated calls answer the same face.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSyncState {
+    pub contacts: String,
+    pub storage: String,
+    pub profile: String,
+    pub since_ms: u64,
+}
+
 /// The §4.47 result of `conversations.getAvatar` (contract revision 1.48):
 /// the decrypted avatar as a data URI (MIME sniffed engine-side from the
 /// magic bytes, `application/octet-stream` when unrecognized) plus the
@@ -18707,6 +18738,15 @@ pub struct AccountsDeviceCapabilitiesParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountsGetDevicesParams {
+    pub account_id: String,
+}
+
+/// `accounts.getSyncState` params (contract revision 1.286, §4.281): one
+/// account, resolved to its engine session by the prepare step — the face
+/// itself is a pure read.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountsGetSyncStateParams {
     pub account_id: String,
 }
 
@@ -21786,6 +21826,33 @@ pub(crate) fn device_list_from_engine(result: &Value) -> Result<DeviceList, Serv
     Ok(DeviceList { devices: projected })
 }
 
+/// Parse the engine's `getSyncState` result (contract revision 1.286,
+/// §4.281). Shape gate (the storagePull discipline): the three phases must be
+/// strings from the closed vocabulary and `sinceMs` a non-negative integer —
+/// anything else is a protocol defect (UPSTREAM_PROTOCOL_ERROR), never a
+/// guessed face.
+/// Unknown sibling keys ride ignored (additive tolerance: the connector
+/// projects the pinned four and never forwards an unpinned key).
+pub(crate) fn sync_state_from_engine(result: &Value) -> Result<AccountSyncState, ServiceError> {
+    fn phase(face: &Value, key: &str) -> Result<String, ServiceError> {
+        face.get(key)
+            .and_then(Value::as_str)
+            .filter(|word| SYNC_STATE_PHASES.contains(word))
+            .map(str::to_owned)
+            .ok_or(ServiceError::Engine(EngineError::Protocol))
+    }
+    let since_ms = result
+        .get("sinceMs")
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    Ok(AccountSyncState {
+        contacts: phase(result, "contacts")?,
+        storage: phase(result, "storage")?,
+        profile: phase(result, "profile")?,
+        since_ms,
+    })
+}
+
 /// Parse the engine's `createGroup` result (contract revision 1.126,
 /// §4.107): `{groupId, revision}` — the new group master key (standard
 /// base64) and the fresh revision. A missing or non-string groupId, or a
@@ -24149,6 +24216,41 @@ mod tests {
         .into_api();
         assert_eq!(api.code, "DEVICES_FAILED");
         assert!(api.data.is_none());
+    }
+
+    /// §4.281 shape gate (contract 1.286): the four keys project verbatim,
+    /// a phase outside the closed vocabulary / a missing phase / a
+    /// non-numeric sinceMs is a protocol defect, and unknown sibling keys
+    /// ride ignored (additive tolerance, the pinned four only).
+    #[test]
+    fn sync_state_projection_gates_the_closed_vocabulary() {
+        let face = sync_state_from_engine(&json!({
+            "contacts": "done",
+            "storage": "inflight",
+            "profile": "failed",
+            "sinceMs": 1_760_000_000_000u64,
+            "futureKey": { "additive": true },
+        }))
+        .unwrap();
+        assert_eq!(face.contacts, "done");
+        assert_eq!(face.storage, "inflight");
+        assert_eq!(face.profile, "failed");
+        assert_eq!(face.since_ms, 1_760_000_000_000);
+
+        for bad in [
+            json!({ "contacts": "settled", "storage": "done", "profile": "idle",
+                    "sinceMs": 1u64 }),
+            json!({ "contacts": "done", "storage": 1, "profile": "idle",
+                    "sinceMs": 1u64 }),
+            json!({ "contacts": "done", "storage": "done", "profile": "idle" }),
+            json!({ "contacts": "done", "storage": "done", "profile": "idle",
+                    "sinceMs": "1" }),
+            json!({ "contacts": "done", "storage": "done", "profile": "idle",
+                    "sinceMs": -1 }),
+        ] {
+            let api = sync_state_from_engine(&bad).err().unwrap().into_api();
+            assert_eq!(api.code, "UPSTREAM_PROTOCOL_ERROR", "{bad}");
+        }
     }
 
     /// §4.103 projection (contract 1.122): entries ride in order under the

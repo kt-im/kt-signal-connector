@@ -22,54 +22,54 @@ use crate::link::now_ms;
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
-    AccountDeviceCapabilities, AccountUsername, AccountsDeviceCapabilitiesParams,
-    AccountsGetDevicesParams, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
-    AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUnlinkDeviceParams,
-    AccountsUpdateConfigurationParams, AttachmentSendTarget, AvatarDownload, BlockedConversations,
-    CallLinkSyncs, CallsSendGroupCallUpdateParams, CallsSendSignalParams, ChatFolderSyncs,
-    ChatFoldersListParams, ChatFoldersSetRecordsParams, CommonGroupsDetails, ConnectorService,
-    ContactsSyncOutcome, ConversationState, ConversationsGetAvatarParams,
-    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
-    ConversationsReportSpamParams, ConversationsReportSpamResult, ConversationsSetBlockedParams,
-    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
-    ConversationsSetPinnedParams, ConversationsSetStateParams, DeviceList,
-    GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails,
-    GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword, GroupInviteLinkPreview,
-    GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams,
-    GroupsCreateParams, GroupsCreateResult, GroupsInviteLinkPasswordParams,
-    GroupsJoinViaLinkParams, GroupsMigrateParams, GroupsMigrateResult, GroupsParseInviteLinkParams,
-    GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
-    GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams,
-    IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary,
-    MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS,
-    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary,
-    MessageRequestOutcome, MessageRequestParams, MessagesDeleteForMeMessagesParams,
-    MessagesDeleteForMeParams, MessagesReportSpamParams, MessagesSendContactParams,
-    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
-    MessagesSendStickerParams, MessagesSendStoryParams, NotificationProfileSyncs,
-    NotificationProfilesListParams, NotificationProfilesSetRecordsParams, PeerTarget,
-    PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
-    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
-    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
-    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
-    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams, StoriesDisabled,
-    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
-    StoriesSetDisabledParams, StoryDistributionListSyncs, StoryDistributionListsListParams,
-    StoryDistributionListsSetRecordsParams, StorySendGroupFace, StorySendRecipientResult,
-    StorySendResult, StorySendSuccess, UsernameLookupEntry, UsernameLookupParams,
-    UsernameLookupResult, account_device_capabilities_from_engine, account_limit_error,
-    blocked_conversations_result, call_link_syncs_result, chat_folder_syncs_result,
-    conversation_state_from_engine, device_list_from_engine, group_create_result_from_engine,
-    group_invite_join_status_from_engine, group_invite_link_parse_from_engine,
-    group_invite_link_password_from_engine, group_invite_link_preview_from_engine,
-    group_migrate_result_from_engine, identities_addressing, identities_verify_intent,
-    identity_from_engine, identity_verify_stamp_word, import_groups_summary_from_engine,
-    merge_contacts_summary_from_engine, notification_profile_syncs_result,
-    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
-    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
-    story_distribution_lists_result, validate_account_delete_operation_id,
+    AccountDeviceCapabilities, AccountSyncState, AccountUsername, AccountsDeviceCapabilitiesParams,
+    AccountsGetDevicesParams, AccountsGetSyncStateParams, AccountsGetUsernameParams,
+    AccountsSetExpireTimerParams, AccountsSetProfileParams, AccountsSetUsernameParams,
+    AccountsUnlinkDeviceParams, AccountsUpdateConfigurationParams, AttachmentSendTarget,
+    AvatarDownload, BlockedConversations, CallLinkSyncs, CallsSendGroupCallUpdateParams,
+    CallsSendSignalParams, ChatFolderSyncs, ChatFoldersListParams, ChatFoldersSetRecordsParams,
+    CommonGroupsDetails, ConnectorService, ContactsSyncOutcome, ConversationState,
+    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
+    ConversationsGetStateParams, ConversationsReportSpamParams, ConversationsReportSpamResult,
+    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
+    ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, ConversationsSetStateParams,
+    DeviceList, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES,
+    GroupDetails, GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword,
+    GroupInviteLinkPreview, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
+    GroupsCancelJoinRequestParams, GroupsCreateParams, GroupsCreateResult,
+    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
+    GroupsMigrateResult, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
+    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
+    HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
+    IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary, MAX_AVATAR_DATA_URI_CHARS,
+    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView,
+    MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary, MessageRequestOutcome,
+    MessageRequestParams, MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams,
+    MessagesReportSpamParams, MessagesSendContactParams, MessagesSendPollCreateParams,
+    MessagesSendPollTerminateParams, MessagesSendPollVoteParams, MessagesSendStickerParams,
+    MessagesSendStoryParams, NotificationProfileSyncs, NotificationProfilesListParams,
+    NotificationProfilesSetRecordsParams, PeerTarget, PhoneLookupEntry, PhoneLookupParams,
+    PhoneLookupResult, PinnedConversations, PreparedHistoryDownload, PreparedSend,
+    ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams,
+    SendTextStyleParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
+    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
+    StickerPackSetSyncParams, StickerPackSyncs, StorageGetCallLinksParams, StorageIngestParams,
+    StorageSetCallLinkParams, StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams,
+    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListSyncs,
+    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, StorySendGroupFace,
+    StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
+    UsernameLookupParams, UsernameLookupResult, account_device_capabilities_from_engine,
+    account_limit_error, blocked_conversations_result, call_link_syncs_result,
+    chat_folder_syncs_result, conversation_state_from_engine, device_list_from_engine,
+    group_create_result_from_engine, group_invite_join_status_from_engine,
+    group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
+    group_invite_link_preview_from_engine, group_migrate_result_from_engine, identities_addressing,
+    identities_verify_intent, identity_from_engine, identity_verify_stamp_word,
+    import_groups_summary_from_engine, merge_contacts_summary_from_engine,
+    notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
+    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
+    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
+    story_distribution_lists_result, sync_state_from_engine, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -7197,6 +7197,30 @@ impl RuntimeSupervisor {
             .call("engine.deviceCapabilities", upstream, CallClass::ReadOnly)
             .await?;
         account_device_capabilities_from_engine(&result)
+    }
+
+    /// accounts.getSyncState (contract revision 1.286, §4.281): account
+    /// resolution then the pure-read engine call — the login-window sync
+    /// arm's projection `{contacts, storage, profile, sinceMs}`, gated by the
+    /// `sync_state_from_engine` shape check (closed phase vocabulary +
+    /// numeric `sinceMs`; a bad shape is a protocol defect, never a guessed
+    /// face). No mutation, no local persistence, no logging: the call is
+    /// idempotent by construction (the engine's answer is a snapshot of its
+    /// own window book), which is the §二 P-B-3 polling contract the desktop
+    /// gate's fallback rides.
+    pub async fn get_sync_state(
+        &self,
+        params: AccountsGetSyncStateParams,
+    ) -> Result<AccountSyncState, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_accounts_get_sync_state(&params.account_id)?
+        };
+        let result = engine
+            .call("getSyncState", upstream, CallClass::ReadOnly)
+            .await?;
+        sync_state_from_engine(&result)
     }
 
     /// accounts.getDevices (contract revision 1.122, §4.103, capability

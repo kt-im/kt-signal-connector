@@ -488,6 +488,13 @@ pub const METHODS: &[MethodRow] = &[
     // indeterminate outcome face answers SEND_OUTCOME_UNKNOWN and is never
     // retried.
     ("accounts.getDevices", Lane::Read, false, "read"),
+    // Login-window sync projection (contract revision 1.286, §4.281): the
+    // engine's pure-read `getSyncState` passthrough — {contacts, storage,
+    // profile, sinceMs} behind the closed phase vocabulary shape gate. Read
+    // lane, non-mutating, no local persistence: this is the desktop gate's
+    // bounded polling fallback (SIGNAL-STAGE1 §二 P-B-3), so a repeated call
+    // must answer the same face and never serialize on the account mutex.
+    ("accounts.getSyncState", Lane::Read, false, "read"),
     ("accounts.unlinkDevice", Lane::Send, true, "accounts"),
     // Username lookup (contract revision 1.59, §4.55): upstream `getUserStatus
     // --username` passthrough (0.14.8 GetUserStatusCommand.java:41,69) — one
@@ -1081,6 +1088,7 @@ mod tests {
             "groups.common",
             "accounts.deviceCapabilities",
             "accounts.getDevices",
+            "accounts.getSyncState",
             "stickerPacks.getManifest",
             "stickerPacks.getImage",
             "conversations.getPinned",

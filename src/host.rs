@@ -29,9 +29,10 @@ use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
     AccountDeleteLocalDataParams, AccountsDeviceCapabilitiesParams, AccountsGetDevicesParams,
-    AccountsGetUsernameParams, AccountsSetExpireTimerParams, AccountsSetProfileParams,
-    AccountsSetUsernameParams, AccountsUnlinkDeviceParams, AccountsUpdateConfigurationParams,
-    BackupsCloudStatusParams, BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
+    AccountsGetSyncStateParams, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
+    AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUnlinkDeviceParams,
+    AccountsUpdateConfigurationParams, BackupsCloudStatusParams,
+    BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
     BackupsExportFileReadChunkParams, BackupsExportParams, BackupsExportPlaintextParams,
     BackupsExportStatusParams, BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams,
     BackupsRestoreFromCloudParams, BackupsUploadStatusParams, BackupsUploadToCloudParams,
@@ -1755,6 +1756,31 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                         "accounts.deviceCapabilities",
                         "params",
                         "invalid accounts.deviceCapabilities params",
+                    ),
+                ),
+            }
+        }
+        // accounts.getSyncState (contract revision 1.286, §4.281): the
+        // login-window sync projection's read face — a pure pass-through of
+        // the engine's {contacts, storage, profile, sinceMs} behind the shape
+        // gate, answering the desktop gate's polling fallback (SIGNAL-STAGE1
+        // §二 P-B-3). Read lane, no mutation, no local persistence: a repeated
+        // call answers the same face by construction.
+        "accounts.getSyncState" => {
+            match serde_json::from_value::<AccountsGetSyncStateParams>(request.params) {
+                Ok(params) => match runtime.get_sync_state(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "accounts.getSyncState",
+                        "params",
+                        "invalid accounts.getSyncState params",
                     ),
                 ),
             }

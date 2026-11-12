@@ -2734,6 +2734,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.get_device_capabilities(params).await
     }
 
+    /// accounts.getSyncState (contract revision 1.286, §4.281): the login
+    /// window projection lives in the account's owning engine process, so the
+    /// read routes there (pure snapshot, never a transition).
+    pub async fn get_sync_state(
+        &self,
+        params: crate::service::AccountsGetSyncStateParams,
+    ) -> Result<crate::service::AccountSyncState, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.get_sync_state(params).await
+    }
+
     /// accounts.getDevices (contract revision 1.122, §4.103): the device list
     /// is the account's own upstream state, so the read routes through the
     /// account's owning engine.
