@@ -21749,3 +21749,27 @@ bindings 仍然 active；watchdog 看到 engine 的 `listAccounts` 不再列这�
 | relink_over_a_parked_terminal_account_takes_the_number_over | 终态号码可重链：finish 成功、一号一行、行回 `ready`（active）、旧槽与目录被清、新引擎 Running | 删掉接管块 → `ACCOUNT_ALREADY_LINKED` 红；删掉 reap 调用 → 「旧目录已删」红 |
 | parked_terminal_account_still_deletes_its_local_data | 终态槽仍可 engine-free 删除（行、目录、槽全清），且幂等 | `permits_engine_free_flow` 去掉 `DeviceUnlinked` → `ACCOUNT_UNLINKED` 红 |
 | `stale_engine_fallback_keeps_only_an_authoritative_terminal_unlink`（lib 单测） | 权威终态存活 / 无 origin 仍降级 | 同上投影变异红 |
+\n## §4.280 链接尝试租约与终止态回收（内部实现，零 wire 变更）\n\n**问题**： 预分配引擎槽，失败/取消/超时的尝试会把“有凭据、无账号行”的槽留在\n 下。启动对账曾直接拒绝启动（一个泄漏槽拖垮整个 connector），\n后改为“隔离后继续”兜底，但 live 路径仍会误杀“手机已批准、connector 没拿到回执”的槽。\n\n**租约**：槽所有权挂在  租约上（），不挂未提交的账号 id。\n 用 Drop 兜住所有提前返回/panic 旁路；/ 消费 self，\n禁止双结算。\n\n**唯一回收漏斗** ：finish 失败、、\nfinish 超时、guard Drop、30s reaper 五条路径全部走它，幂等（重放返回 ）。\n回收前先做一次**有界只读**  探测（，默认 3s）：\n命中本槽预分配 id 的账号 = provisioning 已在引擎侧落成 → 物化账号行并 \n（不隔离、不删目录、不停引擎）；探测失败/超时/不支持 → 原有回收\n（ / ）。 对外语义不变。\n\n**启动兜底**： 对残留槽执行隔离并继续启动，打\n 告警； 对同一槽报\n（与 apply 双向诚实）。\n\n**未覆盖窄窗**：registration 已写但  从未执行——只读探测看不到，维持回收\n（凭据进 ，字节可审计）。要可 promote 需引擎侧提交语义，属另一决策。\n
+
+## §4.280 链接尝试租约与终止态回收（内部实现，零 wire 变更）
+
+**问题**：link.start 预分配引擎槽，失败/取消/超时的尝试会把「有凭据、无账号行」的槽留在
+signal-data/engines/ 下。启动对账曾直接拒绝启动（一个泄漏槽拖垮整个 connector），
+后改为「隔离后继续」兜底，但 live 路径仍会误杀「手机已批准、connector 没拿到回执」的槽。
+
+**租约**：槽所有权挂在 linkAttemptId 租约上（LinkAttemptLease），不挂未提交的账号 id。
+LinkAttemptGuard 用 Drop 兜住所有提前返回/panic 旁路；promote/reclaim 消费 self，禁止双结算。
+
+**唯一回收漏斗** AccountPool::reclaim_link_attempt(attempt_id)：finish 失败、link.cancel、
+finish 超时、guard Drop、30s reaper 五条路径全部走它，幂等（重放返回 AlreadySettled）。
+回收前先做一次有界只读 listAccounts 探测（list_accounts_budget，默认 3s）：
+命中本槽预分配 id 的账号 = provisioning 已在引擎侧落成 → 物化账号行并返回 Promoted
+（不隔离、不删目录、不停引擎）；探测失败/超时/不支持 → 原有回收（Reclaimed / Quarantined）。
+LINK_OUTCOME_UNKNOWN 对外语义不变。
+
+**启动兜底**：reconcile_orphans 对残留槽执行隔离并继续启动，打
+invariant=link_attempt_slot_leaked 告警；migrate-pool --dry-run 对同一槽报
+action=quarantine, outcome=would-continue（与 apply 双向诚实）。
+
+**未覆盖窄窗**：registration 已写但 add_account 从未执行——只读探测看不到，维持回收
+（凭据进 .quarantine-*，字节可审计）。要可 promote 需引擎侧提交语义，属另一决策。
