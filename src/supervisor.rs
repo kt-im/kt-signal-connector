@@ -5536,25 +5536,21 @@ impl RuntimeSupervisor {
         status
     }
 
-    /// BUG-16 刀2b（2026-11-13 · 定址点诚实分类，绝不 blanket）：裸号码
-    /// direct 发送 + 引擎普通内部错面（-32603）= 号码两侧身份库都解不出
-    /// （connector 桥已先 miss 才放行号码，引擎 contacts 数字位再 miss）=
-    /// 对端不在 Signal。改答 `unregistered_recipient` retryable=false——
-    /// 渲染层（f50881c5 文案）明确告知，且不进自动重试队列。其余一切
-    /// 错误形态（超时/传输/限流/任意其它码）原样透传：这只分类「号码
-    /// 寻址在引擎本地解析失败」这一个点位，不做 -32603 的泛化映射。
-    fn classify_direct_number_send_error(
-        recipient: Option<&str>,
+    /// BUG-16 刀2b（2026-11-13 · 审计修正版：只映射引擎专用码，绝不猜
+    /// -32603）：引擎在号码寻址本地解析 miss 时答 **-32010 +
+    /// UNREGISTERED_RECIPIENT**（engine 0a98bf8）——知道自己失败原因的
+    /// 一侧给的确定性语义。本函数只把这个专用码映射成
+    /// `unregistered_recipient` retryable=false（渲染层 f50881c5 文案明确
+    /// 告知，不进自动重试队列）；**-32603 及一切其它形态（超时/传输/限
+    /// 流）原样透传**——boot_send_integrity 钉死的通用 upstream 契约
+    /// （-32603 → UPSTREAM_ERROR retryable=true 进自动重试）逐字节不变。
+    fn classify_unregistered_recipient_send_error(
         error: &crate::engine::EngineError,
     ) -> Option<ServiceError> {
-        let recipient = recipient?;
-        if crate::engine::is_uuid_shaped(recipient) || !recipient.starts_with('+') {
-            return None;
-        }
         if !matches!(
             error,
             crate::engine::EngineError::Upstream {
-                code: Some(-32603),
+                code: Some(-32010),
                 ..
             }
         ) {
@@ -5562,7 +5558,7 @@ impl RuntimeSupervisor {
         }
         Some(ServiceError::Api(ApiError::new(
             "unregistered_recipient",
-            "the recipient number resolves to no Signal identity (connector bridge and engine contacts both missed); the peer is not reachable on Signal",
+            "the engine resolved no Signal identity for this number-addressed send; the peer is not reachable on Signal",
             false,
         )))
     }
@@ -5580,121 +5576,111 @@ impl RuntimeSupervisor {
                 conversation_id,
                 params,
                 pending_sent_at,
-            } => {
-                // BUG-16 刀2b:Err 臂要在定址点读 recipient(见下),clone
-                // 先留一份不参与引擎调用的只读面。
-                let recipient_for_classification = params
-                    .get("recipient")
-                    .and_then(Value::as_array)
-                    .and_then(|list| list.first())
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                match engine.call("send", params, CallClass::Mutating).await {
-                    Ok(result) => {
-                        let sent_at = result
-                            .get("timestamp")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(pending_sent_at);
-                        // §4.173: the reply's per-recipient `results` array (the
-                        // group send shape) counted into success/failure totals.
-                        // Absent on direct sends (single recipient — the row
-                        // status is the whole story) and on any shape-hostile
-                        // array, which degrade to the pre-1.173 behavior.
-                        // §4.190 ⑦: the same array expands into per-recipient
-                        // Sent/Failed ledger seeds beside the counts.
-                        let outcomes = Self::send_outcomes_from_reply(&result);
-                        let seeds = Self::send_receipt_seeds_from_reply(&result);
-                        if outcomes
-                            .as_ref()
-                            .is_some_and(|counted| counted.succeeded == 0)
-                        {
-                            // Every recipient failed: nothing was delivered, so
-                            // the row settles definitively failed (retryable —
-                            // nobody got it, a resend carries no duplicate risk)
-                            // and the answer reports GROUP_SEND_FAILED.
-                            let events = self
-                                .service
-                                .lock()
-                                .await
-                                .complete_send_failed_group_outcomes(
-                                    &pending_id,
-                                    outcomes
-                                        .as_ref()
-                                        .expect("guarded by the succeeded == 0 check"),
-                                    seeds.as_deref().unwrap_or(&[]),
-                                )?;
-                            for event in events {
-                                let _ = self.host_events.send(event);
-                            }
-                            return Err(ServiceError::Api(ApiError::new(
-                                "GROUP_SEND_FAILED",
-                                "send failed for every recipient",
-                                true,
-                            )));
-                        }
-                        let (message, events) =
-                            self.service.lock().await.complete_send_success_seeded(
+            } => match engine.call("send", params, CallClass::Mutating).await {
+                Ok(result) => {
+                    let sent_at = result
+                        .get("timestamp")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(pending_sent_at);
+                    // §4.173: the reply's per-recipient `results` array (the
+                    // group send shape) counted into success/failure totals.
+                    // Absent on direct sends (single recipient — the row
+                    // status is the whole story) and on any shape-hostile
+                    // array, which degrade to the pre-1.173 behavior.
+                    // §4.190 ⑦: the same array expands into per-recipient
+                    // Sent/Failed ledger seeds beside the counts.
+                    let outcomes = Self::send_outcomes_from_reply(&result);
+                    let seeds = Self::send_receipt_seeds_from_reply(&result);
+                    if outcomes
+                        .as_ref()
+                        .is_some_and(|counted| counted.succeeded == 0)
+                    {
+                        // Every recipient failed: nothing was delivered, so
+                        // the row settles definitively failed (retryable —
+                        // nobody got it, a resend carries no duplicate risk)
+                        // and the answer reports GROUP_SEND_FAILED.
+                        let events = self
+                            .service
+                            .lock()
+                            .await
+                            .complete_send_failed_group_outcomes(
                                 &pending_id,
-                                &account_id,
-                                &conversation_id,
-                                sent_at,
-                                outcomes.as_ref(),
+                                outcomes
+                                    .as_ref()
+                                    .expect("guarded by the succeeded == 0 check"),
                                 seeds.as_deref().unwrap_or(&[]),
                             )?;
                         for event in events {
                             let _ = self.host_events.send(event);
                         }
-                        Ok(message)
+                        return Err(ServiceError::Api(ApiError::new(
+                            "GROUP_SEND_FAILED",
+                            "send failed for every recipient",
+                            true,
+                        )));
                     }
-                    Err(EngineError::UnknownOutcome) => {
-                        let events = self
-                            .service
-                            .lock()
-                            .await
-                            .complete_send_unknown(&pending_id)?;
-                        for event in events {
-                            let _ = self.host_events.send(event);
-                        }
-                        Err(ServiceError::Api(ApiError::new(
-                            "SEND_OUTCOME_UNKNOWN",
-                            "mutating request has an unknown outcome",
-                            false,
-                        )))
+                    let (message, events) =
+                        self.service.lock().await.complete_send_success_seeded(
+                            &pending_id,
+                            &account_id,
+                            &conversation_id,
+                            sent_at,
+                            outcomes.as_ref(),
+                            seeds.as_deref().unwrap_or(&[]),
+                        )?;
+                    for event in events {
+                        let _ = self.host_events.send(event);
                     }
-                    Err(error) => {
-                        // §4.123: the funnel settles classified — a
-                        // definitive-error answer in an automatic-retry arm also
-                        // arms the bounded queue schedule in the same guarded
-                        // write (the transport family on the curve beat, the
-                        // rate-limit family on the Retry-After beat), and kicks
-                        // the drain so the beat is honored at its own pace
-                        // instead of the tick's; every other class (and the
-                        // unknown outcome above, which never reaches this arm)
-                        // settles plain.
-                        let events = self
-                            .service
-                            .lock()
-                            .await
-                            .complete_send_failed_for_engine(&pending_id, &error)?;
-                        for event in events {
-                            let _ = self.host_events.send(event);
-                        }
-                        if ConnectorService::auto_retry_schedule(&error)
-                            != crate::store::SendRetrySchedule::None
-                        {
-                            self.notify_outbox_drain();
-                        }
-                        // BUG-16 刀2b：定址点诚实分类（见 classify_direct_number_send_error）。
-                        if let Some(classified) = Self::classify_direct_number_send_error(
-                            recipient_for_classification.as_deref(),
-                            &error,
-                        ) {
-                            return Err(classified);
-                        }
-                        Err(ServiceError::Engine(error))
-                    }
+                    Ok(message)
                 }
-            }
+                Err(EngineError::UnknownOutcome) => {
+                    let events = self
+                        .service
+                        .lock()
+                        .await
+                        .complete_send_unknown(&pending_id)?;
+                    for event in events {
+                        let _ = self.host_events.send(event);
+                    }
+                    Err(ServiceError::Api(ApiError::new(
+                        "SEND_OUTCOME_UNKNOWN",
+                        "mutating request has an unknown outcome",
+                        false,
+                    )))
+                }
+                Err(error) => {
+                    // §4.123: the funnel settles classified — a
+                    // definitive-error answer in an automatic-retry arm also
+                    // arms the bounded queue schedule in the same guarded
+                    // write (the transport family on the curve beat, the
+                    // rate-limit family on the Retry-After beat), and kicks
+                    // the drain so the beat is honored at its own pace
+                    // instead of the tick's; every other class (and the
+                    // unknown outcome above, which never reaches this arm)
+                    // settles plain.
+                    let events = self
+                        .service
+                        .lock()
+                        .await
+                        .complete_send_failed_for_engine(&pending_id, &error)?;
+                    for event in events {
+                        let _ = self.host_events.send(event);
+                    }
+                    if ConnectorService::auto_retry_schedule(&error)
+                        != crate::store::SendRetrySchedule::None
+                    {
+                        self.notify_outbox_drain();
+                    }
+                    // BUG-16 刀2b（修正版）：只映射引擎 -32010 专用码；
+                    // -32603 全透传。
+                    if let Some(classified) =
+                        Self::classify_unregistered_recipient_send_error(&error)
+                    {
+                        return Err(classified);
+                    }
+                    Err(ServiceError::Engine(error))
+                }
+            },
         }
     }
 
@@ -13530,20 +13516,24 @@ mod tests {
     use super::*;
     use crate::engine::EngineError as EngineErrorVariant;
 
-    /// BUG-16 刀2b：定址点分类的四臂——只在「裸号码 + 引擎 -32603 内部
-    /// 错面」产出 unregistered_recipient(retryable=false)，其余一律透传。
+    /// BUG-16 刀2b（审计修正版）：只映射引擎 -32010 专用码；
+    /// **-32603 必须透传**（boot_send_integrity 的通用 upstream 契约：
+    /// UPSTREAM_ERROR retryable=true 进自动重试——fd72b22 首版的回归正是
+    /// 这里被集成测试抓住的）。
     #[test]
-    fn classify_direct_number_send_error_only_fires_on_bare_number_internal_face() {
+    fn classify_unregistered_recipient_only_fires_on_dedicated_code() {
+        let dedicated = EngineErrorVariant::Upstream {
+            cause: Some("UNREGISTERED_RECIPIENT".into()),
+            code: Some(-32010),
+        };
         let internal = EngineErrorVariant::Upstream {
             cause: None,
             code: Some(-32603),
         };
         let timeout = EngineErrorVariant::EngineRequestTimeout { data: None };
 
-        // 裸号码 + -32603 → unregistered_recipient, retryable=false
-        let hit =
-            RuntimeSupervisor::classify_direct_number_send_error(Some("+8618800000000"), &internal)
-                .expect("bare number + internal face classifies");
+        let hit = RuntimeSupervisor::classify_unregistered_recipient_send_error(&dedicated)
+            .expect("dedicated code classifies");
         match hit {
             ServiceError::Api(api) => {
                 assert_eq!(api.code, "unregistered_recipient");
@@ -13551,21 +13541,11 @@ mod tests {
             }
             other => panic!("expected Api, got {other:?}"),
         }
-        // ACI 收件人 → 透传(None)
         assert!(
-            RuntimeSupervisor::classify_direct_number_send_error(
-                Some("3f1a2b4c-5d6e-4f7a-8b9c-0d1e2f3a4b5c"),
-                &internal,
-            )
-            .is_none()
+            RuntimeSupervisor::classify_unregistered_recipient_send_error(&internal).is_none(),
+            "-32603 must pass through untouched (boot_send_integrity contract)"
         );
-        // 裸号码但非内部错面(超时)→ 透传
-        assert!(
-            RuntimeSupervisor::classify_direct_number_send_error(Some("+8618800000000"), &timeout)
-                .is_none()
-        );
-        // 无 recipient 面(群发/旧形状)→ 透传
-        assert!(RuntimeSupervisor::classify_direct_number_send_error(None, &internal).is_none());
+        assert!(RuntimeSupervisor::classify_unregistered_recipient_send_error(&timeout).is_none());
     }
 
     use super::hidden_write_back_targets;
