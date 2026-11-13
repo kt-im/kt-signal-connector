@@ -243,6 +243,9 @@ struct HostDispatchPermit {
     /// 相互独立。
     _link_lane: Option<OwnedSemaphorePermit>,
     _account: Option<OwnedMutexGuard<()>>,
+    /// BUG-15：附件下载/删除屏障用的 per-account 媒体互斥（与 send
+    /// 互斥分离，下载不再阻塞发送）。
+    _media_account: Option<OwnedMutexGuard<()>>,
     _deleting: Option<DeletingAccountGuard>,
 }
 
@@ -281,6 +284,11 @@ struct HostDispatchLimits {
     /// 一个 permit 释放后条目在下次 acquire 时回收。
     account_lanes: Mutex<HashMap<AccountLaneKey, Weak<Semaphore>>>,
     send_accounts: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    /// BUG-15：媒体传输（attachments.download）独占的 per-account 互斥。
+    /// 下载动辄数秒，若与发送共用 send_accounts，会把同账号的 sendText /
+    /// syncRead / markRead 全部串行堵在后面（真机实测 4.2–9.3 秒发送延迟，
+    /// 证据见 send_latency_probe wait_ms）。删除仍要同时 drain 这两把锁。
+    media_accounts: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     /// One bounded lane per proxy group for `link.finish` (ADR 0001 R3).
     /// Same weak-handle discipline as `send_accounts`.
     link_lanes: Mutex<HashMap<String, Weak<Semaphore>>>,
@@ -366,6 +374,7 @@ impl HostDispatchLimits {
             global_send: Arc::new(Semaphore::new(GLOBAL_SEND_CONCURRENCY)),
             account_lanes: Mutex::new(HashMap::new()),
             send_accounts: Mutex::new(HashMap::new()),
+            media_accounts: Mutex::new(HashMap::new()),
             link_lanes: Mutex::new(HashMap::new()),
             deleting_accounts: Arc::new(StdMutex::new(HashMap::new())),
         }
@@ -397,6 +406,22 @@ impl HostDispatchLimits {
             let lane = Arc::new(Semaphore::new(lane_capacity(kind)));
             lanes.insert(key, Arc::downgrade(&lane));
             lane
+        }
+    }
+
+    /// BUG-15：取 per-account 互斥（Weak 表，permit 自持 Arc）。
+    async fn account_mutex(
+        map: &Mutex<HashMap<String, Weak<Mutex<()>>>>,
+        key: String,
+    ) -> Arc<Mutex<()>> {
+        let mut accounts = map.lock().await;
+        accounts.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = accounts.get(&key).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            accounts.insert(key, Arc::downgrade(&lock));
+            lock
         }
     }
 
@@ -455,21 +480,28 @@ impl HostDispatchLimits {
                 }
                 None
             };
-            let account_lock = {
-                let mut accounts = self.send_accounts.lock().await;
-                accounts.retain(|_, lock| lock.strong_count() > 0);
-                if let Some(lock) = accounts.get(&account_key).and_then(Weak::upgrade) {
-                    lock
-                } else {
-                    let lock = Arc::new(Mutex::new(()));
-                    accounts.insert(account_key, Arc::downgrade(&lock));
-                    lock
-                }
+            // BUG-15：附件下载走独立媒体锁——它常达秒级，不能把同账号的
+            // 发送/已读写全部堵在 send_accounts 后面（真机实测 4.2–9.3 秒）。
+            // 删除仍按「send 锁 → 媒体锁」顺序同时 drain 两把：下载与删除
+            // 绝不并发，发送不必等下载。
+            let is_media_download = method == "attachments.download";
+            let primary_map = if is_media_download {
+                &self.media_accounts
+            } else {
+                &self.send_accounts
             };
-            // 顺序固定：账号锁 → per-account lane → 全局兜底。先账号后
-            // 配额的旧理由仍然成立：一个忙账号不能一边攥着 permit 一边
-            // 等自己的账号锁。
+            let account_lock = Self::account_mutex(primary_map, account_key.clone()).await;
+            // 顺序固定：账号锁 → 媒体锁（仅删除）→ per-account lane → 全局兜底。
+            // 先账号后配额的旧理由仍然成立：一个忙账号不能一边攥着 permit
+            // 一边等自己的账号锁。
             let account = account_lock.lock_owned().await;
+            let media = if method == "accounts.deleteLocalData" {
+                let media_lock =
+                    Self::account_mutex(&self.media_accounts, account_key.clone()).await;
+                Some(media_lock.lock_owned().await)
+            } else {
+                None
+            };
             let kind = methods::lane(method);
             let account_lane = acquire_lane(
                 self.account_lane(account_id, kind).await,
@@ -486,6 +518,7 @@ impl HostDispatchLimits {
                 _global_lane: Some(global_lane),
                 _link_lane: None,
                 _account: Some(account),
+                _media_account: media,
                 _deleting: deleting,
             });
         }
@@ -530,6 +563,7 @@ impl HostDispatchLimits {
                 _global_lane: None,
                 _link_lane: Some(permit),
                 _account: None,
+                _media_account: None,
                 _deleting: None,
             });
         }
@@ -550,6 +584,7 @@ impl HostDispatchLimits {
             _global_lane: Some(global_lane),
             _link_lane: None,
             _account: None,
+            _media_account: None,
             _deleting: None,
         })
     }
@@ -7893,5 +7928,45 @@ mod tests {
             Some(&json!("store_key_rejected"))
         );
         assert_eq!(api.message, "the encrypted store cannot be opened");
+    }
+    /// BUG-15：附件下载与发送共用 per-account mutex 时，一次 4–9 秒的下载
+    /// 会把同账号的 sendText 全部堵死（真机 send_latency_probe wait_ms 实证）。
+    /// 下载改走独立媒体锁后：发送不必等下载；删除仍要 drain 两把锁。
+    #[tokio::test]
+    async fn media_download_does_not_block_sends_but_delete_drains_it() {
+        let limits = HostDispatchLimits::new();
+        let download = limits
+            .acquire("attachments.download", Some("acct"), None)
+            .await
+            .expect("download permit");
+        let send = tokio::time::timeout(
+            Duration::from_millis(300),
+            limits.acquire("messages.sendText", Some("acct"), None),
+        )
+        .await;
+        assert!(
+            send.is_ok(),
+            "a send must not queue behind an attachment download (BUG-15)"
+        );
+        drop(send.expect("send resolves").expect("send permit"));
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(150),
+            limits.acquire("accounts.deleteLocalData", Some("acct"), None),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the delete barrier must still drain the media mutex before deleting"
+        );
+        drop(download);
+        let delete = tokio::time::timeout(
+            Duration::from_millis(500),
+            limits.acquire("accounts.deleteLocalData", Some("acct"), None),
+        )
+        .await;
+        assert!(
+            delete.is_ok(),
+            "the delete proceeds once the media transfer is gone"
+        );
     }
 }
