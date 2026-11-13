@@ -342,7 +342,13 @@ async fn a_cold_slot_wakes_for_delete_instead_of_failing_closed() {
     let id = account_id(9);
     {
         let store = store_for(&temp);
-        seed_account(&store, &signal_data(&temp), &id, FIRST_LINK_NUMBER, "default");
+        seed_account(
+            &store,
+            &signal_data(&temp),
+            &id,
+            FIRST_LINK_NUMBER,
+            "default",
+        );
         store
             .prepare_account_delete(&id, "bug8-cold-slot-op", 10)
             .unwrap();
@@ -350,7 +356,10 @@ async fn a_cold_slot_wakes_for_delete_instead_of_failing_closed() {
     let runtime = open_pool(&temp);
     runtime.start().await.unwrap();
     let pool = runtime.account_pool().expect("full pooling");
-    assert!(pool.hibernate_slot(&id).await, "the slot cools without losing its data directory");
+    assert!(
+        pool.hibernate_slot(&id).await,
+        "the slot cools without losing its data directory"
+    );
     assert!(data_dir(&temp, &id).is_dir());
     // 冷槽删除：唤醒引擎（一次 spawn）后正常删除，而不是答 ENGINE_NOT_PROVISIONED。
     runtime
