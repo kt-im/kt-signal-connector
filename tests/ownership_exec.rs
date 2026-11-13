@@ -154,15 +154,39 @@ async fn ownership_hibernate_keeps_directory_and_is_idempotent() {
 
     let removed = runtime.ownership_hibernate_slot(&account).await;
     assert!(removed, "a live slot must hibernate on the first call");
-    assert_eq!(engines_count(&status_value(&runtime).await), 0);
+    // BUG-12:槽留在运行集,status 里 state=stopped(冷槽,非缺席)——
+    // 引擎数仍为 1,但状态从 running 翻为 stopped。
+    let status = status_value(&runtime).await;
+    assert_eq!(
+        engines_count(&status),
+        1,
+        "slot stays listed (cold, not gone)"
+    );
+    assert_eq!(
+        status["engines"][0]["state"].as_str(),
+        Some("stopped"),
+        "hibernated slot reports stopped (cold wake available)"
+    );
     assert!(
         data_dir(&temp, &account).exists(),
         "hibernate keeps the directory cold (wake on next request)"
     );
     assert!(!has_quarantine(&temp), "hibernate never quarantines bytes");
 
+    // BUG-12 核心:槽留在运行集(可唤醒),不是从 map 移除——路由层下次
+    // 拿得到槽并走 ensure_resident 冷唤(而不是 ENGINE_NOT_PROVISIONED)。
+    assert!(
+        runtime
+            .account_pool()
+            .is_some_and(|pool| pool.get(&account).is_some()),
+        "hibernated slot stays in the pool map for cold wake (BUG-12)"
+    );
+
     let replay = runtime.ownership_hibernate_slot(&account).await;
-    assert!(!replay, "replay must be a quiet already-settled no-op");
+    assert!(
+        replay,
+        "replay on a hibernated (cold) slot is idempotent true"
+    );
 }
 
 #[tokio::test]
