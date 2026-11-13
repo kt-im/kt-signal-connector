@@ -248,25 +248,11 @@ async fn body_ranges_receive_round_trips_to_every_wire_face() {
     request(&mut client, "start", "runtime.start", json!({})).await;
     let account_id = link_account(&mut client).await;
 
-    let listed = request(
-        &mut client,
-        "list-initial",
-        "conversations.list",
-        json!({ "accountId": account_id, "limit": 50 }),
-    )
-    .await;
     // The link burst delivers exactly one incoming receive from the fixture
     // peer, so the direct row materializes at link time (the summary carries
-    // no peer identity — the type filter is the honest locator).
-    let conversation_id = listed["result"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["type"] == "direct" && row["isSelf"] == false)
-        .expect("the fixture peer row materializes at link time")["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    // no peer identity — the type filter is the honest locator). 轮询等待，
+    // 不假设「link 应答返回时行已落库」。
+    let conversation_id = wait_for_direct_conversation(&mut client, &account_id).await;
 
     // One marker burst, four receives: the clean styled row, the hostile mix
     // the gate must filter, the all-invalid list that must collapse to
