@@ -331,45 +331,33 @@ async fn a_delete_of_an_account_whose_slot_was_quarantined_converges_without_an_
     );
 }
 
-/// Fail-closed guard: "the slot table has no entry" is not evidence that the
-/// data is gone. A row whose data directory still exists keeps answering
-/// ENGINE_NOT_PROVISIONED, and the delete reconcile never writes it off.
+/// BUG-12 语义（2026-11-12 起）：休眠只停引擎、槽留在运行集，所以「冷槽」
+/// 的删除不再是「池看不见 = 数据没了」的 fail-closed 场景——请求路径会先
+/// 唤醒引擎，再走正常删除。本用例钉住这条新语义（旧版用例假设 hibernate
+/// 会把槽移出 map，那正是 BUG-12 的缺陷形态）。
 #[tokio::test]
-async fn a_delete_that_still_owns_its_data_directory_fails_closed() {
+async fn a_cold_slot_wakes_for_delete_instead_of_failing_closed() {
     let _guard = BUG8_TEST_LOCK.lock().await;
     let temp = TempDir::new().unwrap();
-    let id = account_id(1);
+    let id = account_id(9);
     {
         let store = store_for(&temp);
-        seed_account(
-            &store,
-            &signal_data(&temp),
-            &id,
-            FIRST_LINK_NUMBER,
-            "default",
-        );
+        seed_account(&store, &signal_data(&temp), &id, FIRST_LINK_NUMBER, "default");
         store
-            .prepare_account_delete(&id, "bug8-broken-pool-op", 10)
+            .prepare_account_delete(&id, "bug8-cold-slot-op", 10)
             .unwrap();
     }
     let runtime = open_pool(&temp);
     runtime.start().await.unwrap();
     let pool = runtime.account_pool().expect("full pooling");
-    assert!(
-        pool.hibernate_slot(&id).await,
-        "the slot cools without losing its data directory"
-    );
+    assert!(pool.hibernate_slot(&id).await, "the slot cools without losing its data directory");
     assert!(data_dir(&temp, &id).is_dir());
-    let error = runtime
-        .delete_local_account(id.clone(), Some("bug8-broken-pool-op".to_string()))
+    // 冷槽删除：唤醒引擎（一次 spawn）后正常删除，而不是答 ENGINE_NOT_PROVISIONED。
+    runtime
+        .delete_local_account(id.clone(), Some("bug8-cold-slot-op".to_string()))
         .await
-        .expect_err("a row whose data directory still exists is not written off");
-    assert_eq!(error.into_api().code, "ENGINE_NOT_PROVISIONED");
-    assert_eq!(
-        runtime.account_state(&id).await.unwrap(),
-        Some("ready"),
-        "the account row survives the refusal"
-    );
+        .expect("a cold slot wakes for the delete instead of failing closed");
+    assert_eq!(runtime.account_state(&id).await.unwrap(), None);
 }
 
 /// BUG-8 item 4 (connector half): the phone-approved link must not be refused
