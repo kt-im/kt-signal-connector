@@ -4747,11 +4747,14 @@ impl ConnectorService {
     ) -> Result<PreparedSend, ServiceError> {
         let account_id = account.id.as_str();
         let conversation_id = conversation.id.as_str();
+        // BUG-16 刀2：裸号码 direct 对端先过桥解析成 ACI（行 id/标题不动，
+        // 只换引擎定址键；桥 miss 原样放行——见 resolver 头注）。
+        let conversation = self.resolve_direct_send_recipient(account_id, conversation)?;
         // Quote resolution is part of send validation and runs before the
         // pending row exists: a rejected quote leaves nothing behind, so the
         // same clientRequestId stays a fresh (re-validated) request.
         let quote = quote_message_id
-            .map(|id| self.resolve_quote(account, conversation, id))
+            .map(|id| self.resolve_quote(account, &conversation, id))
             .transpose()?;
         // §4.262: an in-place retry addresses the ORIGINAL row by its own id —
         // the deterministic first-send id is the same value by construction
@@ -4930,7 +4933,7 @@ impl ConnectorService {
             text_styles.as_deref(),
             attachments,
             quote,
-            conversation,
+            &conversation,
             view_once,
             story_reply_author,
             story_reply_timestamp,
@@ -6143,6 +6146,41 @@ impl ConnectorService {
             mrr_upstream,
             report_upstream,
         })
+    }
+
+    /// BUG-16 刀2（2026-11-13 · 发送侧反向解析）：direct 发送的裸号码对端，
+    /// 经 peer_identities 桥（aci_for_peer_key，与 report_target_aci 同款
+    /// §4.48 阶梯）解析成 ACI 后再发。
+    ///
+    /// 事实修正（engine resolve_recipient 源码核对）：引擎**收**裸号码——
+    /// 经它自己的 contacts 数字位匹配解析；BUG-16 现场 1ms 拒是因为该号
+    /// 不在引擎 contacts（手机联系人同步未达）而 ACI 只在 connector 桥里
+    /// （带 ACI 的入站信封记的）——两个身份库各知一半。桥命中 → 按 ACI 发
+    /// （本机权威映射，不依赖手机同步）；桥 miss → **原样放行号码**（引擎
+    /// contacts 或能自解，旧路径行为不变——诚实分类在 supervisor 定址点
+    /// 做，见 dispatch_prepared 的 unregistered_recipient 臂）。
+    fn resolve_direct_send_recipient(
+        &self,
+        account_id: &str,
+        conversation: &ConversationRow,
+    ) -> Result<ConversationRow, ServiceError> {
+        if conversation.kind != "direct" || crate::engine::is_uuid_shaped(&conversation.peer_key) {
+            return Ok(conversation.clone());
+        }
+        match self
+            .store
+            .aci_for_peer_key(account_id, &conversation.peer_key)?
+        {
+            Some(aci) => {
+                if aci.is_empty() {
+                    return Ok(conversation.clone());
+                }
+                let mut resolved = conversation.clone();
+                resolved.peer_key = aci;
+                Ok(resolved)
+            }
+            None => Ok(conversation.clone()),
+        }
     }
 
     /// The report address (contract revision 1.49, §4.48): a UUID-shaped
@@ -25350,6 +25388,90 @@ mod tests {
             ),
             Err(ServiceError::Api(error)) if error.code == "CAPABILITY_UNAVAILABLE"
         ));
+    }
+
+    /// BUG-16 刀2a：裸号码 direct 对端过 peer_identities 桥命中 → 引擎
+    /// recipient 改用 ACI（本机权威映射，不依赖手机联系人同步）；行 id/
+    /// 标题不动，消息仍落原号码会话。
+    #[test]
+    fn send_text_resolves_bare_number_recipient_through_identity_bridge() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let aci = "3f1a2b4c-5d6e-4f7a-8b9c-0d1e2f3a4b5c";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, aci, "+15555550101")
+            .unwrap();
+        let dispatch = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "bridge hit must address by ACI",
+                "req-bridge-hit",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => params,
+            other => panic!("expected dispatch, got {other:?}"),
+        };
+        assert_eq!(
+            dispatch["recipient"],
+            serde_json::json!([aci]),
+            "bridge hit must swap the engine target to the ACI"
+        );
+    }
+
+    /// BUG-16 刀2a miss 臂：桥无映射 → 原样放行号码（引擎 contacts 或能自
+    /// 解，旧路径行为不变——诚实分类在 supervisor 定址点，不在此 fail-fast）。
+    #[test]
+    fn send_text_passes_bare_number_through_when_bridge_misses() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Peer")
+            .unwrap();
+        let dispatch = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "bridge miss keeps the number",
+                "req-bridge-miss",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => params,
+            other => panic!("expected dispatch, got {other:?}"),
+        };
+        assert_eq!(dispatch["recipient"], serde_json::json!(["+15555550102"]));
     }
 
     #[test]
