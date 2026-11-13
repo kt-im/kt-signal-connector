@@ -1897,7 +1897,37 @@ impl AccountPool {
     /// connector 执行臂——停引擎 + 目录原地保留(冷槽语义:下次账号请求
     /// 自动重新拉起,代价一次 spawn)。幂等同上。
     pub async fn hibernate_slot(self: &Arc<Self>, account_id: &str) -> bool {
-        self.discard_with(account_id, SlotDisposition::Keep).await
+        // BUG-12 修正(D4/阶段1-5c):**停引擎但槽留在运行集**——不 discard、
+        // 不清租约/会话/前向账。这正是池自身的冷槽形态(resident=false),下次
+        // 该账号请求走 pool.get → ensure_resident → wake_slot 自动拉起。首版
+        // 用 discard_with(Keep)(从 map 移除)导致 pool.get 返回 None、请求答
+        // ENGINE_NOT_PROVISIONED,唤醒链路够不到(军规:破坏性动作先有已验证
+        // 的恢复路径)。幂等:槽不在=false;已停=true(重放安全)。
+        let Some(slot) = self
+            .slots
+            .read()
+            .ok()
+            .and_then(|slots| slots.get(account_id).cloned())
+        else {
+            return false;
+        };
+        if !slot.is_resident() {
+            return true;
+        }
+        slot.set_resident(false);
+        slot.supervisor.stop_background_tasks();
+        if let Err(error) = slot.supervisor.shutdown().await {
+            tracing::warn!(
+                account_id = %slot.account_id,
+                error_class = error.class(),
+                "hibernate: engine did not stop cleanly (slot stays for wake)"
+            );
+        }
+        tracing::info!(
+            account_id = %slot.account_id,
+            "ownership hibernate: engine stopped, slot kept for cold wake (D4/BUG-12)"
+        );
+        true
     }
 
     /// The one teardown every slot-removal path uses (account delete,
