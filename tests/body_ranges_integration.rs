@@ -163,6 +163,35 @@ async fn link_account(client: &mut Framed<UnixStream, LinesCodec>) -> String {
     finished["result"]["id"].as_str().unwrap().to_string()
 }
 
+
+/// 等直聊会话行出现（link 完成后行落库有时序：本地快、CI 慢，原实现立即断言
+/// 会偶发 `Option::unwrap() on a None value`——main 的 Gate 3 之前从没真正跑到，
+/// 这个时序假设一直没暴露）。轮询到出现为止，最多 10 秒。
+async fn wait_for_direct_conversation(
+    client: &mut Framed<UnixStream, LinesCodec>,
+    account_id: &str,
+) -> String {
+    for attempt in 0..40_u32 {
+        let listed = request(
+            client,
+            &format!("list-wait-{attempt}"),
+            "conversations.list",
+            json!({ "accountId": account_id, "limit": 50 }),
+        )
+        .await;
+        let found = listed["result"]["items"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|row| row["type"] == "direct" && row["isSelf"] == false)
+                .and_then(|row| row["id"].as_str())
+        });
+        if let Some(id) = found {
+            return id.to_string();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("the fixture peer row never materialized within 10s");
+}
+
 /// Stage envelopes through the runtime injection marker and drain until
 /// `found` answers true over the frames that arrive while polling.
 async fn drain_until(
