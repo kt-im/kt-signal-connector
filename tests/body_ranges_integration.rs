@@ -163,7 +163,6 @@ async fn link_account(client: &mut Framed<UnixStream, LinesCodec>) -> String {
     finished["result"]["id"].as_str().unwrap().to_string()
 }
 
-
 /// 等直聊会话行出现（link 完成后行落库有时序：本地快、CI 慢，原实现立即断言
 /// 会偶发 `Option::unwrap() on a None value`——main 的 Gate 3 之前从没真正跑到，
 /// 这个时序假设一直没暴露）。轮询到出现为止，最多 10 秒。
