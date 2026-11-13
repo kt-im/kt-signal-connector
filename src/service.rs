@@ -6167,9 +6167,12 @@ impl ConnectorService {
         if conversation.kind != "direct" || crate::engine::is_uuid_shaped(&conversation.peer_key) {
             return Ok(conversation.clone());
         }
+        // BUG-16 刀2a 修正（双拼写）：真机实证 peer_identities 存的号码拼写
+        // 与会话 peer_key 差一「+」，精确单查假 miss——改走 aci_for_phone_key
+        //（§4.144 双拼写：先精确再替身形，非号码键自然只走精确臂）。
         match self
             .store
-            .aci_for_peer_key(account_id, &conversation.peer_key)?
+            .aci_for_phone_key(account_id, &conversation.peer_key)?
         {
             Some(aci) => {
                 if aci.is_empty() {
@@ -25434,6 +25437,52 @@ mod tests {
             dispatch["recipient"],
             serde_json::json!([aci]),
             "bridge hit must swap the engine target to the ACI"
+        );
+    }
+
+    /// BUG-16 刀2a 修正（双拼写）：桥里存的是**另一种拼写**（bare digits，
+    /// 会话 peer_key 带「+」）也必须命中——真机实证的缺口形态。
+    #[test]
+    fn send_text_resolves_number_recipient_across_alternate_spelling() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550103", "Peer")
+            .unwrap();
+        let aci = "7c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, aci, "15555550103")
+            .unwrap();
+        let dispatch = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "alternate spelling must still hit the bridge",
+                "req-alt-spelling",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => params,
+            other => panic!("expected dispatch, got {other:?}"),
+        };
+        assert_eq!(
+            dispatch["recipient"],
+            serde_json::json!([aci]),
+            "alternate-spelling bridge row must resolve to the ACI"
         );
     }
 

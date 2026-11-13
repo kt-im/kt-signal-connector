@@ -9983,6 +9983,21 @@ impl Store {
         aci_for_peer_key_on(&conn, account_id, peer_key)
     }
 
+    /// BUG-16 刀2a（2026-11-13 · 双拼写修正，dsh 真机复审暴露的缺口）：
+    /// 号码形态 peer_key 的 ACI 解析走 §4.144 双拼写面（先精确、miss 再
+    /// 试 alternate_phone_spelling）——真实数据里 peer_identities 存的拼
+    /// 写和会话 peer_key 常一「+」之差，精确单查会假 miss 把已注册对端
+    /// 放行给引擎答 -32010。非号码键（群键/UUID/任意文本）无替身形，
+    /// 自然只走精确臂。
+    pub fn aci_for_phone_key(
+        &self,
+        account_id: &str,
+        peer_key: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        aci_for_phone_key_on(&conn, account_id, peer_key)
+    }
+
     /// Contract 1.181 (§4.181): the groups-in-common answer over the §4.39
     /// captured rosters — the official ConversationDetails.preload.tsx:80-100
     /// derivation (a direct peer's identity against every group's member
