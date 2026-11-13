@@ -47,7 +47,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # 1.99.0 的 toolchain action 默认只装 rustc/cargo，不装 rustfmt/clippy——
+      # 下面两道 gate 会直接 `cargo-fmt is not installed` 失败（main 上 2026-11-12
+      # 起一直红，同根因）。组件显式声明才能跑完整 gate 集。
       - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
