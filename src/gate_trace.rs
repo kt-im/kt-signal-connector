@@ -35,10 +35,11 @@ pub(crate) fn account8(signal_account: Option<&str>) -> String {
     encoded
 }
 
-/// Emit exactly one connector-hop line. WARN (not INFO) so the line survives
-/// a `KT_SIGNAL_LOG=warn` capture — incident repros may raise the floor.
+/// Emit exactly one connector-hop line. DEBUG (not WARN) — 发布前收尾
+/// （台账 TODO）：四跳探针默认静默，复现时把 `KT_SIGNAL_LOG` 放到 debug
+/// 才见；格式与账号投影零改动（探针降级批，2026-11-12）。
 pub(crate) fn line(event: &str, signal_account: Option<&str>, face: &str, detail: &str) {
-    tracing::warn!(
+    tracing::debug!(
         target: "connector.gate_trace",
         "[gate-trace] hop=conn event={} account={} face={} detail={}",
         event,
@@ -76,6 +77,7 @@ mod tests {
         let buffer = LogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
             .without_time()
             .finish();
         tracing::subscriber::with_default(subscriber, log);

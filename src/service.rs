@@ -22289,7 +22289,11 @@ fn build_attachment_data_uri(
     // 契约 1.294 观测点：只在这个单点记录「本次出站是否带声明尺寸」，无内容、
     // 无号码；CONTEXT: 真机验收 BUG-11 wire 时用它确认渲染层尺寸确实到 wire。
     if let Some((width, height)) = dimensions {
-        tracing::info!(width, height, "outgoing attachment carries declared dimensions");
+        tracing::info!(
+            width,
+            height,
+            "outgoing attachment carries declared dimensions"
+        );
     }
     use std::fmt::Write as _;
     let mut uri = String::with_capacity(decoded.len() / 3 * 4 + 64);
@@ -22385,6 +22389,7 @@ mod tests {
         let buffer = GateTraceBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
             .without_time()
             .finish();
         tracing::subscriber::with_default(subscriber, log);
