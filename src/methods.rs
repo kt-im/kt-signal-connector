@@ -15,6 +15,11 @@ pub enum Lane {
     Control,
     Read,
     Send,
+    /// BUG-15（续）：媒体传输（附件下载/历史附件下载）独占的车道。
+    /// 它们常达数秒，若与发送同车道（Send 2 个 permit），两个并发下载
+    /// 就能把同账号的 sendText 堵在车道外——与 per-account 互斥同源的
+    /// head-of-line blocking。媒体车道并发 1，发送车道不再被下载占用。
+    Media,
 }
 
 /// One table row: `(name, lane, account-scoped mutating, metrics class)`.
@@ -271,7 +276,7 @@ pub const METHODS: &[MethodRow] = &[
     // reaction-class write-lane mutex and delete barrier, same class as
     // importRetry. Advertised through the existing `history-import` tag (no
     // new capability bit, the 1.53 precedent).
-    ("history.attachmentDownload", Lane::Send, true, "send"),
+    ("history.attachmentDownload", Lane::Media, true, "send"),
     // Live attachment download (contract revision 1.61, §4.54): the same
     // transit-CDN chain behind the live-receive/import locator ladder,
     // addressed by attachmentIndex. Mutating (it lands a file in the
@@ -282,7 +287,7 @@ pub const METHODS: &[MethodRow] = &[
     // beyond the history-import desktops) — the one advertisement gated on
     // runtime state since contract 1.98: the handshake omits the tag unless
     // the media table is armed.
-    ("attachments.download", Lane::Send, true, "send"),
+    ("attachments.download", Lane::Media, true, "send"),
     // Attachment backfill request (contract revision 1.175, §4.175): the
     // request half of the official backfill loop — receipt-class fire-and-
     // forget posture, control lane (no payload delivery).
@@ -1288,9 +1293,14 @@ mod tests {
             "messages.deleteForMeMessages",
             "messages.setAttachmentDimensions",
         ];
+        // BUG-15（续）：媒体传输（附件下载/历史附件下载）独占 media 车道，
+        // 不再与 sendText 抢 send 车道的 2 个 permit。
+        let media_lane = ["attachments.download", "history.attachmentDownload"];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {
                 Lane::Read
+            } else if media_lane.contains(name) {
+                Lane::Media
             } else if send_lane.contains(name) {
                 Lane::Send
             } else {

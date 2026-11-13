@@ -114,6 +114,8 @@ const CONTROL_CONCURRENCY: usize = 1;
 const LINK_WAIT_CONCURRENCY: usize = 1;
 const READ_CONCURRENCY: usize = 4;
 const SEND_CONCURRENCY: usize = 2;
+/// BUG-15（续）：媒体车道并发 1（与 per-account 媒体互斥同义）。
+const MEDIA_CONCURRENCY: usize = 1;
 
 /// 全局兜底 = 每账号容量 × 典型账号数（ADR 0005）。它只防资源失控
 /// （N 个账号同时打满各自 lane 时给进程一个硬上界），不参与公平性：
@@ -124,6 +126,7 @@ const TYPICAL_ACCOUNT_COUNT: usize = 4;
 const GLOBAL_CONTROL_CONCURRENCY: usize = CONTROL_CONCURRENCY * TYPICAL_ACCOUNT_COUNT;
 const GLOBAL_READ_CONCURRENCY: usize = READ_CONCURRENCY * TYPICAL_ACCOUNT_COUNT;
 const GLOBAL_SEND_CONCURRENCY: usize = SEND_CONCURRENCY * TYPICAL_ACCOUNT_COUNT;
+const GLOBAL_MEDIA_CONCURRENCY: usize = MEDIA_CONCURRENCY * TYPICAL_ACCOUNT_COUNT;
 /// Forensic floor and answer deadline for an admitted host dispatch
 /// (§4.166 forensic line, §4.168 bounded answer): every bounded dispatch
 /// budget has run out long before this — engine calls are timeout-capped at
@@ -279,6 +282,8 @@ struct HostDispatchLimits {
     global_control: Arc<Semaphore>,
     global_read: Arc<Semaphore>,
     global_send: Arc<Semaphore>,
+    /// BUG-15（续）：媒体车道全局兜底。
+    global_media: Arc<Semaphore>,
     /// per-account lane：账号 + lane → 信号量。Weak-handle 纪律与
     /// `send_accounts` / `link_lanes` 相同：permit 自身持有 Arc，最后
     /// 一个 permit 释放后条目在下次 acquire 时回收。
@@ -348,6 +353,7 @@ const fn lane_capacity(lane: methods::Lane) -> usize {
         methods::Lane::Control => CONTROL_CONCURRENCY,
         methods::Lane::Read => READ_CONCURRENCY,
         methods::Lane::Send => SEND_CONCURRENCY,
+        methods::Lane::Media => MEDIA_CONCURRENCY,
     }
 }
 
@@ -372,6 +378,7 @@ impl HostDispatchLimits {
             global_control: Arc::new(Semaphore::new(GLOBAL_CONTROL_CONCURRENCY)),
             global_read: Arc::new(Semaphore::new(GLOBAL_READ_CONCURRENCY)),
             global_send: Arc::new(Semaphore::new(GLOBAL_SEND_CONCURRENCY)),
+            global_media: Arc::new(Semaphore::new(GLOBAL_MEDIA_CONCURRENCY)),
             account_lanes: Mutex::new(HashMap::new()),
             send_accounts: Mutex::new(HashMap::new()),
             media_accounts: Mutex::new(HashMap::new()),
@@ -387,6 +394,7 @@ impl HostDispatchLimits {
             methods::Lane::Control => self.global_control.clone(),
             methods::Lane::Read => self.global_read.clone(),
             methods::Lane::Send => self.global_send.clone(),
+            methods::Lane::Media => self.global_media.clone(),
         }
     }
 
@@ -484,7 +492,8 @@ impl HostDispatchLimits {
             // 发送/已读写全部堵在 send_accounts 后面（真机实测 4.2–9.3 秒）。
             // 删除仍按「send 锁 → 媒体锁」顺序同时 drain 两把：下载与删除
             // 绝不并发，发送不必等下载。
-            let is_media_download = method == "attachments.download";
+            let is_media_download =
+                method == "attachments.download" || method == "history.attachmentDownload";
             let primary_map = if is_media_download {
                 &self.media_accounts
             } else {
