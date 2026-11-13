@@ -63,4 +63,9 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Gate 3/3 — cargo test (process-group wrapped, orphans reaped on timeout)
+        # RUST_BACKTRACE 只在失败时才有输出：body_ranges_integration 在 Linux
+        # 上偶发 `Option::unwrap() on a None value`，panic 行号被 process-group
+        # 包装截断，打开回溯才能定位到具体调用点。
+        env:
+          RUST_BACKTRACE: "1"
         run: scripts/run-cargo-gates.sh test
