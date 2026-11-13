@@ -149,20 +149,21 @@ async fn send_request_frame(
 /// `link.start` 会拿到 `RUNTIME_NOT_RUNNING`（Linux CI 慢，必现；本地 macOS
 /// 快，几乎不现）。轮询 `runtime.status` 到 `state == "running"` 为止。
 async fn wait_for_runtime_running(client: &mut Framed<UnixStream, LinesCodec>) {
+    let mut last = Value::Null;
     for attempt in 0..100_u32 {
-        let status = request(
+        last = request(
             client,
             &format!("status-wait-{attempt}"),
             "runtime.status",
             json!({}),
         )
         .await;
-        if status["result"]["state"] == "running" {
+        if last["result"]["state"] == "running" {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("engine runtime never reached state=running within 10s");
+    panic!("engine runtime never reached state=running within 10s; last runtime.status = {last}");
 }
 
 async fn link_account(client: &mut Framed<UnixStream, LinesCodec>) -> String {
