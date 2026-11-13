@@ -145,6 +145,26 @@ async fn send_request_frame(
         .unwrap();
 }
 
+/// `runtime.start` 应答 ≠ runtime 就绪：引擎进程启动是异步的，紧接着
+/// `link.start` 会拿到 `RUNTIME_NOT_RUNNING`（Linux CI 慢，必现；本地 macOS
+/// 快，几乎不现）。轮询 `runtime.status` 到 `state == "running"` 为止。
+async fn wait_for_runtime_running(client: &mut Framed<UnixStream, LinesCodec>) {
+    for attempt in 0..100_u32 {
+        let status = request(
+            client,
+            &format!("status-wait-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        if status["result"]["state"] == "running" {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("engine runtime never reached state=running within 10s");
+}
+
 async fn link_account(client: &mut Framed<UnixStream, LinesCodec>) -> String {
     let link = request(
         client,
@@ -255,6 +275,7 @@ async fn body_ranges_receive_round_trips_to_every_wire_face() {
     let mut client = Framed::new(stream, LinesCodec::new());
     authenticate(&mut client, &secret).await;
     request(&mut client, "start", "runtime.start", json!({})).await;
+    wait_for_runtime_running(&mut client).await;
     let account_id = link_account(&mut client).await;
 
     // The link burst delivers exactly one incoming receive from the fixture
