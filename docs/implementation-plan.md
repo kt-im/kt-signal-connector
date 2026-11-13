@@ -86,6 +86,16 @@
   逐字节不变）随 `runtime.status`/`runtime.start`/`runtime.stop` 与每帧
   `runtime.stateChanged` 上报。账号寻址调用照旧答 ACCOUNT_UNLINKED；`engines[].needsRelink`
   仍是槽级机读位。桌面半边（域门禁 / 恢复遮罩）见桌面仓。）
+- Contract revision: 1.294 (2026-11-12; §4.284 普通附件出站声明尺寸，BUG-11 wire 批：
+  `messages.attachments.send` 的单数面新增可选 `width`/`height`，复数 `attachments[]`
+  条目级同名两键，`messages.attachments.retry` 同两键（调用方重述优先，缺席回落行
+  descriptor）。两键双参同进退、各自 1..=16384（与 `messages.setAttachmentDimensions`
+  的官方 `Attachment.width/height` 域同界）；成对时上游 data URI 增
+  `;width=<px>;height=<px>`（engine 上传返回后按 GIF/voice 同款「指针后置位」写
+  `AttachmentPointer.width/height`，接收投影同位读回），pending descriptor 同步记录
+  `width`/`height`。无两键的旧 payload 逐字节不变；两键在 data URI 既有参数面之后
+  纯附加，不改任何既有键名语义。`ENGINE_CONTRACT_MAX_REVISION` 保持 1.286（引擎
+  参数面零新增方法：data URI 参数是既有附件形状的附加参数）。)
 - Login-window sync projection (2026-11-12, wire additive, engine-compat —
   §4.281 `accounts.getSyncState`; no new contract revision number is claimed here: the
   engine's shared revision constant is still 1.285 and the next bump belongs to the
@@ -21974,3 +21984,50 @@ lib 单测 `store::tests::orphaned_account_delete_ledgers_settle_completed_and_l
 **桌面半边**（另一仓）：`signalErrorCopy.ts` 两个删除码改成可执行文案（重开客户端让删除收尾 /
 换号），`useSignalLinkFlow.ts` 的 `friendlyLinkError` 在 finish 兜底之前显式命中这两个码，
 不再把它们画成「本二维码已失效」。
+
+## §4.284 普通附件出站声明尺寸（契约 1.294 · wire additive，BUG-11）
+
+**问题**（BUG-11①）：本方发出的图片/视频附件在 wire 上不带尺寸，接收侧只能先按
+官方兜底盒 200×50 渲染、量到真实尺寸再纠正 —— 容器必跳一次。官方不变式是容器尺寸
+= `attachment.width/height` 的纯函数：发送端在上传指针里就把自然尺寸写进协议。
+
+**形状（三处，全部 additive）**：
+
+1. `messages.attachments.send` 单数面：可选 `width`、`height`（正整数，
+   1..=`MAX_ATTACHMENT_DIMENSION_PX`=16384，与 §4.255 持久面同一官方域）。
+   **双参同进退** —— 只给一边 = `INVALID_REQUEST`（半边尺寸对渲染面零信息量）；
+   与 §4.59 复数 `attachments[]` 同置 = `INVALID_REQUEST`（复数面自带条目级两键，
+   与 `blurHash`/`gif` 的单数形态纪律逐字同族）。
+2. 复数面条目级：`MessagesSendAttachmentEntry` 新增 `width`/`height`，同值域
+   同成对闸；任一条坏形状整批 `INVALID_REQUEST`，写任何 pending 行之前判。
+3. `messages.attachments.retry`：新增同名两键（与 `blurHash` 同口径）。调用方
+   重述优先；缺席时从失败行自己的 descriptor 的 `width/height` 对恢复 —— 首发带
+   尺寸的行，刷新/重启后 ids-only 重试仍带同一对声明，气泡盒子不因重试回退。
+
+**上行投影**：成对时 connector 在 data URI 上追加
+`;width=<px>;height=<px>`（排在既有 `;voice=true`/`;gif=true` 之后、
+`;filename=` 之前；参数名解析，次序只钉定本仓产出字节）。引擎
+`parse_attachment_meta` 解析两参数（坏值/半边整条 fail-closed），上传返回后按
+GIF 旗标/语音元数据同款「指针后置位」写 `AttachmentPointer.width=9`/`height=10`；
+收端 `project_attachment_pointer` 直接读出同名两键（该两位自 P14 起已在收投影面），
+接收侧首帧即终态盒。**桌面测量链降级为纯兜底**，不是新主路。
+
+**无两键的旧 payload 逐字节不变**：`None` 不追加任何参数，descriptor 两键缺席
+（no-null 纪律），既有键名语义零改动。
+
+**测试**（`src/service.rs` lib 单测 + `tests/server_integration.rs` 真进程 +
+`tests/schema_consistency.rs` 边界对）：
+
+| 用例 | 钉住的行为 | 变异 |
+|---|---|---|
+| `prepare_send_attachment_dimensions_ride_uri_and_descriptor` | 单数面成对尺寸 → data URI 两参数 + descriptor 两键；未声明 → 旧字节；0/越界 → `INVALID_REQUEST` 且无行 | 去掉 builder 的 dims 分支 → URI 断言红 |
+| `prepare_send_attachment_multi_dimensions_ride_per_entry` | 复数面逐条对齐、互不串号；半对整批拒 | descriptor 取错条目下标 → 逐条断言红 |
+| `attachment_dimensions_validation_matrix` | 双参同进退、1..=16384、零/越界拒 | 去掉半边闸 → 矩阵红 |
+| `attachment_data_uri_round_trips_and_encodes_the_descriptor`（扩） | 参数次序（gif 之后、filename 之前）与 None 零参数 | 参数顺序错位 → starts_with 断言红 |
+| `multi_attachment_send_merges_entries_and_rejects_mixed_forms`（扩，真进程） | fixture engine 的 send log 逐字带 `;width=640;height=480`；descriptor 两键；半边/越界整批 `INVALID_REQUEST` 且无上游行 | 去掉 URI 追加 → send log 断言红；去掉成对闸 → 拒绝断言红 |
+| `schema_numeric_bounds_match_code_constants`（扩） | 三处 schema `maximum` 与代码常量同为 16384 | 常量/ schema 单边漂移 → 红 |
+
+**边界（如实记档）**：尺寸是**发送侧陈述**，connector 不嗅探字节、不改 content
+type、不做任何解码；文件/语音/贴纸/预览图/长文本附件不声明尺寸（无自然像素尺寸，
+官方同判）。预加载/持久面（`messages.setAttachmentDimensions`）保持不变，仍是
+"引擎没有声明时的桌面测量"兜底入口。

@@ -5831,6 +5831,9 @@ impl RuntimeSupervisor {
     /// the service lock, upstream mutating `send` call, pending row settled
     /// on confirmation / unknown outcome / failure with the same event
     /// emission and no-auto-retry discipline.
+    /// 稳定的单数附件发送面（契约 1.294 前的 13 参形状）：声明尺寸走
+    /// `send_attachment_with_dimensions`，本包装恒传 None（旧调用点与
+    /// 集成测试逐字不变）。
     #[allow(clippy::too_many_arguments)]
     pub async fn send_attachment(
         &self,
@@ -5848,58 +5851,34 @@ impl RuntimeSupervisor {
         blur_hash: Option<String>,
         gif: bool,
     ) -> Result<MessageRecord, ServiceError> {
-        let engine = self.running_engine().await?;
-        let prepared = {
-            let service = self.service.lock().await;
-            let attachment_target = match &target {
-                SendTarget::Conversation(conversation_id) => {
-                    AttachmentSendTarget::Conversation(conversation_id)
-                }
-                SendTarget::Peer {
-                    kind,
-                    peer_key,
-                    peer_title,
-                } => AttachmentSendTarget::Peer(PeerTarget {
-                    kind,
-                    peer_key,
-                    peer_title: peer_title.as_deref(),
-                }),
-            };
-            service.prepare_send_attachment(
-                &account_id,
-                &attachment_target,
-                &client_request_id,
-                &data_base64,
-                size_bytes,
-                filename.as_deref(),
-                content_type.as_deref(),
-                text.as_deref(),
-                quote_message_id.as_deref(),
-                voice_note,
-                view_once,
-                blur_hash.as_deref(),
-                gif,
-            )?
-        };
-        self.dispatch_prepared(&engine, prepared).await
+        self.send_attachment_with_dimensions(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            None,
+        )
+        .await
     }
 
-    /// Retry one definitively-failed outgoing attachment in place (contract
-    /// revision 1.278, §4.262; bytes optional = 1.279, §4.263; plural rebuild =
-    /// 1.280, §4.264): the §4.12 settlement path unchanged — local rearm + face
-    /// rewrite under the service lock, one upstream mutating `send` call
-    /// carrying the caller's bytes when supplied (else the original payload group
-    /// persisted at first send, rebuilt entry by entry), then the shared
-    /// completion, which settles the SAME row id the desktop bubble renders. No
-    /// second row, no new clientRequestId.
+    /// 单数附件发送面 + 声明尺寸（契约 1.294 §4.284，BUG-11 wire 批）。
     #[allow(clippy::too_many_arguments)]
-    pub async fn retry_attachment(
+    pub async fn send_attachment_with_dimensions(
         &self,
         account_id: String,
         target: SendTarget,
         client_request_id: String,
-        data_base64: Option<String>,
-        size_bytes: Option<u64>,
+        data_base64: String,
+        size_bytes: u64,
         filename: Option<String>,
         content_type: Option<String>,
         text: Option<String>,
@@ -5908,6 +5887,7 @@ impl RuntimeSupervisor {
         view_once: bool,
         blur_hash: Option<String>,
         gif: bool,
+        dimensions: Option<(u32, u32)>,
     ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
@@ -5926,7 +5906,110 @@ impl RuntimeSupervisor {
                     peer_title: peer_title.as_deref(),
                 }),
             };
-            service.prepare_retry_attachment(
+            service.prepare_send_attachment_with_dimensions(
+                &account_id,
+                &attachment_target,
+                &client_request_id,
+                &data_base64,
+                size_bytes,
+                filename.as_deref(),
+                content_type.as_deref(),
+                text.as_deref(),
+                quote_message_id.as_deref(),
+                voice_note,
+                view_once,
+                blur_hash.as_deref(),
+                gif,
+                dimensions,
+            )?
+        };
+        self.dispatch_prepared(&engine, prepared).await
+    }
+
+    /// Retry one definitively-failed outgoing attachment in place (contract
+    /// revision 1.278, §4.262; bytes optional = 1.279, §4.263; plural rebuild =
+    /// 1.280, §4.264): the §4.12 settlement path unchanged — local rearm + face
+    /// rewrite under the service lock, one upstream mutating `send` call
+    /// carrying the caller's bytes when supplied (else the original payload group
+    /// persisted at first send, rebuilt entry by entry), then the shared
+    /// completion, which settles the SAME row id the desktop bubble renders. No
+    /// second row, no new clientRequestId.
+    /// 稳定的同行重发面（契约 1.294 前的 13 参形状）：声明尺寸走
+    /// `retry_attachment_with_dimensions`，本包装恒传 None。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retry_attachment(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: Option<String>,
+        size_bytes: Option<u64>,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+    ) -> Result<MessageRecord, ServiceError> {
+        self.retry_attachment_with_dimensions(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            None,
+        )
+        .await
+    }
+
+    /// 同行重发面 + 声明尺寸（契约 1.294 §4.284）：调用方重述优先，
+    /// 否则行 descriptor 的既有尺寸对恢复。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retry_attachment_with_dimensions(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: Option<String>,
+        size_bytes: Option<u64>,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+    ) -> Result<MessageRecord, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            let attachment_target = match &target {
+                SendTarget::Conversation(conversation_id) => {
+                    AttachmentSendTarget::Conversation(conversation_id)
+                }
+                SendTarget::Peer {
+                    kind,
+                    peer_key,
+                    peer_title,
+                } => AttachmentSendTarget::Peer(PeerTarget {
+                    kind,
+                    peer_key,
+                    peer_title: peer_title.as_deref(),
+                }),
+            };
+            service.prepare_retry_attachment_with_dimensions(
                 &account_id,
                 &attachment_target,
                 &client_request_id,
@@ -5940,6 +6023,7 @@ impl RuntimeSupervisor {
                 view_once,
                 blur_hash.as_deref(),
                 gif,
+                dimensions,
             )?
         };
         self.dispatch_prepared(&engine, prepared).await

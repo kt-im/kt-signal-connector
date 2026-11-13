@@ -2635,6 +2635,8 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// 稳定的单数附件发送面（契约 1.294 前的 13 参形状）：声明尺寸走
+    /// `send_attachment_with_dimensions`，本包装恒传 None。
     #[allow(clippy::too_many_arguments)]
     pub async fn send_attachment(
         &self,
@@ -2652,9 +2654,47 @@ impl ProxyGroupRuntime {
         blur_hash: Option<String>,
         gif: bool,
     ) -> Result<MessageRecord, ServiceError> {
+        self.send_attachment_with_dimensions(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            None,
+        )
+        .await
+    }
+
+    /// 单数附件发送面 + 声明尺寸（契约 1.294 §4.284，BUG-11 wire 批）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_attachment_with_dimensions(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: String,
+        size_bytes: u64,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+    ) -> Result<MessageRecord, ServiceError> {
         let slot = self.slot_for_account(&account_id).await?;
         slot.supervisor
-            .send_attachment(
+            .send_attachment_with_dimensions(
                 account_id,
                 target,
                 client_request_id,
@@ -2668,6 +2708,7 @@ impl ProxyGroupRuntime {
                 view_once,
                 blur_hash,
                 gif,
+                dimensions,
             )
             .await
     }
@@ -2679,6 +2720,8 @@ impl ProxyGroupRuntime {
     /// attempt used, and it settles the same row, in the shape the original
     /// used. A missing dataBase64/sizeBytes pair reuses the original payload
     /// group persisted at first send (one row per attachment index).
+    /// 稳定的同行重发面（契约 1.294 前的 13 参形状）：声明尺寸走
+    /// `retry_attachment_with_dimensions`，本包装恒传 None。
     #[allow(clippy::too_many_arguments)]
     pub async fn retry_attachment(
         &self,
@@ -2696,9 +2739,47 @@ impl ProxyGroupRuntime {
         blur_hash: Option<String>,
         gif: bool,
     ) -> Result<MessageRecord, ServiceError> {
+        self.retry_attachment_with_dimensions(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            None,
+        )
+        .await
+    }
+
+    /// 同行重发面 + 声明尺寸（契约 1.294 §4.284）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retry_attachment_with_dimensions(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: Option<String>,
+        size_bytes: Option<u64>,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+    ) -> Result<MessageRecord, ServiceError> {
         let slot = self.slot_for_account(&account_id).await?;
         slot.supervisor
-            .retry_attachment(
+            .retry_attachment_with_dimensions(
                 account_id,
                 target,
                 client_request_id,
@@ -2712,6 +2793,7 @@ impl ProxyGroupRuntime {
                 view_once,
                 blur_hash,
                 gif,
+                dimensions,
             )
             .await
     }

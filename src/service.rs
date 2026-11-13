@@ -3777,6 +3777,10 @@ impl ConnectorService {
     /// caller-controlled path reaches upstream. The pending row carries the
     /// metadata-only descriptor (same wire shape as inbound, contract 1.15) so
     /// the host renders the outgoing attachment from its first tick.
+    /// 稳定的单数附件准备面（契约 1.294 前的 13 参形状）：声明尺寸走
+    /// `prepare_send_attachment_with_dimensions` 的 additively 扩展面，
+    /// 本包装恒传 None——既有无尺寸调用点（含集成测试与历史调用方）逐字
+    /// 不变，旧 data URI 与 descriptor 字节形状零变化。
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_send_attachment(
         &self,
@@ -3794,6 +3798,48 @@ impl ConnectorService {
         blur_hash: Option<&str>,
         gif: bool,
     ) -> Result<PreparedSend, ServiceError> {
+        self.prepare_send_attachment_with_dimensions(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            None,
+        )
+    }
+
+    /// 单数附件准备面 + 声明尺寸（契约 1.294 §4.284，BUG-11 wire 批）：
+    /// `dimensions` 成对时 data URI 增 `;width=;height=` 两参数、pending 行
+    /// descriptor 记录两键；None = 旧形状逐字节不变。
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_send_attachment_with_dimensions(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        data_base64: &str,
+        size_bytes: u64,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+    ) -> Result<PreparedSend, ServiceError> {
+        // 契约 1.294 §4.284：声明尺寸在写任何行之前复核（host 已配对，
+        // service 只复核值域；越界 = INVALID_REQUEST，无 pending 行残留）。
+        let dimensions = validate_attachment_dimensions_pair(dimensions)?;
         let caption = validate_attachment_send_request(
             client_request_id,
             Some(data_base64),
@@ -3814,8 +3860,14 @@ impl ConnectorService {
         }
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_send_conversation(account_id, target)?;
-        let data_uri =
-            build_attachment_data_uri(data_base64, filename, content_type, voice_note, gif)?;
+        let data_uri = build_attachment_data_uri(
+            data_base64,
+            filename,
+            content_type,
+            voice_note,
+            gif,
+            dimensions,
+        )?;
         // 契约 1.279（§4.263）：首发前把这条附件的原始 data URI 落进
         // outgoing_attachment_payloads——单附件面写 index 0（契约 1.280 起复合
         // 主键的固定槽位）。失败/unknown 保留、成功删除，于是刷新或重启之后仍能
@@ -3843,8 +3895,11 @@ impl ConnectorService {
             content_type: content_type.map(str::to_string),
             filename: filename.map(str::to_string),
             size: Some(size_bytes),
-            width: None,
-            height: None,
+            // 契约 1.294 §4.284：声明尺寸同步落 pending 行 descriptor——
+            // 发送方自己的气泡从首个 tick 就是终态盒（与 blurHash/gif 同款
+            // 「首发陈述即行面」纪律）。
+            width: dimensions.map(|(width, _)| width),
+            height: dimensions.map(|(_, height)| height),
             is_voice_note: voice_note,
             caption: None,
             // §4.127: the caller-computed placeholder, shipped verbatim —
@@ -3931,6 +3986,10 @@ impl ConnectorService {
     /// - caller-supplied bytes on a plural row -> RETRY_NOT_ALLOWED;
     /// - a plural row whose persisted payload group is not exactly one row per
     ///   descriptor -> RETRY_NOT_ALLOWED (a partial group cannot be rebuilt).
+    ///
+    /// 稳定的同行重发面（契约 1.294 前的 13 参形状）：声明尺寸走
+    /// `prepare_retry_attachment_with_dimensions`，本包装恒传 None（ids-only
+    /// 重发照旧从行 descriptor 恢复既有尺寸，行为不变）。
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_retry_attachment(
         &self,
@@ -3948,6 +4007,47 @@ impl ConnectorService {
         blur_hash: Option<&str>,
         gif: bool,
     ) -> Result<PreparedSend, ServiceError> {
+        self.prepare_retry_attachment_with_dimensions(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            None,
+        )
+    }
+
+    /// 同行重发面 + 声明尺寸（契约 1.294 §4.284）：调用方重述尺寸优先，
+    /// 否则回落到行 descriptor 的既有 width/height 对。
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_retry_attachment_with_dimensions(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        data_base64: Option<&str>,
+        size_bytes: Option<u64>,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+    ) -> Result<PreparedSend, ServiceError> {
+        // 契约 1.294 §4.284：调用方重述的声明尺寸与其余描述面同口径——先
+        // 复核再碰 store；缺席时回落到行自己的 descriptor（见下方解析臂）。
+        let caller_dimensions = validate_attachment_dimensions_pair(dimensions)?;
         // A caller-supplied payload/size mismatch is rejected before any store
         // read (the first send's own rejection class); the remaining faces are
         // checked once the persisted payload has supplied whatever the caller
@@ -4058,6 +4158,8 @@ impl ConnectorService {
                     blur_hash: blur_hash
                         .map(str::to_string)
                         .or_else(|| descriptor.and_then(|entry| entry.blur_hash.clone())),
+                    dimensions: caller_dimensions
+                        .or_else(|| descriptor.and_then(|entry| entry.width.zip(entry.height))),
                 }]
             }
             None => {
@@ -4094,6 +4196,8 @@ impl ConnectorService {
                         voice: descriptor.is_voice_note,
                         gif: descriptor.is_gif,
                         blur_hash: descriptor.blur_hash.clone(),
+                        // 声明尺寸同样以行为准（首发陈述落行，URI 只作字节源）。
+                        dimensions: descriptor.width.zip(descriptor.height),
                     });
                 }
                 resolved
@@ -4119,6 +4223,9 @@ impl ConnectorService {
                 preserved_view_once,
                 entry.blur_hash.as_deref(),
             )?;
+            // 契约 1.294 §4.284：行面/调用方来的尺寸在重建 URI 之前复核，
+            // 坏值（越界/零）不得进上行帧。
+            validate_attachment_dimensions_pair(entry.dimensions)?;
         }
         let caption = preserved_text.unwrap_or_default();
         // The descriptor id is the first attempt's own (§4.12 stable-id
@@ -4136,6 +4243,7 @@ impl ConnectorService {
                 entry.content_type.as_deref(),
                 entry.voice,
                 entry.gif,
+                entry.dimensions,
             )?;
             payloads.push((index as u32, data_uri.clone()));
             data_uris.push(json!(data_uri));
@@ -4150,8 +4258,10 @@ impl ConnectorService {
                 content_type: entry.content_type.clone(),
                 filename: entry.filename.clone(),
                 size: Some(entry.size_bytes),
-                width: None,
-                height: None,
+                // 契约 1.294 §4.284：重试重建的 descriptor 携带同一对声明
+                // 尺寸（行面恢复或调用方重述），气泡盒子不因重试回退。
+                width: entry.dimensions.map(|(width, _)| width),
+                height: entry.dimensions.map(|(_, height)| height),
                 is_voice_note: entry.voice,
                 caption: None,
                 blur_hash: entry.blur_hash.clone(),
@@ -4260,6 +4370,9 @@ impl ConnectorService {
             validate_attachment_content_type(entry.content_type.as_deref())?;
             // §4.127: the plural face carries the blur placeholder per entry.
             validate_blur_hash(entry.blur_hash.as_deref())?;
+            // 契约 1.294 §4.284：复数面条目级声明尺寸同校验同值域，任一条
+            // 坏形状整批 INVALID_REQUEST（写任何行之前）。
+            validate_attachment_dimensions(entry.width, entry.height)?;
         }
         if let Some(caption) = text
             && !caption.is_empty()
@@ -4285,12 +4398,14 @@ impl ConnectorService {
         // 落库，ids-only 重试才能按 index 重建出完整的一代字节。
         let mut payloads = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
+            let dimensions = validate_attachment_dimensions(entry.width, entry.height)?;
             let data_uri = build_attachment_data_uri(
                 &entry.data_base64,
                 entry.filename.as_deref(),
                 entry.content_type.as_deref(),
                 false,
                 entry.gif,
+                dimensions,
             )?;
             payloads.push((index as u32, data_uri.clone()));
             data_uris.push(json!(data_uri));
@@ -4305,8 +4420,9 @@ impl ConnectorService {
                 content_type: entry.content_type.clone(),
                 filename: entry.filename.clone(),
                 size: Some(entry.size_bytes),
-                width: None,
-                height: None,
+                // 契约 1.294 §4.284：条目级声明尺寸同步落 descriptor。
+                width: dimensions.map(|(width, _)| width),
+                height: dimensions.map(|(_, height)| height),
                 is_voice_note: false,
                 caption: None,
                 // §4.127: per-entry placeholder, same posture as the
@@ -4477,12 +4593,15 @@ impl ConnectorService {
         // §4.147: the sticker image rides the single-item upload face the
         // engine keeps out of the shared attachment path — the official
         // sticker pointer has no GIF bit, so this URI never carries the flag.
+        // 贴纸图不经普通附件尺寸参数面（贴纸尺寸走上游 sticker.width/
+        // height 对象键，见 §4.31）；dimensions 恒 None，字节形状零变化。
         let data_uri = build_attachment_data_uri(
             &image.data_base64,
             None,
             Some(&image.content_type),
             false,
             false,
+            None,
         )?;
         // The sent row's descriptor records the sticker image (metadata only)
         // and the row itself records the pack identity, so the sender's bubble
@@ -18408,6 +18527,18 @@ pub struct MessagesSendAttachmentParams {
     /// INVALID_REQUEST.
     #[serde(default)]
     pub gif: bool,
+    /// 声明尺寸（BUG-11 wire 批，契约 1.294 §4.284）：发送侧测量到的图片/
+    /// 视频自然像素尺寸。两键双参同进退（只给一边 = INVALID_REQUEST，半边
+    /// 声明对渲染面零信息量），各自 1..=[MAX_ATTACHMENT_DIMENSION_PX]。成对
+    /// 时上游 data URI 增 ";width=<px>;height=<px>" 两参数（engine 上传返回
+    /// 后置位 AttachmentPointer.width/height，接收投影同位读回），同时落
+    /// pending 行 descriptor 的 width/height——发送方自己的气泡从首个 tick
+    /// 即终态盒，不必等回波测量。单数形态键：与 §4.59 复数 attachments 数组
+    /// 同置 = INVALID_REQUEST（复数面条目自带两键）。
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
     /// §4.59 plural attachment payloads (contract revision 1.66): one
     /// upstream `send` carries every entry's data URI in its array-typed
     /// `attachments` parameter — the official forward face merges a multi-
@@ -18441,6 +18572,13 @@ pub struct MessagesSendAttachmentEntry {
     pub blur_hash: Option<String>,
     #[serde(default)]
     pub gif: bool,
+    /// 条目级声明尺寸（BUG-11 wire 批，契约 1.294 §4.284）：与单数形态
+    /// width/height 同语义同值域，双参同进退；成对时该条 data URI 增
+    /// ";width=<px>;height=<px>"，descriptor 同步记录两键。
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
 }
 
 /// `messages.sendSticker` image payload (contract revision 1.35, §4.31): the
@@ -20626,6 +20764,56 @@ fn validate_blur_hash(blur_hash: Option<&str>) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// 出向声明尺寸校验（BUG-11 wire 批，契约 1.294 §4.284）：两键双参同进退
+/// （全缺 = 未声明，旧形状逐字节不变；只有半边 = INVALID_REQUEST，半边尺寸
+/// 对渲染面无意义）、各自正整数且 ≤ MAX_ATTACHMENT_DIMENSION_PX（与
+/// messages.setAttachmentDimensions 的官方域同界）。返回成对值供 data URI
+/// 参数面 / descriptor 面消费；纯函数，可重复调用（host 形状闸与 service
+/// 准备腿各判一次，口径唯一）。
+pub(crate) fn validate_attachment_dimensions(
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<Option<(u32, u32)>, ServiceError> {
+    match (width, height) {
+        (None, None) => Ok(None),
+        (Some(width), Some(height)) => {
+            if width < 1 || height < 1 {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "width and height must be positive integers",
+                    false,
+                )));
+            }
+            if width > MAX_ATTACHMENT_DIMENSION_PX || height > MAX_ATTACHMENT_DIMENSION_PX {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "width and height must not exceed 16384",
+                    false,
+                )));
+            }
+            Ok(Some((width, height)))
+        }
+        _ => Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "width and height must be provided together",
+            false,
+        ))),
+    }
+}
+
+/// 已配对尺寸的边界复核（service 侧防御，契约 1.294 §4.284）：host 形状闸
+/// 已用 [validate_attachment_dimensions] 拒绝半边形态，service 收货时类型
+/// 本身已保证成对，这里只复核值域——越界照旧 INVALID_REQUEST，绝不把渲染
+/// 面用不上的数字写进 data URI 或 descriptor。
+pub(crate) fn validate_attachment_dimensions_pair(
+    dimensions: Option<(u32, u32)>,
+) -> Result<Option<(u32, u32)>, ServiceError> {
+    match dimensions {
+        None => Ok(None),
+        Some((width, height)) => validate_attachment_dimensions(Some(width), Some(height)),
+    }
+}
+
 /// At most one preview per send upstream (signal-cli builds `List.of(one)`);
 /// extras are ignored, `None`/empty list means no preview.
 fn previews_to_upstream(
@@ -22019,6 +22207,10 @@ struct ResolvedAttachmentPayload {
     voice: bool,
     gif: bool,
     blur_hash: Option<String>,
+    /// 契约 1.294 §4.284：声明尺寸（调用方重述优先，否则行 descriptor 的
+    /// 既有 width/height 对）。ids-only 重发从行面恢复，所以一份首发带尺寸
+    /// 的失败附件在刷新/重启后重试仍带同一对声明。
+    dimensions: Option<(u32, u32)>,
 }
 
 /// 契约 1.279（§4.263）：把 payload 表里存下的 RFC 2397 data URI 还原成重试
@@ -22071,12 +22263,20 @@ fn parse_attachment_data_uri(data_uri: &str) -> Result<StoredAttachmentPayload, 
 /// `gif` appends the `;gif=true` parameter (§4.147), which the engine maps
 /// to the official `Flags.GIF=8` bit — both flags are verbatim statement
 /// parameters the connector never interprets.
+/// `dimensions` (BUG-11 wire 批, 契约 1.294 §4.284) appends
+/// `;width=<px>;height=<px>` — the sender's measured pixel size, verbatim
+/// transit material: the engine parses the pair and post-sets
+/// `AttachmentPointer.width/height` on the uploaded pointer (the GIF/voice
+/// precedent), so the receive side carries the declared size from the first
+/// frame and the desktop's measurement chain degrades to a pure fallback.
+/// `None` appends nothing — every pre-1.294 payload stays byte-identical.
 fn build_attachment_data_uri(
     base64_data: &str,
     filename: Option<&str>,
     content_type: Option<&str>,
     voice: bool,
     gif: bool,
+    dimensions: Option<(u32, u32)>,
 ) -> Result<String, ServiceError> {
     let mut decoded = Vec::with_capacity(base64_data.len() / 4 * 3);
     base64_decode_to_vec(base64_data, &mut decoded).map_err(|_| {
@@ -22095,6 +22295,12 @@ fn build_attachment_data_uri(
     }
     if gif {
         uri.push_str(";gif=true");
+    }
+    // 契约 1.294 §4.284（BUG-11 wire 批）：声明尺寸参数排在 gif 之后、
+    // filename 之前——纯附加参数，engine 侧按参数名解析，次序仅钉定本仓
+    // 产出的字节形状（既有形状不带两参数，逐字节不变）。
+    if let Some((width, height)) = dimensions {
+        let _ = write!(uri, ";width={width};height={height}");
     }
     if let Some(filename) = filename {
         uri.push_str(";filename=");
@@ -25589,6 +25795,9 @@ mod tests {
 
         // Plural: the per-entry key rides its own descriptor.
         let entries = vec![MessagesSendAttachmentEntry {
+            // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+            width: None,
+            height: None,
             data_base64: b64.to_string(),
             size_bytes: 16,
             filename: Some("notes.txt".into()),
@@ -25648,6 +25857,9 @@ mod tests {
         }
         // The plural face fails closed the same way.
         let bad_entries = vec![MessagesSendAttachmentEntry {
+            // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+            width: None,
+            height: None,
             data_base64: b64.to_string(),
             size_bytes: 16,
             filename: None,
@@ -26492,6 +26704,9 @@ mod tests {
                 "req-multi-retry",
                 &[
                     MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
                         data_base64: b64.into(),
                         size_bytes: 16,
                         filename: Some("one.txt".into()),
@@ -26500,6 +26715,9 @@ mod tests {
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
                         data_base64: b64.into(),
                         size_bytes: 16,
                         filename: Some("two.txt".into()),
@@ -26970,6 +27188,9 @@ mod tests {
                 client_request_id,
                 &[
                     MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
                         data_base64: "YXR0YWNobWVudCBieXRlcw==".into(),
                         size_bytes: 16,
                         filename: Some("one.txt".into()),
@@ -26978,6 +27199,9 @@ mod tests {
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
                         data_base64: "c2Vjb25kIGF0dGFjaG1lbnQ=".into(),
                         size_bytes: 17,
                         filename: Some("two.bin".into()),
@@ -27167,6 +27391,9 @@ mod tests {
                 client_request_id,
                 &[
                     MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
                         data_base64: "YXR0YWNobWVudCBieXRlcw==".into(),
                         size_bytes: 16,
                         filename: Some("one.txt".into()),
@@ -27175,6 +27402,9 @@ mod tests {
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
                         data_base64: "c2Vjb25kIGF0dGFjaG1lbnQ=".into(),
                         size_bytes: 17,
                         filename: Some("two.bin".into()),
@@ -27549,6 +27779,9 @@ mod tests {
                 client_request_id,
                 &[
                     MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
                         data_base64: "YXR0YWNobWVudCBieXRlcw==".into(),
                         size_bytes: 16,
                         filename: Some("one.txt".into()),
@@ -27557,6 +27790,9 @@ mod tests {
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
                         data_base64: "c2Vjb25kIGF0dGFjaG1lbnQ=".into(),
                         size_bytes: 17,
                         filename: Some("two.bin".into()),
@@ -31519,6 +31755,7 @@ mod tests {
             Some("text/plain"),
             false,
             false,
+            None,
         )
         .unwrap();
         assert!(uri.starts_with("data:text/plain;filename=notes%20%E4%B8%8B%E8%BD%BD.txt;base64,"));
@@ -31528,32 +31765,94 @@ mod tests {
         assert_eq!(decoded, payload);
 
         // Default content type when none given.
-        let uri = build_attachment_data_uri(&b64, None, None, false, false).unwrap();
+        let uri = build_attachment_data_uri(&b64, None, None, false, false, None).unwrap();
         assert!(uri.starts_with("data:application/octet-stream;base64,"));
 
         // §4.30: the voice flag inserts the `;voice=true` parameter after the
         // mime type, before the filename and base64 payload markers.
-        let uri =
-            build_attachment_data_uri(&b64, Some("voice.ogg"), Some("audio/ogg"), true, false)
-                .unwrap();
+        let uri = build_attachment_data_uri(
+            &b64,
+            Some("voice.ogg"),
+            Some("audio/ogg"),
+            true,
+            false,
+            None,
+        )
+        .unwrap();
         assert!(uri.starts_with("data:audio/ogg;voice=true;filename=voice.ogg;base64,"));
 
         // §4.147: the GIF flag inserts the `;gif=true` parameter on the same
         // statement-parameter face — after the mime/voice slot, before the
         // filename and base64 markers — and coexists with the voice flag
         // byte-for-byte; `gif=false` inserts nothing.
-        let uri =
-            build_attachment_data_uri(&b64, Some("tenor.gif"), Some("image/gif"), false, true)
-                .unwrap();
+        let uri = build_attachment_data_uri(
+            &b64,
+            Some("tenor.gif"),
+            Some("image/gif"),
+            false,
+            true,
+            None,
+        )
+        .unwrap();
         assert!(uri.starts_with("data:image/gif;gif=true;filename=tenor.gif;base64,"));
-        let uri = build_attachment_data_uri(&b64, Some("clip.mp4"), Some("video/mp4"), true, true)
-            .unwrap();
-        assert!(uri.starts_with("data:video/mp4;voice=true;gif=true;filename=clip.mp4;base64,"));
         let uri =
-            build_attachment_data_uri(&b64, Some("clip.mp4"), Some("video/mp4"), false, false)
+            build_attachment_data_uri(&b64, Some("clip.mp4"), Some("video/mp4"), true, true, None)
                 .unwrap();
+        assert!(uri.starts_with("data:video/mp4;voice=true;gif=true;filename=clip.mp4;base64,"));
+        let uri = build_attachment_data_uri(
+            &b64,
+            Some("clip.mp4"),
+            Some("video/mp4"),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
         assert!(uri.starts_with("data:video/mp4;filename=clip.mp4;base64,"));
         assert!(!uri.contains("gif"), "gif=false appends no parameter");
+
+        // BUG-11 wire 批（契约 1.294 §4.284）：声明尺寸对插入
+        // ";width=<px>;height=<px>"（gif 之后、filename 之前），与既有
+        // 参数面共存；None = 不插任何参数（旧形状逐字节不变）。
+        let uri = build_attachment_data_uri(
+            &b64,
+            Some("photo.jpg"),
+            Some("image/jpeg"),
+            false,
+            false,
+            Some((640, 480)),
+        )
+        .unwrap();
+        assert!(
+            uri.starts_with("data:image/jpeg;width=640;height=480;filename=photo.jpg;base64,"),
+            "declared dimensions ride the data URI: {uri}"
+        );
+        let uri = build_attachment_data_uri(
+            &b64,
+            None,
+            Some("image/jpeg"),
+            false,
+            true,
+            Some((1, 16_384)),
+        )
+        .unwrap();
+        assert!(
+            uri.starts_with("data:image/jpeg;gif=true;width=1;height=16384;base64,"),
+            "dimensions append after gif and before the payload: {uri}"
+        );
+        let uri = build_attachment_data_uri(
+            &b64,
+            Some("photo.jpg"),
+            Some("image/jpeg"),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !uri.contains("width=") && !uri.contains("height="),
+            "no declared dimensions = no parameter (old shape): {uri}"
+        );
     }
 
     /// prepare_send_attachment (§4.12): validation failures leave no pending
@@ -31923,6 +32222,9 @@ mod tests {
         let b64_5 = "aGVsbG8="; // "hello", 5 raw
         let entries = vec![
             MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: b64_16.to_string(),
                 size_bytes: 16,
                 filename: Some("tenor.gif".into()),
@@ -31931,6 +32233,9 @@ mod tests {
                 gif: true,
             },
             MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: b64_5.to_string(),
                 size_bytes: 5,
                 filename: Some("notes.txt".into()),
@@ -31971,6 +32276,254 @@ mod tests {
         assert!(!row.attachments[1].is_gif);
     }
 
+    /// BUG-11 wire 批（契约 1.294 §4.284）：声明尺寸成对时上行 data URI 增
+    /// `;width=;height=` 两参数、pending 行 descriptor 记录 width/height；
+    /// 缺席 = 旧形状逐字节不变；半边/越界 = INVALID_REQUEST 且不落行。
+    #[test]
+    fn prepare_send_attachment_dimensions_ride_uri_and_descriptor() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let b64 = "YXR0YWNobWVudCBieXRlcw=="; // "attachment bytes", 16 raw
+
+        // 声明尺寸：URI 参数 + descriptor 两键（首个 tick 即终态盒）。
+        let prepared = service
+            .prepare_send_attachment_with_dimensions(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-dims-1",
+                b64,
+                16,
+                Some("photo.jpg"),
+                Some("image/jpeg"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+                Some((640, 480)),
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(
+            params["attachments"][0].as_str().unwrap(),
+            "data:image/jpeg;width=640;height=480;filename=photo.jpg;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-dims-1")
+            .unwrap()
+            .expect("the pending row exists");
+        assert_eq!(
+            (row.attachments[0].width, row.attachments[0].height),
+            (Some(640), Some(480))
+        );
+
+        // 未声明：URI 与 descriptor 逐字节回到 1.293 形状。
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-dims-2",
+                b64,
+                16,
+                Some("photo.jpg"),
+                Some("image/jpeg"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(
+            params["attachments"][0].as_str().unwrap(),
+            "data:image/jpeg;filename=photo.jpg;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-dims-2")
+            .unwrap()
+            .expect("the pending row exists");
+        assert_eq!(
+            (row.attachments[0].width, row.attachments[0].height),
+            (None, None)
+        );
+
+        // 越界与零：service 侧复核（host 形状闸的同口径第二道），不落行。
+        for bad in [
+            Some((0, 480)),
+            Some((640, 0)),
+            Some((16_385, 480)),
+            Some((640, 16_385)),
+        ] {
+            let rejected = service.prepare_send_attachment_with_dimensions(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-dims-bad",
+                b64,
+                16,
+                Some("photo.jpg"),
+                Some("image/jpeg"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+                bad,
+            );
+            assert!(rejected.is_err(), "bad dimensions {bad:?} must reject");
+            assert!(
+                service
+                    .store
+                    .message_by_client_request(&account.id, "req-dims-bad")
+                    .unwrap()
+                    .is_none(),
+                "a rejected send leaves no pending row"
+            );
+        }
+    }
+
+    /// BUG-11 wire 批复数面：条目级声明尺寸只染自己那条的 data URI 与
+    /// descriptor，逐条对齐、互不串号。
+    #[test]
+    fn prepare_send_attachment_multi_dimensions_ride_per_entry() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let b64_16 = "YXR0YWNobWVudCBieXRlcw=="; // 16 raw
+        let b64_5 = "aGVsbG8="; // 5 raw
+        let entries = vec![
+            MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
+                data_base64: b64_16.to_string(),
+                size_bytes: 16,
+                filename: Some("photo.jpg".into()),
+                content_type: Some("image/jpeg".into()),
+                blur_hash: None,
+                gif: false,
+            },
+            MessagesSendAttachmentEntry {
+                width: Some(320),
+                height: Some(240),
+                data_base64: b64_5.to_string(),
+                size_bytes: 5,
+                filename: Some("notes.txt".into()),
+                content_type: Some("text/plain".into()),
+                blur_hash: None,
+                gif: false,
+            },
+        ];
+        let prepared = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-dims",
+                &entries,
+                None,
+                None,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        let attachments = params["attachments"].as_array().unwrap();
+        assert_eq!(
+            attachments[0].as_str().unwrap(),
+            "data:image/jpeg;filename=photo.jpg;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        assert_eq!(
+            attachments[1].as_str().unwrap(),
+            "data:text/plain;width=320;height=240;filename=notes.txt;base64,aGVsbG8="
+        );
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-multi-dims")
+            .unwrap()
+            .expect("the pending multi row exists");
+        assert_eq!(
+            (row.attachments[0].width, row.attachments[0].height),
+            (None, None)
+        );
+        assert_eq!(
+            (row.attachments[1].width, row.attachments[1].height),
+            (Some(320), Some(240))
+        );
+
+        // 任一条半边 = 整批 INVALID_REQUEST，无 pending 行。
+        let bad = vec![MessagesSendAttachmentEntry {
+            width: Some(320),
+            height: None,
+            data_base64: b64_5.to_string(),
+            size_bytes: 5,
+            filename: None,
+            content_type: None,
+            blur_hash: None,
+            gif: false,
+        }];
+        let rejected = service.prepare_send_attachment_multi(
+            &account.id,
+            &AttachmentSendTarget::Conversation(&conversation.id),
+            "req-multi-dims-bad",
+            &bad,
+            None,
+            None,
+        );
+        assert!(rejected.is_err(), "a half pair must reject the whole batch");
+        assert!(
+            service
+                .store
+                .message_by_client_request(&account.id, "req-multi-dims-bad")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// BUG-11 wire 批形状矩阵：双参同进退、正整数、1..=MAX_ATTACHMENT_DIMENSION_PX。
+    #[test]
+    fn attachment_dimensions_validation_matrix() {
+        // 全缺 = 未声明（旧形状）。
+        assert_eq!(validate_attachment_dimensions(None, None).unwrap(), None);
+        // 成对合法值：下界与上界可收。
+        assert_eq!(
+            validate_attachment_dimensions(Some(1), Some(1)).unwrap(),
+            Some((1, 1))
+        );
+        assert_eq!(
+            validate_attachment_dimensions(Some(16_384), Some(16_384)).unwrap(),
+            Some((16_384, 16_384))
+        );
+        // 半边 = 同进退拒绝。
+        for (w, h) in [(Some(640), None), (None, Some(480))] {
+            let error = validate_attachment_dimensions(w, h).unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        }
+        // 零/越界 = 拒绝。
+        for (w, h) in [
+            (Some(0), Some(480)),
+            (Some(640), Some(0)),
+            (Some(16_385), Some(480)),
+            (Some(640), Some(16_385)),
+        ] {
+            let error = validate_attachment_dimensions(w, h).unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        }
+        // 已配对复核与形状复核同口径（service 侧第二道）。
+        assert_eq!(
+            validate_attachment_dimensions_pair(Some((2, 3))).unwrap(),
+            Some((2, 3))
+        );
+        assert!(validate_attachment_dimensions_pair(Some((2, 0))).is_err());
+    }
+
     /// Contract 1.66 (§4.59): the plural form sends ONE upstream message
     /// whose array-typed `attachments` carries every entry in order — the
     /// official forward face. The pending row carries one descriptor per
@@ -31992,6 +32545,9 @@ mod tests {
                 .iter()
                 .map(
                     |(data, size, filename, content_type)| MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
                         data_base64: (*data).to_string(),
                         size_bytes: *size,
                         filename: filename.map(str::to_string),
@@ -32104,6 +32660,9 @@ mod tests {
         // behind.
         let oversized: Vec<MessagesSendAttachmentEntry> = (0..33)
             .map(|_| MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: b64_5.to_string(),
                 size_bytes: 5,
                 filename: Some("a.txt".into()),
@@ -32137,6 +32696,9 @@ mod tests {
         // rejection needs no megabyte payloads.
         let heavy: Vec<MessagesSendAttachmentEntry> = (0..2)
             .map(|_| MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: b64_5.to_string(),
                 size_bytes: 60_000_000,
                 filename: Some("big.bin".into()),
@@ -47914,6 +48476,9 @@ mod tests {
         let second = b"second entry!".to_vec();
         let entries = vec![
             MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: base64_encode(&first),
                 size_bytes: first.len() as u64,
                 filename: Some("a.txt".into()),
@@ -47922,6 +48487,9 @@ mod tests {
                 gif: false,
             },
             MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: base64_encode(&second),
                 size_bytes: second.len() as u64,
                 filename: Some("b.txt".into()),

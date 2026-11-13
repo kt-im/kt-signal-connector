@@ -1151,6 +1151,40 @@ fn schema_numeric_bounds_match_code_constants() {
             "maximum",
             MAX_ATTACHMENT_DIMENSION_ROWS as u64,
         ),
+        // Declared media dimensions on the send family (contract 1.294, §4.284
+        // BUG-11 wire 批): the same official Attachment.width/height domain as
+        // the persisted face above, on the singular keys, the plural entry keys
+        // and the retry face (all three reuse the one constant).
+        (
+            "/$defs/messagesSendAttachmentParams/properties/width",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentParams/properties/height",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentEntry/properties/width",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentEntry/properties/height",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
+        (
+            "/$defs/messagesRetryAttachmentParams/properties/width",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
+        (
+            "/$defs/messagesRetryAttachmentParams/properties/height",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
         // Peer addressing on the safety-number faces (contract 1.281,
         // §4.265): the peerKey wire bound on both faces pairs with the code
         // constant. The UUID/E.164 grammar above/below that bound is the

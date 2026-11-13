@@ -2891,15 +2891,22 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                     // `gif` instead); the singular form requires exactly the
                     // §4.12 pair (dataBase64+sizeBytes). All rejections are
                     // deterministic and happen before any pending row exists.
+                    // 契约 1.294 §4.284（BUG-11 wire 批）：width/height 是单数
+                    // 形态的声明尺寸键，与 §4.127 blurHash 同族——数组旁出现即
+                    // 单数/复数混形，INVALID_REQUEST。
                     if params.attachments.is_some()
-                        && (params.voice_note || params.view_once || params.gif)
+                        && (params.voice_note
+                            || params.view_once
+                            || params.gif
+                            || params.width.is_some()
+                            || params.height.is_some())
                     {
                         return HostResponse::failure(
                             request_id,
                             reject_probe(
                                 "messages.attachments.send",
-                                "attachments,voiceNote,viewOnce,gif",
-                                "voiceNote, viewOnce and gif apply to the singular attachment form only",
+                                "attachments,voiceNote,viewOnce,gif,width,height",
+                                "voiceNote, viewOnce, gif, width and height apply to the singular attachment form only",
                             ),
                         );
                     }
@@ -2948,8 +2955,20 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                                 blur_hash,
                             }),
                         ) => {
+                            // 契约 1.294 §4.284：声明尺寸的形状闸在 host（与
+                            // blurHash/voiceNote 同层）——双参同进退、正整数、
+                            // ≤ 16384；坏形状在写任何 pending 行之前被判。
+                            let dimensions = match crate::service::validate_attachment_dimensions(
+                                params.width,
+                                params.height,
+                            ) {
+                                Ok(dimensions) => dimensions,
+                                Err(error) => {
+                                    return HostResponse::failure(request_id, error.into_api());
+                                }
+                            };
                             match runtime
-                                .send_attachment(
+                                .send_attachment_with_dimensions(
                                     params.account_id,
                                     target,
                                     params.client_request_id,
@@ -2963,6 +2982,7 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                                     params.view_once,
                                     blur_hash,
                                     params.gif,
+                                    dimensions,
                                 )
                                 .await
                             {
@@ -3062,8 +3082,23 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                                     ),
                                 )
                             } else {
+                                // 契约 1.294 §4.284：重试面允许调用方重述尺寸
+                                // （与 blurHash 同口径；缺席时回落到行 descriptor）。
+                                let dimensions =
+                                    match crate::service::validate_attachment_dimensions(
+                                        params.width,
+                                        params.height,
+                                    ) {
+                                        Ok(dimensions) => dimensions,
+                                        Err(error) => {
+                                            return HostResponse::failure(
+                                                request_id,
+                                                error.into_api(),
+                                            );
+                                        }
+                                    };
                                 match runtime
-                                    .retry_attachment(
+                                    .retry_attachment_with_dimensions(
                                         params.account_id,
                                         target,
                                         params.client_request_id,
@@ -3077,6 +3112,7 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                                         params.view_once,
                                         params.blur_hash,
                                         params.gif,
+                                        dimensions,
                                     )
                                     .await
                                 {

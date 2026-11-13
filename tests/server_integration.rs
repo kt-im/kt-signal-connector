@@ -16040,7 +16040,11 @@ async fn multi_attachment_send_merges_entries_into_one_upstream_message() {
                     "dataBase64": "YXR0YWNobWVudCBieXRlcw==",
                     "sizeBytes": 16,
                     "filename": "notes.txt",
-                    "contentType": "text/plain"
+                    "contentType": "text/plain",
+                    // BUG-11 wire 批（契约 1.294 §4.284）：条目级声明尺寸
+                    // 成对进场 → 上行 data URI 两参数 + descriptor 两键。
+                    "width": 640,
+                    "height": 480
                 },
                 {
                     "dataBase64": "aGVsbG8=",
@@ -16058,18 +16062,59 @@ async fn multi_attachment_send_merges_entries_into_one_upstream_message() {
     assert_eq!(descriptors.len(), 2);
     assert_eq!(descriptors[0]["filename"], "notes.txt");
     assert_eq!(descriptors[1]["filename"], "clip.ogg");
+    // 声明尺寸落 descriptor（首个 tick 即终态盒），未声明条目两键不在。
+    assert_eq!(descriptors[0]["width"], 640, "{sent}");
+    assert_eq!(descriptors[0]["height"], 480, "{sent}");
+    assert!(descriptors[1].get("width").is_none(), "{sent}");
     let lines = attachment_lines();
     assert_eq!(lines.len(), 1, "one upstream send: {lines:?}");
     let upstream = lines[0]["attachments"].as_array().unwrap();
     assert_eq!(upstream.len(), 2);
     assert_eq!(
         upstream[0].as_str().unwrap(),
-        "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw=="
+        "data:text/plain;width=640;height=480;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw=="
     );
     assert_eq!(
         upstream[1].as_str().unwrap(),
         "data:audio/ogg;filename=clip.ogg;base64,aGVsbG8="
     );
+
+    // BUG-11 wire 批（契约 1.294 §4.284）：声明尺寸半边/越界都是
+    // INVALID_REQUEST（双参同进退 + 1..=16384），在任何 pending 行之前判。
+    for (id, width, height) in [
+        ("multi-dims-half", json!(640), Value::Null),
+        ("multi-dims-zero", json!(0), json!(480)),
+        ("multi-dims-over", json!(16385), json!(480)),
+    ] {
+        let mut entry = json!({
+            "dataBase64": "aGVsbG8=",
+            "sizeBytes": 5,
+            "contentType": "image/jpeg"
+        });
+        if !width.is_null() {
+            entry["width"] = width.clone();
+        }
+        if !height.is_null() {
+            entry["height"] = height.clone();
+        }
+        let rejected = request(
+            &mut client,
+            id,
+            "messages.attachments.send",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "clientRequestId": id,
+                "attachments": [entry],
+            }),
+        )
+        .await;
+        assert_eq!(
+            rejected["error"]["code"], "INVALID_REQUEST",
+            "{id}: {rejected}"
+        );
+        assert_eq!(rejected["error"]["retryable"], false, "{id}: {rejected}");
+    }
 
     // Mixed forms: any singular key beside the array is INVALID_REQUEST —
     // no upstream line, no pending row.
@@ -16147,7 +16192,14 @@ async fn multi_attachment_send_merges_entries_into_one_upstream_message() {
     )
     .await;
     let rows = listed["result"]["items"].as_array().unwrap();
-    for rejected_id in ["multi-mixed-1", "multi-voice-1", "multi-bad-1"] {
+    for rejected_id in [
+        "multi-mixed-1",
+        "multi-voice-1",
+        "multi-bad-1",
+        "multi-dims-half",
+        "multi-dims-zero",
+        "multi-dims-over",
+    ] {
         assert!(
             rows.iter().all(|row| row["clientRequestId"] != rejected_id),
             "a rejected request leaves no row: {rejected_id}"
