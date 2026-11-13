@@ -153,14 +153,23 @@ async fn link_account(client: &mut Framed<UnixStream, LinesCodec>) -> String {
         json!({ "deviceName": "KT-BodyRangesPass" }),
     )
     .await;
+    // 失败时把完整响应打出来：原先直接 `finished["result"]["id"].as_str().unwrap()`，
+    // 一旦 link.start / link.finish 返回 error，CI 只能看到「Option::unwrap on None」，
+    // 看不出是哪一步、什么错（Linux job 第一次真正跑到 Gate 3 就是这么岔的）。
+    let session_id = link["result"]["linkSessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("link.start did not return linkSessionId: {link}"));
     let finished = request(
         client,
         "link-finish",
         "link.finish",
-        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+        json!({ "linkSessionId": session_id }),
     )
     .await;
-    finished["result"]["id"].as_str().unwrap().to_string()
+    finished["result"]["id"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("link.finish did not return an account id: {finished}"))
 }
 
 /// 等直聊会话行出现（link 完成后行落库有时序：本地快、CI 慢，原实现立即断言
