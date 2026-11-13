@@ -61,7 +61,10 @@ fn spawn_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
         .arg(root.join("state"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        // stderr 直通而不是 piped：piped 且没人读时，缓冲写满会把子进程堵死，
+        // 而且引擎起不来的原因（python fixture 的 traceback / spawn 失败）全
+        // 沉在管道里——Linux job 上 runtime 一直 stopped 就是这个盲区。
+        .stderr(Stdio::inherit())
         .kill_on_drop(true);
     command
         .env("KT_FAKE_EXPECT_NO_JAVA", "1")
