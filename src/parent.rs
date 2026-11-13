@@ -227,7 +227,8 @@ pub(crate) fn write_owner_marker(data_dir: &Path, pid: u32, now: SystemTime) {
     let body = format!("{pid}\n{stamp}\n");
     let path = data_dir.join(OWNER_FILE_NAME);
     if std::fs::write(&path, body).is_ok()
-        && let Err(error) = std::fs::set_permissions(&path, owner_only())
+        && let Some(perms) = owner_only()
+        && let Err(error) = std::fs::set_permissions(&path, perms)
     {
         tracing::debug!(
             error_class = ?error.kind(),
@@ -236,18 +237,25 @@ pub(crate) fn write_owner_marker(data_dir: &Path, pid: u32, now: SystemTime) {
     }
 }
 
+/// POSIX 权限收紧（仅 Unix 有意义）。Windows 返回 None = 不设。
 #[cfg(unix)]
-fn owner_only() -> std::fs::Permissions {
+fn owner_only() -> Option<std::fs::Permissions> {
     use std::os::unix::fs::PermissionsExt;
 
-    std::fs::Permissions::from_mode(0o600)
+    Some(std::fs::Permissions::from_mode(0o600))
 }
 
+// Windows 没有 POSIX mode：PermissionsExt 至今 unstable（rust-lang/rust#152956），
+// `Permissions::from_mode` 与 `Permissions::new` 在 Windows 上都不存在，
+// `std::fs::Permissions` 只能从 metadata 取、无法构造。
+//
+// 连接器数据目录本来就在 `%LOCALAPPDATA%` 下（按用户隔离），ACL 足够，
+// 因此 Windows 分支不收紧权限，返回 None 让调用点跳过 set_permissions。
+//
+// 这条分支此前从未在 Windows 编译过（仓库只有 macOS 产物），缺陷才一直没暴露。
 #[cfg(windows)]
-fn owner_only() -> std::fs::Permissions {
-    use std::os::windows::fs::PermissionsExt;
-
-    std::fs::Permissions::from_mode(0o600)
+fn owner_only() -> Option<std::fs::Permissions> {
+    None
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

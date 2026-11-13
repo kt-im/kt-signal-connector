@@ -1,0 +1,5 @@
+# 供应链关键文件：任何改动必须由负责人审（配合 branch protection 的 code owner review）
+/.github/workflows/  @Arise0852 @HuaWeiQiu
+/scripts/            @Arise0852 @HuaWeiQiu
+/Cargo.toml          @Arise0852 @HuaWeiQiu
+/Cargo.lock          @Arise0852 @HuaWeiQiu
