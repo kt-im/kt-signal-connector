@@ -1,0 +1,239 @@
+# Release 构建矩阵：两平台 release 二进制 + SHA-256 校验文件，产物落 OSS 并回写 catalog。
+#
+# action 主版本基线：2026-10-10 实查 GitHub releases API
+#   checkout v7.0.1 / upload-artifact v7.0.2 / Swatinem/rust-cache v2.9.2 /
+#   dtolnay/rust-toolchain v1（Node24 运行时，无 Node20-only 弃用面）。
+# 来源：gh api repos/actions/<repo>/releases/latest。
+#
+# 构建前置：OpenSSL 是编译期硬依赖（rustls-native-roots / libsqlcipher 链路面）。
+#   Windows 走 vcpkg 静态链接（x64-windows-static-md + OPENSSL_STATIC=1）；
+#   macOS 走 Homebrew openssl@3，用 OPENSSL_DIR 指向 keg。
+#   链接参数（user32/advapi32/crypt32/ws2_32/gdi32）已在 .cargo/config.toml 声明，
+#   本文件不再设 RUSTFLAGS，避免覆盖掉 target 级 rustflags。
+#
+# 触发：tag push（v*）正式发版；workflow_dispatch 供手工自证/补产物。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    # OIDC 角色信任条件是 repo:<org>/<repo>:environment:prod
+    environment: prod
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: install openssl (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      - name: install openssl (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install openssl:x64-windows-static-md
+          "OPENSSL_DIR=C:\vcpkg\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: cargo build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: package with sha256 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -v dist
+          cp -v "target/${{ matrix.target }}/release/kt-signal-connector" \
+            "dist/kt-signal-connector-${{ matrix.target }}"
+          (
+            cd dist
+            shasum -a 256 "kt-signal-connector-${{ matrix.target }}" \
+              > "kt-signal-connector-${{ matrix.target }}.sha256"
+            cat "kt-signal-connector-${{ matrix.target }}.sha256"
+          )
+
+      - name: package with sha256 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $bin = "kt-signal-connector-${{ matrix.target }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/kt-signal-connector.exe" "dist/$bin"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$bin").Hash.ToLower()
+          "$hash  $bin" | Out-File -Encoding ascii "dist/$bin.sha256"
+          Get-Content "dist/$bin.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kt-signal-connector-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+      # OIDC → OSS（download.ktai.im）。role 由 KTAIorg/kt-cloud-infra#196 建：
+      #   acs:ram::5590716371345016:role/gha-ktim-signal-runtime-prod
+      # 只授权写 kontian-assets/kt/signal-runtime/*（显式 Deny Delete）。
+      - name: Assume Aliyun OIDC role for OSS publish
+        id: aliyun-oidc
+        if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
+        uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6
+        with:
+          role-to-assume: ${{ vars.KT_SIGNAL_RUNTIME_RAM_ROLE }}
+          oidc-provider-arn: acs:ram::5590716371345016:oidc-provider/github-actions-KT-Settlement
+          audience: sts.aliyuncs.com
+          role-session-name: kt-signal-runtime-connector
+
+      - name: Publish connector to download.ktai.im
+        if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
+        env:
+          OSS_ACCESS_KEY_ID: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-id }}
+          OSS_ACCESS_KEY_SECRET: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-secret }}
+          OSS_STS_TOKEN: ${{ steps.aliyun-oidc.outputs.aliyun-security-token }}
+          OSS_BUCKET: kontian-assets
+          OSS_ENDPOINT: oss-us-west-1.aliyuncs.com
+          OSS_PREFIX: kt/signal-runtime/connector
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OSS_ACCESS_KEY_ID:-}" ]; then echo "OIDC STS outputs missing" >&2; exit 1; fi
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$TARGET" = "x86_64-pc-windows-msvc" ]; then artifact="kt-signal-connector-windows-x64.exe"; src="dist/kt-signal-connector-$TARGET.exe"; else artifact="kt-signal-connector-macos-arm64"; src="dist/kt-signal-connector-$TARGET"; fi
+          obj="$OSS_PREFIX/$version/$artifact"
+          echo "publishing $src -> oss://$OSS_BUCKET/$obj"
+
+          python3 -m pip install --quiet --disable-pip-version-check oss2
+          export SRC="$src" OSS_KEY="$obj"
+          python3 - <<'PYEOF'
+          import os, hashlib, oss2
+          auth = oss2.StsAuth(os.environ['OSS_ACCESS_KEY_ID'], os.environ['OSS_ACCESS_KEY_SECRET'], os.environ['OSS_STS_TOKEN'])
+          bucket = oss2.Bucket(auth, 'https://' + os.environ['OSS_ENDPOINT'], os.environ['OSS_BUCKET'])
+          src, key = os.environ['SRC'], os.environ['OSS_KEY']
+          with open(src, 'rb') as f:
+              local_sha = hashlib.sha256(f.read()).hexdigest()
+          local_size = os.path.getsize(src)
+          if bucket.object_exists(key):
+              meta = bucket.head_object(key)
+              remote_sha = (meta.headers or {}).get('x-oss-meta-sha256', '')
+              if remote_sha and remote_sha != local_sha:
+                  raise SystemExit(f"FATAL: oss://{os.environ['OSS_BUCKET']}/{key} holds sha256={remote_sha}, refusing overwrite with {local_sha}. Bump version in Cargo.toml.")
+              if meta.content_length != local_size:
+                  raise SystemExit(f"FATAL: size {meta.content_length} != local {local_size}. Bump version instead of reusing this path.")
+              print(f"already published with identical content, skip: {key}")
+          else:
+              bucket.put_object_from_file(key, src, headers={'x-oss-meta-sha256': local_sha})
+              meta = bucket.head_object(key)
+              assert meta.content_length == local_size, 'size mismatch after upload'
+              print(f"uploaded {key} size={meta.content_length} sha256={local_sha}")
+          print(f"public url: https://download.ktai.im/{key}")
+          PYEOF
+
+      # 产物落位后更新 catalog（与 engine 同纪律）：
+      # matrix 每个平台只更新 connector 记录里**自己那个 platform** 的 artifact，
+      # 保留另一个平台的既有条目（两个 job 并发写同一记录，读-改-写 + 重试）。
+      - name: Publish catalog entry to download.ktai.im
+        if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
+        env:
+          OSS_ACCESS_KEY_ID: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-id }}
+          OSS_ACCESS_KEY_SECRET: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-secret }}
+          OSS_STS_TOKEN: ${{ steps.aliyun-oidc.outputs.aliyun-security-token }}
+          OSS_BUCKET: kontian-assets
+          OSS_ENDPOINT: oss-us-west-1.aliyuncs.com
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "x86_64-pc-windows-msvc" ]; then
+            platform="windows-x64"; artifact="kt-signal-connector-windows-x64.exe"; src="dist/kt-signal-connector-$TARGET.exe"
+          elif [ "$TARGET" = "aarch64-apple-darwin" ]; then
+            platform="macos-arm64"; artifact="kt-signal-connector-macos-arm64"; src="dist/kt-signal-connector-$TARGET"
+          else
+            echo "platform $TARGET not published to catalog (only windows-x64 / macos-arm64 are consumed)"; exit 0
+          fi
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          python3 -m pip install --quiet --disable-pip-version-check oss2
+          export SRC="$src" PLATFORM="$platform" ARTIFACT="$artifact" COMPONENT_VERSION="$version"
+          python3 - <<'PYEOF'
+          import os, json, hashlib, time, oss2
+          auth = oss2.StsAuth(os.environ['OSS_ACCESS_KEY_ID'], os.environ['OSS_ACCESS_KEY_SECRET'], os.environ['OSS_STS_TOKEN'])
+          bucket = oss2.Bucket(auth, 'https://' + os.environ['OSS_ENDPOINT'], os.environ['OSS_BUCKET'])
+          CATALOG_KEY = 'kt/signal-runtime/catalog.json'
+          BASE = 'https://download.ktai.im/kt/signal-runtime/connector'
+          version, platform, artifact, src = (os.environ[k] for k in ('COMPONENT_VERSION','PLATFORM','ARTIFACT','SRC'))
+
+          with open(src, 'rb') as f:
+              sha = hashlib.sha256(f.read()).hexdigest()
+          size = os.path.getsize(src)
+
+          def load():
+              try:
+                  return json.loads(bucket.get_object(CATALOG_KEY).read())
+              except oss2.exceptions.NoSuchKey:
+                  return {"catalogVersion": 1, "channel": "stable", "generatedAtUnixMs": 0, "releases": []}
+              except Exception as e:
+                  raise SystemExit(f"FATAL: cannot read catalog: {e}")
+
+          allowed = ('https://download.ktai.im/kt/signal-runtime/', 'https://github.com/kt-im/')
+          for attempt in range(5):
+              catalog = load()
+              connector = next((r for r in catalog.get('releases', []) if r.get('component') == 'connector'), None)
+              if connector is None:
+                  connector = {"component": "connector", "version": version, "artifacts": {},
+                            "engineContractRevision": {"min": "1.92", "max": "1.92"},
+                            "desktopApiVersion": {"min": "1.0", "max": "1.0"}}
+                  catalog.setdefault('releases', []).append(connector)
+              connector['version'] = version
+              connector.setdefault('artifacts', {})[platform] = {
+                  "platform": platform,
+                  "sizeBytes": size,
+                  "sha256": sha,
+                  "primaryUrl": f"{BASE}/{version}/{artifact}",
+              }
+              for art in connector['artifacts'].values():
+                  for field in ('primaryUrl', 'fallbackUrl'):
+                      url = art.get(field)
+                      if url is None:
+                          continue
+                      if not url.startswith(allowed):
+                          raise SystemExit(f"FATAL: {field} not in allowlist: {url}")
+              catalog['catalogVersion'] = 1
+              catalog['channel'] = catalog.get('channel', 'stable')
+              catalog['generatedAtUnixMs'] = int(time.time() * 1000)
+              body = json.dumps(catalog, ensure_ascii=False, indent=2).encode()
+              try:
+                  bucket.put_object(CATALOG_KEY, body, headers={'x-oss-meta-sha256': hashlib.sha256(body).hexdigest()})
+                  print(f"catalog updated: connector {version} {platform} size={size} sha256={sha}")
+                  print(f"public url: https://download.ktai.im/{CATALOG_KEY}")
+                  break
+              except Exception as e:
+                  if attempt == 4:
+                      raise SystemExit(f"FATAL: catalog write failed after retries: {e}")
+                  time.sleep(2 ** attempt)
+          PYEOF
