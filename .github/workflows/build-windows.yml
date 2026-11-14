@@ -1,14 +1,9 @@
+# 手工排障专用：main push 不再自动构建或发布。
+# 正式发布通道见 release.yml（v* tag 触发），产物走 OSS 并回写 catalog。
 name: build-windows-connector
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/build-windows.yml'
-      - 'src/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
 
 # OIDC → 阿里云 STS 需要 id-token: write（否则拿不到 ACTIONS_ID_TOKEN_REQUEST_URL）
 permissions:
