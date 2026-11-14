@@ -1,6 +1,6 @@
 [package]
 name = "kt-signal-connector"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -58,6 +58,10 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# The newer-schema startup test (contract revision 1.284, §4.268) seeds a real
+# encrypted store and bumps its schema stamp through the same bundled SQLCipher
+# engine the crate opens — no hand-rolled fixture file could prove the refusal.
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
 # Constructing a `reqwest::Response` from an `http::Response` lets the doctor
 # unit suite pin the service-probe `http` classification without any network.
 http = "1"

@@ -15,6 +15,11 @@ pub enum Lane {
     Control,
     Read,
     Send,
+    /// BUG-15（续）：媒体传输（附件下载/历史附件下载）独占的车道。
+    /// 它们常达数秒，若与发送同车道（Send 2 个 permit），两个并发下载
+    /// 就能把同账号的 sendText 堵在车道外——与 per-account 互斥同源的
+    /// head-of-line blocking。媒体车道并发 1，发送车道不再被下载占用。
+    Media,
 }
 
 /// One table row: `(name, lane, account-scoped mutating, metrics class)`.
@@ -29,6 +34,10 @@ pub const METHODS: &[MethodRow] = &[
     ("runtime.status", Lane::Control, false, "control"),
     ("runtime.start", Lane::Control, false, "control"),
     ("runtime.stop", Lane::Control, false, "control"),
+    // D4 所有权执行面(阶段1 批1-5c):本地编排(不透传上游),Control 车道
+    // ——隔离/休眠都是破坏性收敛动作,与 runtime.stop 同级同格。
+    ("ownership.quarantineSlot", Lane::Control, false, "control"),
+    ("ownership.hibernateSlot", Lane::Control, false, "control"),
     ("accounts.list", Lane::Control, false, "accounts"),
     ("accounts.deleteLocalData", Lane::Control, true, "accounts"),
     // Account settings writes (contract 1.46, §4.45): the three storage-record
@@ -42,6 +51,12 @@ pub const METHODS: &[MethodRow] = &[
     // bounded per-group wait lane (ADR 0001 R3) before the table's lane
     // would apply, so its Control entry only documents the fallback shape.
     ("link.finish", Lane::Control, false, "link"),
+    // Rotating link attempt (contract 1.286, §4.272): one bounded engine call
+    // on the attempt's own engine, no local persistence beyond the in-memory
+    // slot table. The pre-dispatch gate answers LINK_ATTEMPT_NOT_FOUND /
+    // INVALID_REQUEST / LINK_EXPIRED without touching the engine, and an
+    // engine without the rotate face answers NOT_SUPPORTED.
+    ("link.rotate", Lane::Control, false, "link"),
     ("link.cancel", Lane::Control, false, "link"),
     ("conversations.list", Lane::Read, false, "read"),
     // Blocked-conversations read (contract 1.46, §4.45): a bounded
@@ -99,6 +114,13 @@ pub const METHODS: &[MethodRow] = &[
     // send-lane, upstream traffic — the same class as the original send.
     ("messages.retryText", Lane::Send, true, "send"),
     ("messages.attachments.send", Lane::Send, true, "send"),
+    // In-place attachment retry (contract 1.278, §4.262; dataBase64/sizeBytes
+    // optional = 1.279, §4.263; plural payload rebuild = 1.280, §4.264):
+    // mutating, send-lane upstream traffic — the same class as the original
+    // send, because the retry really re-uploads the bytes (caller-supplied for a
+    // singular row, or the persisted payload group) and settles the SAME row in
+    // the shape the original used.
+    ("messages.attachments.retry", Lane::Send, true, "send"),
     // Sticker send (contract 1.35): mutating, send-lane upstream traffic —
     // the §4.12 attachment class verbatim, same-account mutex and delete
     // barrier included; advertised through `send-sticker`.
@@ -254,7 +276,7 @@ pub const METHODS: &[MethodRow] = &[
     // reaction-class write-lane mutex and delete barrier, same class as
     // importRetry. Advertised through the existing `history-import` tag (no
     // new capability bit, the 1.53 precedent).
-    ("history.attachmentDownload", Lane::Send, true, "send"),
+    ("history.attachmentDownload", Lane::Media, true, "send"),
     // Live attachment download (contract revision 1.61, §4.54): the same
     // transit-CDN chain behind the live-receive/import locator ladder,
     // addressed by attachmentIndex. Mutating (it lands a file in the
@@ -265,7 +287,7 @@ pub const METHODS: &[MethodRow] = &[
     // beyond the history-import desktops) — the one advertisement gated on
     // runtime state since contract 1.98: the handshake omits the tag unless
     // the media table is armed.
-    ("attachments.download", Lane::Send, true, "send"),
+    ("attachments.download", Lane::Media, true, "send"),
     // Attachment backfill request (contract revision 1.175, §4.175): the
     // request half of the official backfill loop — receipt-class fire-and-
     // forget posture, control lane (no payload delivery).
@@ -475,6 +497,13 @@ pub const METHODS: &[MethodRow] = &[
     // indeterminate outcome face answers SEND_OUTCOME_UNKNOWN and is never
     // retried.
     ("accounts.getDevices", Lane::Read, false, "read"),
+    // Login-window sync projection (contract revision 1.286, §4.281): the
+    // engine's pure-read `getSyncState` passthrough — {contacts, storage,
+    // profile, sinceMs} behind the closed phase vocabulary shape gate. Read
+    // lane, non-mutating, no local persistence: this is the desktop gate's
+    // bounded polling fallback (SIGNAL-STAGE1 §二 P-B-3), so a repeated call
+    // must answer the same face and never serialize on the account mutex.
+    ("accounts.getSyncState", Lane::Read, false, "read"),
     ("accounts.unlinkDevice", Lane::Send, true, "accounts"),
     // Username lookup (contract revision 1.59, §4.55): upstream `getUserStatus
     // --username` passthrough (0.14.8 GetUserStatusCommand.java:41,69) — one
@@ -512,12 +541,14 @@ pub const METHODS: &[MethodRow] = &[
     // precedent). Direct conversations only (the official group report
     // resolves the added-by sender first — no data plane, honest refusal).
     ("conversations.reportSpam", Lane::Send, true, "send"),
-    // Safety-number read (contract revision 1.68, §4.61): the pinned
-    // upstream's native `listIdentities` JSON-RPC read (0.14.8
-    // jsonrpc.rs:121-126; ListIdentitiesCommand.java:23 — a
+    // Safety-number read (contract revision 1.68, §4.61; peer arm 1.281,
+    // §4.265): the pinned upstream's native `listIdentities` JSON-RPC read
+    // (0.14.8 jsonrpc.rs:121-126; ListIdentitiesCommand.java:23 — a
     // JsonRpcLocalCommand, so the JSON-RPC projection is native) — one
-    // bounded read keyed by the resolved peer reference, no mutation, no
-    // local persistence; advertised through `safety-number`.
+    // bounded read keyed by the addressed peer reference (a 1:1 conversation
+    // id, or the peer's own ACI UUID / E.164 with no conversation row
+    // needed), no mutation, no local persistence; advertised through
+    // `safety-number`.
     ("identities.get", Lane::Read, false, "read"),
     // Safety-number verify write (contract revision 1.68, §4.61): the
     // pinned upstream's native `trust` JSON-RPC face (0.14.8
@@ -527,8 +558,11 @@ pub const METHODS: &[MethodRow] = &[
     // upstream traffic — the reaction class verbatim, same-account mutex
     // and delete barrier included; the testing-only trustAllKnownKeys mode
     // is never sent. The official toggle's clear-verification half has no
-    // pinned JSON-RPC projection and stays out of the contract. Zero local
-    // writes: trust level converges through the next `identities.get`.
+    // pinned JSON-RPC projection and stays out of the contract. One local
+    // write on success (1.260, §4.244): the addressed peer's trust stamp —
+    // by conversation row on the `conversationId` arm, by peer key on the
+    // `peerKey` arm (1.281, §4.265, where no conversation row is required at
+    // all) — so the read face converges without a second round trip.
     ("identities.verify", Lane::Send, true, "send"),
     // Stories faces (contract revision 1.76, §4.67): `messages.sendStory` is
     // mutating send-lane upstream traffic — the reaction class verbatim,
@@ -705,6 +739,13 @@ pub const METHODS: &[MethodRow] = &[
     // Control lane like runtime.status; never
     // mutating; the implementation is entirely in `doctor`.
     ("runtime.doctor", Lane::Control, false, "control"),
+    // Durable change-ledger read face (contract revision 1.283, §4.267): one
+    // bounded, token-stamped page of thin events plus the reset verdict. Read
+    // lane — the page reads on the store's read pool, never the writer, and
+    // the reset is a decision, not a mutation. Added to the table so the
+    // handshake advertises it: a host that cannot see the capability would
+    // fall back to polling every list face.
+    ("events.list", Lane::Read, false, "read"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -1056,6 +1097,7 @@ mod tests {
             "groups.common",
             "accounts.deviceCapabilities",
             "accounts.getDevices",
+            "accounts.getSyncState",
             "stickerPacks.getManifest",
             "stickerPacks.getImage",
             "conversations.getPinned",
@@ -1074,6 +1116,7 @@ mod tests {
             "username.lookup",
             "phone.lookup",
             "identities.get",
+            "events.list",
             "stories.getDisabled",
             "stories.openAttachment",
             "calls.linkPresentation",
@@ -1101,6 +1144,7 @@ mod tests {
             "accounts.unlinkDevice",
             "messages.retryText",
             "messages.attachments.send",
+            "messages.attachments.retry",
             "messages.sendSticker",
             "messages.sendContact",
             "messages.sendPollCreate",
@@ -1175,6 +1219,7 @@ mod tests {
             "accounts.updateConfiguration",
             "messages.retryText",
             "messages.attachments.send",
+            "messages.attachments.retry",
             "messages.sendSticker",
             "messages.sendContact",
             "messages.sendPollCreate",
@@ -1248,9 +1293,14 @@ mod tests {
             "messages.deleteForMeMessages",
             "messages.setAttachmentDimensions",
         ];
+        // BUG-15（续）：媒体传输（附件下载/历史附件下载）独占 media 车道，
+        // 不再与 sendText 抢 send 车道的 2 个 permit。
+        let media_lane = ["attachments.download", "history.attachmentDownload"];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {
                 Lane::Read
+            } else if media_lane.contains(name) {
+                Lane::Media
             } else if send_lane.contains(name) {
                 Lane::Send
             } else {

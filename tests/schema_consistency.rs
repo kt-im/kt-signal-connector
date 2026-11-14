@@ -41,24 +41,27 @@ use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
 use kt_signal_connector::service::{
     CALL_GROUP_MASTER_KEY_B64_CHARS, CALL_LINK_ROOM_ID_B64_CHARS, CALL_LINK_ROOT_KEY_B64_MAX_CHARS,
     GROUP_CHANGED_MAX_CHANGES, GROUP_DESCRIPTION_MAX_BYTES, GROUP_MEMBER_LABEL_MAX_BYTES,
-    GROUP_NAME_MAX_BYTES, IDENTITY_SAFETY_NUMBER_MAX_CHARS, MARK_RECEIPT_MESSAGE_IDS_LIMIT,
-    MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CONTENT_TYPE_BYTES,
-    MAX_ATTACHMENT_DIMENSION_PX, MAX_ATTACHMENT_DIMENSION_ROWS, MAX_ATTACHMENT_FILENAME_BYTES,
-    MAX_ATTACHMENT_ID_BYTES, MAX_AVATAR_DATA_URI_CHARS, MAX_CALL_LINK_KEY_CHARS,
-    MAX_CHAT_FOLDER_BATCH, MAX_CHAT_FOLDER_ID_CHARS, MAX_DELETE_FOR_ME_MESSAGES,
-    MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
-    MAX_LOCATOR_FIELD_CHARS, MAX_LOCATOR_HASH_CHARS, MAX_NOTIFICATION_PROFILE_BATCH,
-    MAX_NOTIFICATION_PROFILE_ID_CHARS, MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS,
-    MAX_PREVIEW_DESCRIPTION_BYTES, MAX_PREVIEW_IMAGE_DATA_URI_CHARS, MAX_PREVIEW_TITLE_BYTES,
-    MAX_PREVIEW_URL_BYTES, MAX_PROFILE_ABOUT_BYTES, MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS,
-    MAX_SNAPSHOT_DIR_BYTES, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
-    MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS, MAX_STORY_LIST_BATCH,
-    MAX_STORY_LIST_ID_CHARS, MAX_STORY_PREVIEW_TITLE_BYTES, MAX_STORY_PREVIEW_URL_CHARS,
-    MAX_TEXT_BYTES, PHONE_LOOKUP_MAX_ENTRIES, REPORT_SPAM_MESSAGE_IDS_LIMIT,
-    STICKER_PACK_BROWSE_ID_HEX_CHARS, STICKER_PACK_SYNC_KEY_B64_CHARS,
-    USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES, USERNAME_MAX_WIRE_CHARS,
+    GROUP_NAME_MAX_BYTES, IDENTITY_PEER_KEY_MAX_CHARS, IDENTITY_SAFETY_NUMBER_MAX_CHARS,
+    MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_DIMENSION_PX, MAX_ATTACHMENT_DIMENSION_ROWS,
+    MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES, MAX_AVATAR_DATA_URI_CHARS,
+    MAX_CALL_LINK_KEY_CHARS, MAX_CHAT_FOLDER_BATCH, MAX_CHAT_FOLDER_ID_CHARS,
+    MAX_DELETE_FOR_ME_MESSAGES, MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_GROUP_MEMBER_ID_CHARS,
+    MAX_GROUP_MEMBERS, MAX_LOCATOR_FIELD_CHARS, MAX_LOCATOR_HASH_CHARS,
+    MAX_NOTIFICATION_PROFILE_BATCH, MAX_NOTIFICATION_PROFILE_ID_CHARS, MAX_OPAQUE_ID_BYTES,
+    MAX_PIN_CONVERSATION_ID_CHARS, MAX_PREVIEW_DESCRIPTION_BYTES, MAX_PREVIEW_IMAGE_DATA_URI_CHARS,
+    MAX_PREVIEW_TITLE_BYTES, MAX_PREVIEW_URL_BYTES, MAX_PROFILE_ABOUT_BYTES,
+    MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS, MAX_SNAPSHOT_DIR_BYTES, MAX_STICKER_EMOJI_CHARS,
+    MAX_STICKER_PACK_ID_CHARS, MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS,
+    MAX_STORY_LIST_BATCH, MAX_STORY_LIST_ID_CHARS, MAX_STORY_PREVIEW_TITLE_BYTES,
+    MAX_STORY_PREVIEW_URL_CHARS, MAX_TEXT_BYTES, PHONE_LOOKUP_MAX_ENTRIES,
+    REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
+    STICKER_PACK_SYNC_KEY_B64_CHARS, USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES,
+    USERNAME_MAX_WIRE_CHARS,
 };
-use kt_signal_connector::store::{MAX_MESSAGE_RECEIPT_RECIPIENTS, MAX_PAGE_LIMIT};
+use kt_signal_connector::store::{
+    EVENT_PAGE_MAX_LIMIT, EVENT_TOKEN_MAX_CHARS, MAX_MESSAGE_RECEIPT_RECIPIENTS, MAX_PAGE_LIMIT,
+};
 
 /// Events the code emits but the schema event enum does not declare. Currently
 /// none: `runtime.resourcePressure` (emitted by the RSS sampler bridge,
@@ -394,6 +397,13 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[
         ("/$defs/requestId", "maxLength", MAX_REQUEST_ID_BYTES as u64),
+        // Contract 1.291 (§4.277 B): the migration status code is clamped to the
+        // same bound the connector enforces before it writes the face.
+        (
+            "/$defs/storeMigration/properties/code",
+            "maxLength",
+            kt_signal_connector::pool::STORE_MIGRATION_CODE_MAX_CHARS as u64,
+        ),
         ("/$defs/opaqueId", "maxLength", MAX_OPAQUE_ID_BYTES as u64),
         (
             "/$defs/linkStartParams/properties/deviceName",
@@ -642,7 +652,7 @@ fn schema_numeric_bounds_match_code_constants() {
         // indices shifted +1 when contract 1.158 §4.156 inserted the
         // story.deleteCandidate branch at allOf/12.)
         (
-            "/$defs/event/allOf/14/then/properties/data/properties/changes",
+            "/$defs/event/allOf/15/then/properties/data/properties/changes",
             "maxItems",
             GROUP_CHANGED_MAX_CHANGES as u64,
         ),
@@ -650,17 +660,17 @@ fn schema_numeric_bounds_match_code_constants() {
         // the parse-side bounds — the group cap, the per-group entry cap,
         // and the author id bound (the receive-id family).
         (
-            "/$defs/event/allOf/15/then/properties/data/properties/deletes",
+            "/$defs/event/allOf/16/then/properties/data/properties/deletes",
             "maxItems",
             MAX_SYNC_DELETE_GROUPS as u64,
         ),
         (
-            "/$defs/event/allOf/15/then/properties/data/properties/deletes/items/properties/messages",
+            "/$defs/event/allOf/16/then/properties/data/properties/deletes/items/properties/messages",
             "maxItems",
             MAX_SYNC_DELETE_GROUP_MESSAGES as u64,
         ),
         (
-            "/$defs/event/allOf/15/then/properties/data/properties/deletes/items/properties/messages/items/properties/author",
+            "/$defs/event/allOf/16/then/properties/data/properties/deletes/items/properties/messages/items/properties/author",
             "maxLength",
             MAX_RECEIVE_ID_CHARS as u64,
         ),
@@ -668,7 +678,7 @@ fn schema_numeric_bounds_match_code_constants() {
         // arm's 256-entry batch ceiling (the engine's projection cap is the
         // same value).
         (
-            "/$defs/event/allOf/15/then/properties/data/properties/attachmentDeletes",
+            "/$defs/event/allOf/16/then/properties/data/properties/attachmentDeletes",
             "maxItems",
             MAX_SYNC_DELETE_GROUP_MESSAGES as u64,
         ),
@@ -677,12 +687,12 @@ fn schema_numeric_bounds_match_code_constants() {
         // hex identity key mirrors its own bound (the parse drops an
         // over-bound key whole — never a truncated fingerprint).
         (
-            "/$defs/event/allOf/16/then/properties/data/properties/destinationUuid",
+            "/$defs/event/allOf/17/then/properties/data/properties/destinationUuid",
             "maxLength",
             MAX_RECEIVE_ID_CHARS as u64,
         ),
         (
-            "/$defs/event/allOf/16/then/properties/data/properties/identityKey",
+            "/$defs/event/allOf/17/then/properties/data/properties/identityKey",
             "maxLength",
             MAX_SYNC_IDENTITY_KEY_CHARS as u64,
         ),
@@ -694,12 +704,12 @@ fn schema_numeric_bounds_match_code_constants() {
         // engine.initialSyncComplete landed arms ahead of it, so the
         // positional pointer moved from the historical allOf/32.
         (
-            "/$defs/event/allOf/33/then/properties/data/properties/receipts/items/properties/recipient",
+            "/$defs/event/allOf/35/then/properties/data/properties/receipts/items/properties/recipient",
             "maxLength",
             MAX_RECEIVE_ID_CHARS as u64,
         ),
         (
-            "/$defs/event/allOf/33/then/properties/data/properties/receipts",
+            "/$defs/event/allOf/35/then/properties/data/properties/receipts",
             "maxItems",
             MAX_MESSAGE_RECEIPT_RECIPIENTS as u64,
         ),
@@ -707,7 +717,7 @@ fn schema_numeric_bounds_match_code_constants() {
         // mirrors the parse bound (§4.175's MAX_INBOUND_ATTACHMENTS — one
         // entry per remote attachment position).
         (
-            "/$defs/event/allOf/35/then/properties/data/properties/attachments",
+            "/$defs/event/allOf/37/then/properties/data/properties/attachments",
             "maxItems",
             MAX_INBOUND_ATTACHMENTS as u64,
         ),
@@ -716,7 +726,7 @@ fn schema_numeric_bounds_match_code_constants() {
         // the conversation identity rides the shared opaqueId def, so no
         // inline pairing exists to pin.
         (
-            "/$defs/event/allOf/17/then/properties/data/properties/callId",
+            "/$defs/event/allOf/18/then/properties/data/properties/callId",
             "maxLength",
             MAX_SYNC_CALL_ID_CHARS as u64,
         ),
@@ -724,24 +734,24 @@ fn schema_numeric_bounds_match_code_constants() {
         // their own bound — the root key drops the record whole over it, the
         // admin key drops per-key (never a truncated call-link address).
         (
-            "/$defs/event/allOf/20/then/properties/data/properties/rootKey",
+            "/$defs/event/allOf/21/then/properties/data/properties/rootKey",
             "maxLength",
             MAX_SYNC_CALL_LINK_KEY_CHARS as u64,
         ),
         (
-            "/$defs/event/allOf/20/then/properties/data/properties/adminKey",
+            "/$defs/event/allOf/21/then/properties/data/properties/adminKey",
             "maxLength",
             MAX_SYNC_CALL_LINK_KEY_CHARS as u64,
         ),
         // The device-name/PNI registration ids mirror the parse's u32 range
         // gate (the std bound the parse enforces through try_from).
         (
-            "/$defs/event/allOf/22/then/properties/data/properties/deviceId",
+            "/$defs/event/allOf/24/then/properties/data/properties/deviceId",
             "maximum",
             u32::MAX as u64,
         ),
         (
-            "/$defs/event/allOf/24/then/properties/data/properties/registrationId",
+            "/$defs/event/allOf/26/then/properties/data/properties/registrationId",
             "maximum",
             u32::MAX as u64,
         ),
@@ -1141,6 +1151,71 @@ fn schema_numeric_bounds_match_code_constants() {
             "maximum",
             MAX_ATTACHMENT_DIMENSION_ROWS as u64,
         ),
+        // Declared media dimensions on the send family (contract 1.294, §4.284
+        // BUG-11 wire 批): the same official Attachment.width/height domain as
+        // the persisted face above, on the singular keys, the plural entry keys
+        // and the retry face (all three reuse the one constant).
+        (
+            "/$defs/messagesSendAttachmentParams/properties/width",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentParams/properties/height",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentEntry/properties/width",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentEntry/properties/height",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
+        (
+            "/$defs/messagesRetryAttachmentParams/properties/width",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
+        (
+            "/$defs/messagesRetryAttachmentParams/properties/height",
+            "maximum",
+            MAX_ATTACHMENT_DIMENSION_PX as u64,
+        ),
+        // Peer addressing on the safety-number faces (contract 1.281,
+        // §4.265): the peerKey wire bound on both faces pairs with the code
+        // constant. The UUID/E.164 grammar above/below that bound is the
+        // shape gate (uuid_shaped / is_e164_phone_number_shape), pinned by
+        // the §4.265 unit tests and mirrored by the schema's anyOf patterns
+        // in the structural test below.
+        (
+            "/$defs/identitiesGetParams/properties/peerKey",
+            "maxLength",
+            IDENTITY_PEER_KEY_MAX_CHARS as u64,
+        ),
+        (
+            "/$defs/identitiesVerifyParams/properties/peerKey",
+            "maxLength",
+            IDENTITY_PEER_KEY_MAX_CHARS as u64,
+        ),
+        // 契约 1.283（§4.267）：events.list 的游标面。token 的代际上界与 page
+        // 的 limit 上界都由 store 的命名常量执行，这里锁住两个数不漂移；
+        // afterSeq 的 0 下界是集合本身的形状（负游标没有意义），由
+        // schema_bound 的 minimum 配对。
+        (
+            "/$defs/eventsListParams/properties/token",
+            "maxLength",
+            EVENT_TOKEN_MAX_CHARS as u64,
+        ),
+        (
+            "/$defs/eventsListParams/properties/limit",
+            "maximum",
+            EVENT_PAGE_MAX_LIMIT as u64,
+        ),
+        ("/$defs/eventsListParams/properties/afterSeq", "minimum", 0),
     ];
     assert!(!pairs.is_empty());
     for (pointer, key, code) in pairs {
@@ -1149,5 +1224,140 @@ fn schema_numeric_bounds_match_code_constants() {
             declared, *code,
             "bound drift at {pointer}.{key}: schema says {declared}, code enforces {code}"
         );
+    }
+}
+
+/// 契约 1.281（§4.265）结构锁：两张安全码面的寻址恰一（conversationId xor
+/// peerKey）写成 oneOf —— verify 面的两个独立 oneOf（地址臂、数字/重置臂）
+/// 由 allOf 组合 —— 且 peerKey 的 anyOf 词形只认 ACI UUID 或 E.164（组
+/// master key、PNI:/u: 用户名拼写与裸数字都不在这条面上）。词形语义由
+/// service 的单测（`identity_peer_addressing_reads_without_a_conversation_and
+/// _stamps_by_peer`）逐条对齐，这里锁的是 wire 契约本身不能悄悄退化。
+#[test]
+fn identity_faces_declare_the_addressing_one_of_and_peer_key_grammar() {
+    let schema = schema();
+    let get = schema
+        .pointer("/$defs/identitiesGetParams")
+        .expect("identitiesGetParams must exist");
+    assert_eq!(
+        get["required"],
+        serde_json::json!(["accountId"]),
+        "the addressing form is exactly-one, so neither key is required"
+    );
+    assert_eq!(
+        get["oneOf"],
+        serde_json::json!([
+            { "required": ["conversationId"] },
+            { "required": ["peerKey"] },
+        ])
+    );
+    assert_eq!(
+        get["properties"]["conversationId"]["maxLength"],
+        serde_json::json!(256)
+    );
+
+    let verify = schema
+        .pointer("/$defs/identitiesVerifyParams")
+        .expect("identitiesVerifyParams must exist");
+    assert_eq!(verify["required"], serde_json::json!(["accountId"]));
+    assert_eq!(
+        verify["allOf"],
+        serde_json::json!([
+            {
+                "oneOf": [
+                    { "required": ["conversationId"] },
+                    { "required": ["peerKey"] },
+                ],
+            },
+            {
+                "oneOf": [
+                    { "required": ["safetyNumber"] },
+                    { "required": ["state"] },
+                ],
+            },
+        ]),
+        "two independent exactly-one axes need allOf, not a second oneOf key"
+    );
+
+    // The two grammar arms, verbatim: ACI UUID (8-4-4-4-12 hex) or E.164.
+    for pointer in [
+        "/$defs/identitiesGetParams/properties/peerKey/anyOf",
+        "/$defs/identitiesVerifyParams/properties/peerKey/anyOf",
+    ] {
+        let patterns: Vec<&str> = schema
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("schema must declare the peerKey grammar at {pointer}"))
+            .iter()
+            .map(|arm| {
+                arm.get("pattern")
+                    .and_then(Value::as_str)
+                    .expect("each peerKey arm is a pattern")
+            })
+            .collect();
+        assert_eq!(
+            patterns,
+            vec![
+                "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "^\\+[0-9]{7,15}$",
+            ],
+            "the peerKey grammar drifted at {pointer}"
+        );
+    }
+}
+/// Contract 1.291 (§4.277 B): the status face is a closed vocabulary on both
+/// halves, and the connector's own code is the only source of it. `off` is
+/// deliberately absent from the wire enum: an unarmed connector omits the key.
+#[test]
+fn the_store_migration_face_matches_the_code_vocabulary() {
+    use kt_signal_connector::pool::{
+        STORE_CODE_CAPABILITY_MISSING, STORE_CODE_INTERRUPTED, STORE_CODE_IO_ERROR,
+        STORE_CODE_KEY_INVALID, STORE_CODE_LOCKED, STORE_CODE_REQUIRED, STORE_CODE_TIMEOUT,
+        STORE_CODE_VERIFY_FAILED, StoreMigrationState,
+    };
+    let declared = schema_enum("/$defs/storeMigrationState/enum");
+    let emitted: BTreeSet<String> = [
+        StoreMigrationState::Pending,
+        StoreMigrationState::Migrating,
+        StoreMigrationState::Migrated,
+        StoreMigrationState::Blocked,
+        StoreMigrationState::Failed,
+    ]
+    .iter()
+    .map(|state| state.label().to_string())
+    .collect();
+    assert_eq!(
+        declared, emitted,
+        "the wire enum is exactly the states the connector can report"
+    );
+    assert!(
+        !declared.contains("off"),
+        "an unarmed connector omits the key; it never sends a sixth word"
+    );
+    let codes = schema_enum("/$defs/storeMigration/properties/code/enum");
+    let known: BTreeSet<String> = [
+        STORE_CODE_CAPABILITY_MISSING,
+        STORE_CODE_KEY_INVALID,
+        STORE_CODE_VERIFY_FAILED,
+        STORE_CODE_REQUIRED,
+        STORE_CODE_INTERRUPTED,
+        STORE_CODE_IO_ERROR,
+        STORE_CODE_LOCKED,
+        STORE_CODE_TIMEOUT,
+    ]
+    .iter()
+    .map(|code| code.to_string())
+    .collect();
+    assert_eq!(codes, known, "the code face is closed and connector-owned");
+    for state in [
+        StoreMigrationState::Off,
+        StoreMigrationState::Pending,
+        StoreMigrationState::Migrating,
+        StoreMigrationState::Migrated,
+        StoreMigrationState::Blocked,
+        StoreMigrationState::Failed,
+    ] {
+        let label = state.label();
+        assert!(label.len() <= 16, "{label}");
     }
 }

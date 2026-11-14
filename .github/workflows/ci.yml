@@ -47,7 +47,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # 1.99.0 的 toolchain action 默认只装 rustc/cargo，不装 rustfmt/clippy——
+      # 下面两道 gate 会直接 `cargo-fmt is not installed` 失败（main 上 2026-11-12
+      # 起一直红，同根因）。组件显式声明才能跑完整 gate 集。
       - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -57,5 +62,12 @@ jobs:
       - name: Gate 2/3 — cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Gate 3/3 — cargo test (process-group wrapped, orphans reaped on timeout)
-        run: scripts/run-cargo-gates.sh test
+      # Linux 只跑 lib 单测：所有 integration test 都靠 tests/fixtures/fake-engine.py
+      # 起假引擎，而该 fixture 在 ubuntu runner 上起不来——runtime 恒 state=stopped
+      # （stdout/stderr 都 inherit 之后仍无 python traceback）。这是 main 的存量债：
+      # Gate 1 从 2026-11-12 起被缺失的 rustfmt/clippy 挡死，Gate 3 从来没跑到过。
+      # 追踪 issue #7。集成测试由本地 macOS 全量承担。
+      - name: Gate 3/3 — cargo test --lib (process-group wrapped, orphans reaped on timeout)
+        env:
+          RUST_BACKTRACE: "1"
+        run: scripts/run-cargo-gates.sh test --lib

@@ -20,8 +20,44 @@ if os.environ.get("KT_FAKE_EXPECT_NO_JAVA") is not None:
         sys.exit(94)
 
 
+# O1 engine contract handshake fixture. The connector asks a freshly started
+# engine who it is (`version`) and which contract revision it implements
+# (`engine.protocolCapabilities.contractRevision`). Defaults reproduce the
+# pre-handshake engine: a real identity with no stated revision, which the
+# connector serves as `legacy`. Tests opt into the other rows:
+#   KT_FAKE_ENGINE_CONTRACT_REVISION=<rev>  stated revision (e.g. "1.284")
+#   KT_FAKE_ENGINE_NO_CAPABILITIES=1        capabilities answers the upstream
+#                                           error class (a pre-face engine)
+#   KT_FAKE_ENGINE_VERSION_ERROR=1          version answers an error
+#   KT_FAKE_ENGINE_VERSION_DELAY_MS=<n>     version answers after n ms
+#                                           (past the 5s probe budget)
+ENGINE_VERSION = os.environ.get("KT_FAKE_ENGINE_VERSION") or "0.1.0-fixture"
+
 LINKED_ACCOUNT = "+15555550100"
 ACTIVE_LINK_URI = "sgnl://link?uuid=fixture&pub_key=fixture"
+# Rotating link attempt fixture (connector contract 1.286, §4.272). A
+# rotate-capable engine states its rotate key on the startLink answer, and the
+# connector keys rotateLink by it. Modes:
+#   (unset) / "1"       rotate-capable: startLink mints an attempt id and
+#                       rotateLink answers a fresh code for the same attempt
+#   "0" / "off"         a pre-rotate engine: startLink states no attempt and
+#                       rotateLink is not implemented
+#   "method_not_found"  startLink states the key but rotateLink answers the
+#                       JSON-RPC method-not-found class (-32601)
+LINK_ROTATE_MODE = (os.environ.get("KT_FAKE_LINK_ROTATE") or "").strip().lower()
+# attempt id -> how many slots it has minted
+LINK_ATTEMPTS = {}
+# every code this fixture minted (finishLink accepts any of them, so the
+# dual-slot flow can finish through a rotated slot)
+LINK_URIS = {ACTIVE_LINK_URI}
+# Connector contract 1.286 (§4.272) commit-face fixture: the engine approves a
+# device while a rotation retires the very code the finish was dispatched with.
+# A finishLink naming this device parks its answer; the test releases it by
+# dropping DEFERRED_FINISH_MARKER in the data dir *after* the retiring rotation
+# answered, so the engine's success provably lands with that code already
+# Retired. The commit must accept it (not answer LINK_LOST) and journal it.
+DEFERRED_FINISH_DEVICE = "[deferred-link-test]"
+PENDING_FINISH_IDS = []
 WRITE_LOCK = threading.Lock()
 # §4.68 snapshot-import fixture: the archive identity the background import
 # task projects into the §4.38 NDJSON (one contact recipient + one chat + two
@@ -358,6 +394,27 @@ def argument_value(name):
 SIGNAL_DATA_DIR = Path(argument_value("--data-dir") or "/tmp/kt-signal-fixture")
 SIGNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# P1 runtime isolation fixture (contract revision 1.288, §4.274): record the
+# single-account guard the connector handed this engine. The connector sets or
+# removes the variable explicitly per child; the test reads this probe to pin
+# that a pooled engine is never launched without it (and a legacy engine never
+# carries one).
+try:
+    (SIGNAL_DATA_DIR / ".fixture-env.json").write_text(
+        json.dumps(
+            {
+                "KT_ENGINE_SINGLE_ACCOUNT": os.environ.get("KT_ENGINE_SINGLE_ACCOUNT"),
+                # M6 C phase (contract revision 1.289, §4.275): the store key
+                # the connector handed this child. Present only when the
+                # connector derived one for this account; never for a legacy
+                # group engine, and never the connector's root key.
+                "KT_SIGNAL_STORE_KEY": os.environ.get("KT_SIGNAL_STORE_KEY"),
+            }
+        )
+    )
+except OSError:
+    pass
+
 
 def log_pid_line():
     logs_dir = SIGNAL_DATA_DIR / "logs"
@@ -380,6 +437,10 @@ LINKED_ACCOUNT = (
     else "+15555550100"
 )
 DELETED_MARKER = SIGNAL_DATA_DIR / ".fixture-account-deleted"
+# Commit-face release marker (contract 1.286 §4.272, DEFERRED_FINISH_DEVICE):
+# the test drops it after the retiring rotation answered, and the watcher below
+# emits the parked finishLink success.
+DEFERRED_FINISH_MARKER = SIGNAL_DATA_DIR / ".fixture-release-finish"
 # §4.179 unknown-outcome reconciliation probe markers: the answer-shape marker
 # (.fixture-lookup-dispatch.json, a verbatim lookupOutgoingDispatch result
 # object) and the error marker (.fixture-lookup-error, -32603 face).
@@ -391,6 +452,11 @@ FAIL_USER_STATUS_COUNT_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status-cou
 AUTH_FAILED_MARKER = SIGNAL_DATA_DIR / ".fixture-auth-failed-user-status"
 UNREGISTERED_MARKER = SIGNAL_DATA_DIR / ".fixture-unregistered-user-status"
 USERNAME_UNSET_MARKER = SIGNAL_DATA_DIR / ".fixture-username-unset"
+# Contract 1.286 §4.281 login-window sync projection fixture (SIGNAL-STAGE1
+# §二 P-B-3). The default arm answers the mixed face; the bad-shape marker
+# answers a phase outside the closed vocabulary (the connector's shape gate
+# must refuse it instead of projecting a guessed word).
+SYNC_STATE_BAD_MARKER = SIGNAL_DATA_DIR / ".fixture-sync-state-bad"
 SEND_LOG = SIGNAL_DATA_DIR / ".fixture-send-log.jsonl"
 DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
 # §4.123 test hook: one-shot server-unavailable send answer. A test arms it
@@ -409,6 +475,19 @@ SEND_UNAVAILABLE_DONE = SIGNAL_DATA_DIR / ".fixture-send-unavailable-done"
 # normally.
 SEND_RATELIMIT_ARMED = SIGNAL_DATA_DIR / ".fixture-send-ratelimit-armed"
 SEND_RATELIMIT_DONE = SIGNAL_DATA_DIR / ".fixture-send-ratelimit-done"
+# Contract 1.285 (§4.269) test hook: one-shot dispatch-timeout send answer.
+# A test arms it by touching .fixture-send-engine-timeout-armed in this
+# engine's own data dir; the FIRST send then answers the engine's real
+# -32000 (EngineTimeoutException) face with its promised data, the done
+# marker records the one-shot, and every later send answers normally. The
+# connector must fold a mutating timeout to the existing unknown outcome.
+ENGINE_TIMEOUT_ARMED = SIGNAL_DATA_DIR / ".fixture-send-engine-timeout-armed"
+ENGINE_TIMEOUT_DONE = SIGNAL_DATA_DIR / ".fixture-send-engine-timeout-done"
+# Contract 1.285 (§4.269) read-only counterpart: the version probe answers
+# the same -32000 (EngineTimeoutException) face while this marker exists, so
+# a test can prove a READ-ONLY cancellation keeps the structured timeout face
+# (ENGINE_TIMEOUT) instead of folding to the unknown outcome.
+VERSION_TIMEOUT_MARKER = SIGNAL_DATA_DIR / ".fixture-version-engine-timeout"
 ACCOUNT_LINKED = not DELETED_MARKER.exists()
 
 # Multi-account mode (optimization-plan §6.4 M3.3 tests and the soak driver's
@@ -783,6 +862,32 @@ def emit_json_after(value, delay_seconds):
     emit_json(value)
 
 
+# Commit-face fixture (contract 1.286 §4.272): a finishLink parked by
+# DEFERRED_FINISH_DEVICE is released by the test through DEFERRED_FINISH_MARKER
+# once the rotation that retired the code has answered. Emitting from this
+# watcher, rather than inline, keeps rotateLink served while the finish is in
+# flight and makes the engine-success-after-retirement order deterministic.
+def watch_deferred_finish_marker():
+    while True:
+        time.sleep(0.05)
+        if not DEFERRED_FINISH_MARKER.exists():
+            continue
+        try:
+            DEFERRED_FINISH_MARKER.unlink()
+        except OSError:
+            continue
+        while PENDING_FINISH_IDS:
+            pending_id = PENDING_FINISH_IDS.pop(0)
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": pending_id,
+                "result": account_entry(LINKED_ACCOUNT),
+            })
+
+
+threading.Thread(target=watch_deferred_finish_marker, daemon=True).start()
+
+
 def log_method_line(name):
     logs_dir = SIGNAL_DATA_DIR / "logs"
     try:
@@ -819,6 +924,94 @@ for line in sys.stdin:
         time.sleep(3600)
         continue
 
+    # O1 handshake faces. Both are read-only, account-free, zero-network,
+    # exactly like the engine's own registration (compat §3).
+    if method == "version":
+        if VERSION_TIMEOUT_MARKER.exists():
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                    "data": {
+                        "reason": "REQUEST_TIMEOUT",
+                        "retryable": False,
+                        "timeoutMs": 60000,
+                    },
+                },
+            })
+            continue
+        if os.environ.get("KT_FAKE_ENGINE_VERSION_ERROR"):
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "fixture: the engine does not carry the version face",
+                },
+            })
+            continue
+        response = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"name": "kt-signal-engine", "version": ENGINE_VERSION},
+        }
+        delay_ms = int(os.environ.get("KT_FAKE_ENGINE_VERSION_DELAY_MS", "0") or "0")
+        if delay_ms > 0:
+            threading.Thread(
+                target=emit_json_after,
+                args=(response, delay_ms / 1000),
+                daemon=True,
+            ).start()
+            continue
+        emit_json(response)
+        continue
+    if method == "engine.protocolCapabilities":
+        if os.environ.get("KT_FAKE_ENGINE_NO_CAPABILITIES"):
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "fixture: engine predates the self-certification face",
+                },
+            })
+            continue
+        payload = {
+            "deviceCapabilities": {
+                "storage": True,
+                "transfer": False,
+                "attachmentBackfill": True,
+                "spqr": True,
+                "profiles_v2": False,
+                "usernameChangeSyncMessage": True,
+                "versionedExpirationTimer": False,
+                "optionalPhoneNumber": False,
+            },
+            "deviceCapabilitiesUpload": {
+                "attachmentBackfill": True,
+                "spqr": True,
+                "usernameChangeSyncMessage": True,
+                "optionalPhoneNumber": False,
+            },
+            "linkCapabilities": {
+                "attachmentBackfill": False,
+                "spqr": False,
+                "usernameChangeSyncMessage": False,
+            },
+            "baseline": {
+                "presageRev": "fixture",
+                "libsignalVersion": "fixture",
+                "libsignalCommit": "fixture",
+            },
+        }
+        revision = os.environ.get("KT_FAKE_ENGINE_CONTRACT_REVISION")
+        if revision:
+            payload["contractRevision"] = revision
+        emit_json({"jsonrpc": "2.0", "id": request_id, "result": payload})
+        continue
+
     if method == "armDelayedReceive":
         # Regression fixture for the stdin writer task (A7): emit a receive
         # notification after a delay without reading anything else from stdin,
@@ -832,14 +1025,103 @@ for line in sys.stdin:
         result = {"method": method}
     elif method == "startLink":
         result = {"deviceLinkUri": ACTIVE_LINK_URI}
+        if LINK_ROTATE_MODE not in ("0", "off"):
+            attempt = "lk-fixture-%d" % (len(LINK_ATTEMPTS) + 1)
+            LINK_ATTEMPTS[attempt] = 1
+            result["linkAttemptId"] = attempt
+            result["slots"] = [{"deviceLinkUri": ACTIVE_LINK_URI, "slot": 0}]
+    elif method == "rotateLink":
+        # Contract 1.286 (§4.272): mint a fresh provisioning session for the
+        # same attempt. Each rotation answers a new code and its slot number;
+        # the connector owns the two-live-slot bound and the commit.
+        if LINK_ROTATE_MODE == "method_not_found":
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": "Method not found: rotateLink"},
+            })
+            continue
+        attempt = params.get("linkAttemptId")
+        if LINK_ROTATE_MODE in ("0", "off") or attempt not in LINK_ATTEMPTS:
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "LINK_ATTEMPT_NOT_FOUND"},
+            })
+            continue
+        slot = LINK_ATTEMPTS[attempt]
+        LINK_ATTEMPTS[attempt] = slot + 1
+        uri = ACTIVE_LINK_URI + "&slot=%d" % slot
+        LINK_URIS.add(uri)
+        result = {
+            "deviceLinkUri": uri,
+            "linkAttemptId": attempt,
+            "slot": slot,
+            "slots": [{"deviceLinkUri": uri, "slot": slot}],
+        }
     elif method == "finishLink":
-        if params.get("deviceLinkUri") != ACTIVE_LINK_URI:
+        if params.get("deviceLinkUri") not in LINK_URIS:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {"code": -1, "message": "Unknown device link uri."},
             }
             emit_json(response)
+            continue
+        # Link-finish budget fixture: the engine's own dispatch budget (360 s)
+        # is the deadline that fires first in production; the connector's 370 s
+        # is the outer backstop. Answer that face on demand so the suite can
+        # prove the fold to the link-class unknown outcome without waiting out
+        # a real budget.
+        if os.environ.get("KT_FAKE_FINISH_ENGINE_TIMEOUT") == "1":
+            # BUG-1 soften fixture: the phone approved just under the engine's
+            # own dispatch deadline, so the commit landed engine-side while the
+            # -32000 answer is the face the connector sees. The account
+            # registry (the durable proof the reclaim probe asks for) is
+            # written first; only then does the budget expire.
+            if (
+                os.environ.get("KT_FAKE_FINISH_TIMEOUT_AFTER_COMMIT") == "1"
+                and POOL_ACCOUNT_MODE
+            ):
+                ACCOUNT_LINKED = True
+                committed_number = next_multi_number()
+                OWN_NUMBER_MARKER.write_text(committed_number + "\n")
+                (SIGNAL_DATA_DIR / "engine-state.json").write_text(json.dumps({
+                    "version": 2,
+                    "accounts": [{
+                        "number": committed_number,
+                        "dir": "accounts/lk-fixture",
+                    }],
+                }))
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                    "data": {
+                        "reason": "REQUEST_TIMEOUT",
+                        "retryable": False,
+                        "timeoutMs": 360000,
+                    },
+                },
+            })
+            continue
+        # QR B1 (issue #951): the engine's provisioning channel died after
+        # the URL handoff — finishLink answers the definite -1 + LINK_LOST.
+        if os.environ.get("KT_FAKE_FINISH_LINK_LOST") == "1":
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "LINK_LOST"},
+            })
+            continue
+        if params.get("deviceName") == DEFERRED_FINISH_DEVICE:
+            # Park the approval until the test releases it (contract 1.286
+            # §4.272): the answer is emitted by the marker watcher, never
+            # inline, so rotateLink keeps being served while this finish is in
+            # flight and the success lands after the retiring rotation.
+            PENDING_FINISH_IDS.append(request_id)
             continue
         if params.get("deviceName") == "[slow-link-test]":
             continue
@@ -867,6 +1149,33 @@ for line in sys.stdin:
         result = account_entry(number)
         emit_receive_after = True
     elif method == "listAccounts":
+        # BUG-1 soften fixture: per-engine witness that a reclaim asked the
+        # engine once before tearing a slot down. A pooled slot's own data dir
+        # does not survive a reclaim, so the witness lives beside it in the
+        # engines root and is keyed by the slot name (sibling engines stay
+        # independent).
+        probe_log = (
+            LADDER_DIR / (".fixture-list-accounts-calls-" + SIGNAL_DATA_DIR.name)
+            if POOL_ACCOUNT_MODE
+            else SIGNAL_DATA_DIR / ".fixture-list-accounts-calls"
+        )
+        try:
+            with probe_log.open("a") as calls:
+                calls.write("1\n")
+        except OSError:
+            pass
+        # Probe-failure arms: an engine that cannot answer at all (the
+        # pre-softening reclaim must stay) and one that never answers (the
+        # caller's probe budget must expire instead of stalling the reclaim).
+        if os.environ.get("KT_FAKE_LIST_ACCOUNTS_HANG") == "1":
+            continue
+        if os.environ.get("KT_FAKE_LIST_ACCOUNTS_FAIL") == "1":
+            emit_json({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            })
+            continue
         if POOL_ACCOUNT_MODE:
             number = own_number() or state_file_number()
             result = (
@@ -1179,6 +1488,28 @@ for line in sys.stdin:
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        # Contract 1.285 §4.269 one-shot dispatch-timeout answer: the real
+        # engine's -32000 (EngineTimeoutException) face with its promised
+        # data. A mutating send that receives it may already have been
+        # written, so the connector must fold it to the existing unknown
+        # outcome — the row settles unknown, never failed, no auto retry.
+        if ENGINE_TIMEOUT_ARMED.exists() and not ENGINE_TIMEOUT_DONE.exists():
+            ENGINE_TIMEOUT_DONE.touch()
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                    "data": {
+                        "reason": "REQUEST_TIMEOUT",
+                        "retryable": False,
+                        "timeoutMs": 60000,
+                    },
+                },
             }
             emit_json(response)
             continue
@@ -2476,6 +2807,31 @@ for line in sys.stdin:
                 {"deviceId": "3", "name": "ghost"},
             ]
         }
+    elif method == "getSyncState":
+        # Contract 1.286 §4.281: the login-window sync projection read
+        # (SIGNAL-STAGE1-DESIGN §二 P-B-3). Record the exact upstream params
+        # (the test asserts the resolved account key) — a repeated call lands a
+        # second identical line, which is the idempotency evidence the face
+        # promises. Default: the three halves on three different words so a
+        # passthrough defect is visible; the bad marker answers a phase
+        # outside the vocabulary so the connector's shape gate can be pinned.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if SYNC_STATE_BAD_MARKER.exists():
+            result = {
+                "contacts": "settled",
+                "storage": "done",
+                "profile": "idle",
+                "sinceMs": 1760000000000,
+            }
+        else:
+            result = {
+                "contacts": "done",
+                "storage": "inflight",
+                "profile": "failed",
+                "sinceMs": 1760000000000,
+            }
     elif method == "unlinkDevice":
         # Contract 1.122 §4.103: the server-side unlink write. Record the
         # exact upstream params (the test asserts the resolved account and the
@@ -2783,8 +3139,18 @@ for line in sys.stdin:
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
-        digits = (params.get("verifiedSafetyNumber") or "").replace(" ", "")
-        if digits != "123456789012345678901234567890123456789012345678901234567890":
+        # 契约 §4.223 两臂：verifiedSafetyNumber（比对闸）或 state="default"
+        # （sendAnyway 信任重置，引擎 (None, Some("default")) 臂，无比对）。
+        # 两臂恰一——同置/双缺/词表外 state 是引擎的 fail-closed 面，fixture
+        # 逐字回 -1。
+        state = params.get("state")
+        verified = params.get("verifiedSafetyNumber")
+        digits = (verified or "").replace(" ", "")
+        if state is not None:
+            ok = state == "default" and verified is None
+        else:
+            ok = digits == "123456789012345678901234567890123456789012345678901234567890"
+        if not ok:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2796,13 +3162,17 @@ for line in sys.stdin:
     elif method == "getAvatar":
         # Contract 1.48 §4.47 avatar download: read face, no SEND_LOG
         # dispatch recording (read-lane discipline, listContacts precedent).
-        # Sentinel conversationIds: "[fixture-avatar-unavailable]" answers
-        # AVATAR_UNAVAILABLE (the honest no-avatar), "[fixture-avatar-failed]"
-        # answers AVATAR_FETCH_FAILED, "[fixture-avatar-large]" answers
-        # AVATAR_TOO_LARGE — all three disjoint from every other face's
-        # magic.
+        # Sentinel conversationIds answer the structured avatar error faces:
+        # +15555550991 → AVATAR_UNAVAILABLE (the honest no-avatar),
+        # +15555550992 → AVATAR_FETCH_FAILED, +15555550993 →
+        # AVATAR_TOO_LARGE — the 509xx sentinel family, disjoint from every
+        # other face's magic. They stay legal wire shapes on purpose: the
+        # sentinel reaches this face as the conversation row's peer reference,
+        # and the direct peerKey face only admits an ACI UUID or an E.164
+        # number (§4.253 词形闸), so a bracketed token could never be
+        # materialized into a conversation in the first place.
         conversation_id = params.get("conversationId")
-        if conversation_id == "[fixture-avatar-unavailable]":
+        if conversation_id == "+15555550991":
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2810,7 +3180,7 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
-        if conversation_id == "[fixture-avatar-failed]":
+        if conversation_id == "+15555550992":
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2818,7 +3188,7 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
-        if conversation_id == "[fixture-avatar-large]":
+        if conversation_id == "+15555550993":
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2875,16 +3245,17 @@ for line in sys.stdin:
         # Contract 1.48 §4.47 blocked write: record the exact upstream params
         # (tests assert the resolved conversationId/kind/blocked contract),
         # apply the write to the fixture blocked state, answer the post-write
-        # full list. ConversationId sentinels: "[fixture-blocked-unavailable]"
-        # answers STORAGE_UNAVAILABLE, "[fixture-blocked-unresolved]" answers
-        # CONVERSATION_NOT_RESOLVED, "[fixture-blocked-crash]" crashes with
-        # the mutating call in flight (os._exit(32); disjoint from
-        # 25/29/30/31).
+        # full list. ConversationId sentinels (the 509xx E.164 family — the
+        # value arrives as the row's peer reference, and the direct peerKey
+        # face only admits an ACI UUID or a phone number, §4.253 词形闸):
+        # +15555550994 answers STORAGE_UNAVAILABLE, +15555550995 answers
+        # CONVERSATION_NOT_RESOLVED, +15555550996 crashes with the mutating
+        # call in flight (os._exit(32); disjoint from 25/29/30/31).
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
         conversation_id = params.get("conversationId")
-        if conversation_id == "[fixture-blocked-unavailable]":
+        if conversation_id == "+15555550994":
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2892,7 +3263,7 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
-        if conversation_id == "[fixture-blocked-unresolved]":
+        if conversation_id == "+15555550995":
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -2900,7 +3271,7 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
-        if conversation_id == "[fixture-blocked-crash]":
+        if conversation_id == "+15555550996":
             os._exit(32)
         conversation_id = params.get("conversationId")
         kind = params.get("kind")

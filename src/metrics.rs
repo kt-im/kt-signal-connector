@@ -97,6 +97,69 @@ static READ_WATERMARK_TARGETS_REJECTED: AtomicU64 = AtomicU64::new(0);
 /// mistake.
 static READ_WATERMARK_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+// --- O1 engine contract handshake ------------------------------------------
+//
+// The handshake runs once per engine landing (boot start, watchdog recovery,
+// per-account slot wake). Its counters are process-lifetime; the two string
+// gauges are the last verdict, exposed here so a connector log alone can say
+// which engine build it is talking to and under which contract.
+static ENGINE_CONTRACT_CHECKS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_CONTRACT_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_CONTRACT_PROBE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_CONTRACT_LEGACY: AtomicU64 = AtomicU64::new(0);
+
+/// The last handshake verdict, process-wide (metrics snapshot; the doctor
+/// carries the per-group face). Strings are the engine's own verbatim
+/// answers — version literals only, no account material.
+#[derive(Clone, Debug)]
+pub struct EngineContractSnapshot {
+    pub engine_name: Option<String>,
+    pub engine_version: Option<String>,
+    pub contract_revision: Option<String>,
+    pub status: &'static str,
+}
+
+impl EngineContractSnapshot {
+    pub const fn none() -> Self {
+        Self {
+            engine_name: None,
+            engine_version: None,
+            contract_revision: None,
+            status: crate::engine_contract::CONTRACT_STATUS_UNVERIFIED,
+        }
+    }
+
+    /// The snapshot projection of a served verdict (match or legacy).
+    pub fn from_report(report: &crate::engine_contract::EngineContractReport) -> Self {
+        Self {
+            engine_name: Some(report.engine_name.clone()),
+            engine_version: Some(report.engine_version.clone()),
+            contract_revision: report.contract_revision.clone(),
+            status: report.status,
+        }
+    }
+
+    /// The snapshot projection of a latched refusal.
+    pub fn from_fault(fault: &crate::engine_contract::EngineContractFault) -> Self {
+        Self {
+            engine_name: fault.engine_name.clone(),
+            engine_version: fault.engine_version.clone(),
+            contract_revision: fault.contract_revision.clone(),
+            status: crate::engine_contract::CONTRACT_STATUS_MISMATCH,
+        }
+    }
+}
+
+static ENGINE_CONTRACT_LAST: std::sync::Mutex<EngineContractSnapshot> =
+    std::sync::Mutex::new(EngineContractSnapshot::none());
+
+/// One engine slot's handshake face for the periodic per-group metrics line.
+#[derive(Clone, Debug)]
+pub struct EngineContractSample {
+    pub group_id: String,
+    pub state: crate::engine_contract::EngineContractState,
+}
+
 fn class_metrics(method_class: &str) -> &'static ClassMetrics {
     let index = METHOD_CLASSES
         .iter()
@@ -187,6 +250,58 @@ pub fn record_watchdog_restart() {
 
 /// Process-lifetime watchdog restart count, for the `runtime.doctor`
 /// network face (§4.79) — the existing metric, read back.
+/// O1: record a served handshake verdict (match or legacy).
+pub fn record_engine_contract(report: &crate::engine_contract::EngineContractReport) {
+    ENGINE_CONTRACT_CHECKS.fetch_add(1, Ordering::Relaxed);
+    if report.status == crate::engine_contract::CONTRACT_STATUS_LEGACY {
+        ENGINE_CONTRACT_LEGACY.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Ok(mut last) = ENGINE_CONTRACT_LAST.lock() {
+        *last = EngineContractSnapshot::from_report(report);
+    }
+}
+
+/// O1: record a latched contract refusal.
+pub fn record_engine_contract_mismatch(fault: &crate::engine_contract::EngineContractFault) {
+    ENGINE_CONTRACT_CHECKS.fetch_add(1, Ordering::Relaxed);
+    ENGINE_CONTRACT_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut last) = ENGINE_CONTRACT_LAST.lock() {
+        *last = EngineContractSnapshot::from_fault(fault);
+    }
+}
+
+/// O1: the handshake could not complete inside its budget - a retryable
+/// startup failure, never a contract verdict.
+pub fn record_engine_contract_probe_failure() {
+    ENGINE_CONTRACT_CHECKS.fetch_add(1, Ordering::Relaxed);
+    ENGINE_CONTRACT_PROBE_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The last handshake verdict for the snapshot line (a copy; the atomics are
+/// the source for the counters).
+pub fn engine_contract_snapshot() -> EngineContractSnapshot {
+    ENGINE_CONTRACT_LAST
+        .lock()
+        .map(|last| last.clone())
+        .unwrap_or_else(|_| EngineContractSnapshot::none())
+}
+
+/// O1: one periodic line per engine slot (the per-group engine contract face,
+/// beside the RSS sample). A slot with no verdict yet logs the honest
+/// 'unverified' literal rather than a fabricated match.
+pub fn log_engine_contract(samples: &[EngineContractSample]) {
+    for sample in samples {
+        tracing::info!(
+            target: "metrics",
+            group_id = %sample.group_id,
+            engine_version = sample.state.engine_version().unwrap_or("-"),
+            engine_contract_revision = sample.state.contract_revision().unwrap_or("-"),
+            engine_contract_status = sample.state.status(),
+            "engine contract metrics"
+        );
+    }
+}
+
 pub fn watchdog_restarts_total() -> u64 {
     WATCHDOG_RESTARTS.load(Ordering::Relaxed)
 }
@@ -297,6 +412,7 @@ pub fn receive_queue_drained() {
 /// Log the current counters/gauges as structured, redacted lines. Counters are
 /// process-lifetime cumulative; gauges are instantaneous.
 pub fn log_snapshot() {
+    let contract = engine_contract_snapshot();
     tracing::info!(
         target: "metrics",
         receive_dropped_total = RECEIVE_DROPPED.load(Ordering::Relaxed),
@@ -320,6 +436,18 @@ pub fn log_snapshot() {
             READ_WATERMARK_TARGETS_REJECTED.load(Ordering::Relaxed),
         read_watermark_store_failures_total =
             READ_WATERMARK_STORE_FAILURES.load(Ordering::Relaxed),
+        // O1: the last handshake verdict beside its counters — the engine
+        // build this connector is actually talking to is a first-class
+        // diagnostic, not something an operator has to grep doctor for.
+        engine_version = contract.engine_version.as_deref().unwrap_or("-"),
+        engine_name = contract.engine_name.as_deref().unwrap_or("-"),
+        engine_contract_revision = contract.contract_revision.as_deref().unwrap_or("-"),
+        engine_contract_status = contract.status,
+        engine_contract_checks_total = ENGINE_CONTRACT_CHECKS.load(Ordering::Relaxed),
+        engine_contract_mismatches_total = ENGINE_CONTRACT_MISMATCHES.load(Ordering::Relaxed),
+        engine_contract_probe_failures_total =
+            ENGINE_CONTRACT_PROBE_FAILURES.load(Ordering::Relaxed),
+        engine_contract_legacy_total = ENGINE_CONTRACT_LEGACY.load(Ordering::Relaxed),
         "connector metrics snapshot"
     );
     for (index, class) in METHOD_CLASSES.iter().enumerate() {
@@ -346,6 +474,46 @@ pub fn log_snapshot() {
     }
 }
 
+/// The store's own health line (contract revision 1.282, §4.266): the schema
+/// version it landed on next to its target, the last pre-migration integrity
+/// gate verdict, the database and WAL byte sizes, and what the pre-migration
+/// snapshot pass did. Numbers and fixed literals only — the same redaction
+/// discipline as every other series here.
+pub fn log_store_health(health: &crate::store::StoreHealth) {
+    tracing::info!(
+        target: "metrics",
+        store_schema_version = health.schema_version,
+        store_schema_target = health.schema_target,
+        store_integrity = health.integrity,
+        store_db_bytes = health.db_bytes,
+        store_wal_bytes = health.wal_bytes,
+        store_snapshot_count = health.snapshots.count,
+        store_snapshot_bytes = health.snapshots.bytes,
+        store_snapshot_last_result = health.snapshots.last_result,
+        store_migration_failure = health.last_migration_failure.is_some(),
+        "store metrics snapshot"
+    );
+}
+
+/// The event ledger's line (contract revision 1.283, §4.267): its generation,
+/// the retention floor and the head seq, how many rows and bytes it holds, and
+/// the window they are held to. Numbers and fixed literals only — no token, no
+/// event type, no account id (the redaction discipline of every series here).
+pub fn log_event_log_health(health: &crate::store::EventLogHealth) {
+    tracing::info!(
+        target: "metrics",
+        event_ledger_readable = health.readable,
+        event_ledger_generation = health.token_generation,
+        event_ledger_floor = health.trimmed_through_seq,
+        event_ledger_seq_max = health.seq_max,
+        event_ledger_rows = health.rows,
+        event_ledger_bytes = health.bytes,
+        event_ledger_max_rows = health.retention.max_rows,
+        event_ledger_max_bytes = health.retention.max_bytes,
+        "event ledger metrics snapshot"
+    );
+}
+
 /// Per-engine RSS gauges for the snapshot (optimization-plan §6.4 M3.4): the
 /// latest sample of each proxy group's engine, keyed by the launcher-defined
 /// group id — an opaque id, the same classification the runtime status and
@@ -367,6 +535,44 @@ pub fn log_engine_rss(samples: &[(String, Option<u64>)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// O1: the metrics snapshot exposes the engine build and the contract
+    /// revision verdict — the two facts an operator needs to tell an engine
+    /// upgrade from a connector contract gate. Pure projections are pinned
+    /// here; the process-wide latch is exercised by the supervisor path.
+    #[test]
+    fn engine_contract_snapshot_projects_both_verdicts() {
+        let matched = crate::engine_contract::EngineContractReport {
+            engine_name: "kt-signal-engine".into(),
+            engine_version: "0.1.0-dev.29".into(),
+            contract_revision: Some("1.284".into()),
+            status: crate::engine_contract::CONTRACT_STATUS_MATCH,
+        };
+        let snapshot = EngineContractSnapshot::from_report(&matched);
+        assert_eq!(snapshot.status, "match");
+        assert_eq!(snapshot.engine_version.as_deref(), Some("0.1.0-dev.29"));
+        assert_eq!(snapshot.contract_revision.as_deref(), Some("1.284"));
+
+        let legacy = crate::engine_contract::EngineContractReport {
+            contract_revision: None,
+            status: crate::engine_contract::CONTRACT_STATUS_LEGACY,
+            ..matched.clone()
+        };
+        let snapshot = EngineContractSnapshot::from_report(&legacy);
+        assert_eq!(snapshot.status, "legacy");
+        assert!(snapshot.contract_revision.is_none());
+
+        let fault = crate::engine_contract::EngineContractFault {
+            engine_name: Some("kt-signal-engine".into()),
+            engine_version: Some("0.1.0-dev.29".into()),
+            contract_revision: Some("1.100".into()),
+            reason: crate::engine_contract::MismatchReason::RevisionOutOfRange,
+        };
+        let snapshot = EngineContractSnapshot::from_fault(&fault);
+        assert_eq!(snapshot.status, "mismatch");
+        assert_eq!(snapshot.engine_version.as_deref(), Some("0.1.0-dev.29"));
+        assert_eq!(snapshot.contract_revision.as_deref(), Some("1.100"));
+    }
 
     #[test]
     fn every_host_method_maps_to_a_known_class() {
@@ -515,6 +721,81 @@ mod tests {
         // Nothing content-shaped ever appears: no numbers, addresses, bodies.
         assert!(!output.contains("+1555"));
         assert!(!output.contains("text"));
+    }
+
+    /// Contract revision 1.282 (§4.266): the store line carries the upgrade
+    /// facts — schema version, integrity verdict, db/wal sizes, snapshot
+    /// outcome — as fixed keys and classified literals, never a path.
+    #[test]
+    fn store_health_line_carries_the_upgrade_facts() {
+        let health = crate::store::StoreHealth {
+            schema_version: crate::store::SCHEMA_VERSION,
+            schema_target: crate::store::SCHEMA_VERSION,
+            integrity: "integrity",
+            db_bytes: 4096,
+            wal_bytes: 128,
+            snapshots: crate::store::SnapshotHealth {
+                count: 2,
+                bytes: 8192,
+                last_result: "created",
+                last_at: Some(1),
+            },
+            last_migration_failure: Some(crate::store::MigrationFailureFace {
+                at: 1,
+                from: 20,
+                to: crate::store::SCHEMA_VERSION,
+                rollback: "restored".into(),
+                snapshot: None,
+            }),
+            schema_newer: None,
+        };
+        let output = captured_output(|| log_store_health(&health));
+        assert!(output.contains("store metrics snapshot"), "{output}");
+        assert!(output.contains("store_schema_version="), "{output}");
+        assert!(output.contains("store_integrity=\"integrity\""), "{output}");
+        assert!(output.contains("store_db_bytes=4096"));
+        assert!(output.contains("store_wal_bytes=128"));
+        assert!(output.contains("store_snapshot_count=2"));
+        assert!(
+            output.contains("store_snapshot_last_result=\"created\""),
+            "{output}"
+        );
+        assert!(output.contains("store_migration_failure=true"));
+        // No path ever reaches the series.
+        assert!(!output.contains("migration-snapshots"));
+        assert!(!output.contains(".sqlite3"));
+    }
+
+    /// Contract revision 1.283 (§4.267): the ledger line carries generation,
+    /// floor, head, rows, bytes and the retention window as fixed keys — and
+    /// never a token or an event type.
+    #[test]
+    fn event_ledger_line_carries_the_retention_facts() {
+        let health = crate::store::EventLogHealth {
+            readable: true,
+            token_generation: 4,
+            trimmed_through_seq: 120,
+            seq_max: 260,
+            rows: 140,
+            bytes: 11_200,
+            oldest_created_at: Some(1),
+            newest_created_at: Some(2),
+            retention: crate::store::EventLogRetentionHealth {
+                max_age_ms: crate::store::EVENT_LOG_RETENTION_MS,
+                max_rows: crate::store::EVENT_LOG_MAX_ROWS,
+                max_bytes: crate::store::EVENT_LOG_MAX_BYTES,
+            },
+        };
+        let output = captured_output(|| log_event_log_health(&health));
+        assert!(output.contains("event ledger metrics snapshot"), "{output}");
+        assert!(output.contains("event_ledger_readable=true"), "{output}");
+        assert!(output.contains("event_ledger_generation=4"), "{output}");
+        assert!(output.contains("event_ledger_floor=120"), "{output}");
+        assert!(output.contains("event_ledger_seq_max=260"), "{output}");
+        assert!(output.contains("event_ledger_rows=140"), "{output}");
+        assert!(output.contains("event_ledger_bytes=11200"), "{output}");
+        assert!(output.contains("event_ledger_max_rows=20000"), "{output}");
+        assert!(!output.contains("token="), "{output}");
     }
 
     #[test]

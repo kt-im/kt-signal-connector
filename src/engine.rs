@@ -124,6 +124,22 @@ pub struct EngineConfig {
     /// demand); unarmed keeps the pre-ingest shape and every media method
     /// answers `CAPABILITY_UNAVAILABLE`.
     pub media_ingest: bool,
+    /// Pin `KT_ENGINE_SINGLE_ACCOUNT=1` on this child (pooled slots only; see
+    /// crate::pool::SINGLE_ACCOUNT_ENV and the engine's own read point,
+    /// `kt-signal-engine/src/main.rs:416-446`). Set explicitly instead of inherited:
+    /// the connector's own environment is never the child's authority on which
+    /// topology it serves.
+    pub single_account_guard: bool,
+    /// This child's own store-key decision (M6 C phase). `Account(key)` is
+    /// handed over as `KT_SIGNAL_STORE_KEY` in canonical 64-hex form — a pooled
+    /// slot's HKDF derivation **for that account**
+    /// (`store::engine_store_key_for_account`), never the root itself. The two
+    /// keyless states keep the engine on its plaintext legacy store and are not
+    /// the same thing: `RootKeyMissing` is a real downgrade (no root key is
+    /// configured, so nothing is derived from thin air), while
+    /// `GroupEngineNoAccountKey` is the deliberate legacy topology — one process
+    /// serving several accounts carries no single account's key.
+    pub store_key: crate::store::EngineStoreKey,
     pub line_limit: usize,
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -162,6 +178,8 @@ impl EngineConfig {
             executable,
             data_dir,
             media_ingest: false,
+            single_account_guard: false,
+            store_key: crate::store::EngineStoreKey::RootKeyMissing,
             line_limit: DEFAULT_UPSTREAM_LINE_LIMIT,
             history_cdn_base: None,
             request_timeout: Duration::from_secs(15),
@@ -255,6 +273,224 @@ fn engine_args(data_dir: &Path, media_ingest: bool) -> Vec<std::ffi::OsString> {
     args
 }
 
+/// The engine's migration argv mode (M6 phase D1/D3). The connector spawns
+/// the **same engine binary** in this mode instead of `jsonRpc` to move one
+/// account's plaintext `store.db` to an encrypted one, so the one programmable
+/// judgement stays the exit code (0 done/no-op/planned, 2 usage, 10 retryable,
+/// 11 terminal — engine design §2.4). Nothing in this module interprets the
+/// human-readable text: only `--json` evidence fields ride along for the log
+/// line.
+pub const STORE_MIGRATE_SUBCOMMAND: &str = "storeMigrate";
+
+/// Hard bound on the migration child's stdout/stderr the connector keeps. The
+/// `--json` document is one line; anything past this is a child that is not
+/// respecting its own contract, and a startup path must not grow with it.
+const STORE_MIGRATION_OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// The fixed argv shape of one migration run (engine design §2.2):
+/// `--data-dir <DIR> storeMigrate [--dry-run] --json`. `--account` is
+/// deliberately absent: a pooled data directory holds exactly one
+/// `accounts/lk-*` store (pool invariant I3), so naming it would only add a
+/// second source of truth the connector does not own.
+fn store_migrate_args(data_dir: &Path, dry_run: bool) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--data-dir".into(),
+        data_dir.as_os_str().into(),
+        STORE_MIGRATE_SUBCOMMAND.into(),
+    ];
+    if dry_run {
+        args.push("--dry-run".into());
+    }
+    args.push("--json".into());
+    args
+}
+
+/// What one migration run left behind. Evidence only — the caller classifies
+/// on `exit` (the engine's programmable判据), never on the text.
+#[derive(Clone, Debug, Default)]
+pub struct StoreMigrationRun {
+    /// The child's exit code; `None` when it never produced one (spawn
+    /// failure, I/O failure, or the budget expired).
+    pub exit: Option<i32>,
+    /// The budget expired and the child was killed.
+    pub timed_out: bool,
+    /// The child could not be spawned or waited on.
+    pub failed: bool,
+    /// `accounts[0].action` from the `--json` document
+    /// (`migrate`/`dry-run`/`noop`/`absent`/`failed`), when it parsed.
+    pub action: Option<String>,
+    /// The first `code` the document offered (`accounts[0].code`, else the
+    /// top-level `error.code`) — an evidence label, never a secret.
+    pub code: Option<String>,
+    /// `plan[]` (step-name array) when the document carried one.
+    pub plan: Vec<String>,
+}
+
+impl StoreMigrationRun {
+    /// One short label for the log line: `timed_out`, `spawn_failed`, or the
+    /// exit code as text. Never fabricates a code the child did not state.
+    pub fn outcome_label(&self) -> String {
+        match (self.timed_out, self.failed, self.exit) {
+            (true, _, _) => "timed_out".to_string(),
+            (_, true, _) => "spawn_failed".to_string(),
+            (_, _, Some(exit)) => format!("exit_{exit}"),
+            (_, _, None) => "no_exit".to_string(),
+        }
+    }
+}
+
+/// Run the engine's `storeMigrate` mode for one slot.
+///
+/// The child is handed exactly the account's derived key through
+/// `KT_SIGNAL_STORE_KEY` — the same env the engine that will open the store
+/// gets, and the same derivation (K1/K2: the key that encrypts is the key that
+/// opens). Everything else about the child's environment is inherited, except
+/// the single-account guard, which is a topology promise that means nothing to
+/// a one-shot migrator and must not be echoed as if it did.
+///
+/// The budget is the caller's (migration budget, deliberately not the 15 s
+/// request timeout): a store copy is I/O amplification, and inheriting a
+/// request budget would fail it on exactly the machines that need it most.
+pub async fn run_store_migration(
+    executable: &Path,
+    data_dir: &Path,
+    key: &crate::store::StoreKey,
+    dry_run: bool,
+    budget: Duration,
+) -> StoreMigrationRun {
+    let encoded = key.to_hex();
+    let mut command = Command::new(executable);
+    command
+        .args(store_migrate_args(data_dir, dry_run))
+        .env(crate::store::STORE_KEY_ENV, encoded.as_str())
+        .env_remove(crate::pool::SINGLE_ACCOUNT_ENV)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            return StoreMigrationRun {
+                failed: true,
+                ..StoreMigrationRun::default()
+            };
+        }
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_task = tokio::spawn(read_bounded(stdout));
+    let stderr_task = tokio::spawn(read_bounded(stderr));
+    let status = match timeout(budget, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return StoreMigrationRun {
+                failed: true,
+                ..StoreMigrationRun::default()
+            };
+        }
+        Err(_) => {
+            // Budget expired: kill and reap, so no migration child outlives the
+            // slot start it was launched for.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return StoreMigrationRun {
+                timed_out: true,
+                ..StoreMigrationRun::default()
+            };
+        }
+    };
+    let stdout = stdout_task.await.unwrap_or_default();
+    let _stderr = stderr_task.await.unwrap_or_default();
+    let mut run = parse_store_migration_document(&stdout);
+    run.exit = status.code();
+    run
+}
+
+/// Read a child pipe to a bounded buffer. A migrator that writes past the
+/// limit is truncated, not trusted: the document is one line, and the
+/// classification never depends on the bytes anyway.
+async fn read_bounded<R>(reader: Option<R>) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(mut reader) = reader else {
+        return String::new();
+    };
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let room = STORE_MIGRATION_OUTPUT_LIMIT.saturating_sub(buffer.len());
+                if room == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read.min(room)]);
+            }
+        }
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+/// Pull the evidence fields out of the `--json` document: `accounts[0]`'s
+/// `action`/`code` and `plan[]`. A document that does not parse yields an
+/// empty run — never an invented verdict.
+fn parse_store_migration_document(stdout: &str) -> StoreMigrationRun {
+    let mut run = StoreMigrationRun::default();
+    let document = stdout
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(|line| serde_json::from_str::<Value>(line).ok());
+    let Some(document) = document else {
+        return run;
+    };
+    if let Some(accounts) = document.get("accounts").and_then(Value::as_array) {
+        if let Some(account) = accounts.first() {
+            run.action = account
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            run.code = account
+                .get("code")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        } else if document.get("error").is_none() {
+            // An empty `accounts` array is the migrator's "nothing to do"
+            // shape (a fresh slot has no store). Exit 0 plus this shape is a
+            // no-op; without this label the classifier would fall back to
+            // `completed`, which the migration face renders as `failed`
+            // (task-24). A document carrying a top-level `error` keeps its
+            // action-free shape: the exit code and that code are the verdict.
+            run.action = Some("noop".to_string());
+        }
+    }
+    if run.code.is_none() {
+        run.code = document
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    if let Some(plan) = document.get("plan").and_then(Value::as_array) {
+        run.plan = plan
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+    }
+    run
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EngineState {
@@ -285,8 +521,23 @@ pub enum CallClass {
 pub enum EngineError {
     #[error("engine process could not be started")]
     StartFailed,
+    /// O1: the engine answered the contract handshake but cannot be verified —
+    /// its identity is missing, or the contract revision it states is outside
+    /// the connector's supported interval (or is not a revision at all). The
+    /// fault is latched on the supervisor for the process lifetime: the same
+    /// binary answers the same revision on every restart, so a retry cannot
+    /// heal it. The payload is the structured facts the host wire answer and
+    /// the launcher's fixed `KT_FATAL` line carry.
+    #[error("engine contract could not be verified; the engine is not served")]
+    ContractMismatch(crate::engine_contract::EngineContractFault),
     #[error("engine is not running")]
     NotRunning,
+    /// Contract 1.291 (§4.277 C): the pool's store gate refused this spawn.
+    /// The payload is a closed literal naming the lifecycle state - never
+    /// engine text, never a path, never key material - and the caller maps it
+    /// to the host face.
+    #[error("engine start deferred by the store gate")]
+    StoreDeferred { code: &'static str },
     #[error("engine request queue is full")]
     Backpressure,
     #[error("engine request timed out")]
@@ -319,6 +570,8 @@ pub enum EngineError {
     },
     #[error("engine rejected the device credentials")]
     Unauthorized,
+    #[error("engine send was rejected because the client version expired")]
+    AppExpired,
     /// Contract 1.99 §4.80: the engine's send-chain transport families. The
     /// engine folds a transport-layer send failure into the plain
     /// internal_error JSON-RPC face (-32603) whose `message` embeds the cause
@@ -350,6 +603,54 @@ pub enum EngineError {
     /// never touches account state.
     #[error("engine send was rejected: recipient identity is unverified")]
     IdentityUnverified,
+    /// Contract 1.285 §4.269: the engine's dispatch-level busy face. The
+    /// engine's in-flight table is full, so the request is rejected without
+    /// being executed — the server-error code `-32000` whose `message`
+    /// embeds `(EngineBusyException)` and whose `data` carries
+    /// `{reason, retryable, inFlightLimit}`. Because the request never ran,
+    /// a later attempt is safe; the payload rides verbatim (pass-through
+    /// facts, never re-keyed, never stripped).
+    #[error("engine is busy with in-flight requests")]
+    EngineBusy {
+        /// The engine's `error.data` object, pass-through only.
+        data: Option<Value>,
+    },
+    /// Contract 1.285 §4.269: the engine's READ-ONLY request-budget face —
+    /// the dispatch future was cancelled after the method's budget expired
+    /// and the engine answered `-32000` with `(EngineTimeoutException)` and
+    /// `data = {reason, retryable, timeoutMs}`. A read-only call cannot have
+    /// written anything, so it keeps the structured timeout face
+    /// (`retryable: false`) with the payload verbatim. A cancelled MUTATING
+    /// dispatch may already have been written and never reaches this variant:
+    /// the classifier folds it to `EngineError::UnknownOutcome` (the same
+    /// answer the connector's own mutating deadline gives), so the send row
+    /// settles unknown and is never retried automatically.
+    #[error("engine cancelled the read-only request after its budget expired")]
+    EngineRequestTimeout {
+        /// The engine's `error.data` object, pass-through only.
+        data: Option<Value>,
+    },
+    /// Contract 1.285 §4.269: the attachment upload gate's busy face —
+    /// `-32603` with `(AttachmentBusyException)`: both global upload slots
+    /// stayed occupied past the bounded wait, so the upload never started
+    /// and the message is definitely undelivered. A later attempt is safe;
+    /// the engine sends no `data` on this face today (a future one rides
+    /// verbatim).
+    #[error("engine attachment upload slot is busy")]
+    AttachmentBusy {
+        /// The engine's `error.data` object, pass-through only.
+        data: Option<Value>,
+    },
+    /// Contract 1.285 §4.269: the attachment upload gate's byte-budget face
+    /// — `-32603` with `(AttachmentBudgetException)`: the 320 MiB global
+    /// decoded-byte budget could not be reserved before base64 decode, so
+    /// neither decode nor upload happened. The same request can stay over
+    /// budget, so it is never retried automatically.
+    #[error("engine attachment byte budget is exhausted")]
+    AttachmentBudget {
+        /// The engine's `error.data` object, pass-through only.
+        data: Option<Value>,
+    },
     /// The engine answered a JSON-RPC error object with an upstream error
     /// code (contract 1.36 sticker/pin faces): the code string is carried
     /// structurally so the connector maps engine error codes onto the host
@@ -375,7 +676,9 @@ impl EngineError {
     pub(crate) fn class(&self) -> &'static str {
         match self {
             EngineError::StartFailed => "start_failed",
+            EngineError::ContractMismatch(_) => "contract_mismatch",
             EngineError::NotRunning => "not_running",
+            EngineError::StoreDeferred { .. } => "store_deferred",
             EngineError::Backpressure => "backpressure",
             EngineError::Timeout => "timeout",
             EngineError::UnknownOutcome => "unknown_outcome",
@@ -387,6 +690,11 @@ impl EngineError {
             EngineError::ProofRequired => "proof_required",
             EngineError::ServerUnavailable => "server_unavailable",
             EngineError::IdentityUnverified => "identity_unverified",
+            EngineError::AppExpired => "app_expired",
+            EngineError::EngineBusy { .. } => "engine_busy",
+            EngineError::EngineRequestTimeout { .. } => "engine_request_timeout",
+            EngineError::AttachmentBusy { .. } => "attachment_busy",
+            EngineError::AttachmentBudget { .. } => "attachment_budget",
             EngineError::UpstreamCode { .. } => "upstream_code",
         }
     }
@@ -425,6 +733,14 @@ pub enum EngineEvent {
     /// [`EngineError::Unauthorized`].
     AccountUnauthorized {
         account: String,
+    },
+    /// Engine receive-close classification. Invalidated is not an account
+    /// terminal state; 4401 only reconnects. The supervisor keeps this on the
+    /// health/connection axis, never on account state.
+    ConnectionState {
+        account: String,
+        state: String,
+        close_code: Option<u16>,
     },
     /// The engine's `receive.emptied` notification (contract 1.134, §4.117):
     /// the account's history queue drained (the official
@@ -1744,6 +2060,7 @@ pub enum ControlReceive {
     /// the records name their own subjects (the read/viewed precedent).
     SyncContacts {
         contacts: Vec<SyncContactRecord>,
+        complete: bool,
     },
     /// The engine's `syncMessage.blocked` projection (contract 1.140,
     /// §4.136): the account's own linked device replaced its block list —
@@ -2645,7 +2962,7 @@ impl NormalizedReceive {
                 // The contacts sync carries heap record Vecs like the read
                 // lists — counted entry-wise so the queue budget stays
                 // honest (§4.13).
-                Some(ControlReceive::SyncContacts { contacts }) => contacts
+                Some(ControlReceive::SyncContacts { contacts, .. }) => contacts
                     .iter()
                     .map(|record| {
                         std::mem::size_of::<SyncContactRecord>()
@@ -2810,10 +3127,51 @@ impl EngineHandle {
             .stdin(Stdio::piped())
             .stdout(stdout_writer)
             .stderr(Stdio::piped())
-            // The dev/test store-key override must never leak into the child's
-            // environment (Phase 3: keys travel the bootstrap channel only).
-            .env_remove(crate::store::STORE_KEY_ENV)
             .kill_on_drop(true);
+        // M6 C phase: the child's store key is a connector decision, exactly
+        // like the single-account guard below — an inherited `KT_SIGNAL_STORE_KEY`
+        // (the dev/test override this process may itself be running on) is never
+        // the child's authority. A pooled slot hands over that account's own
+        // HKDF derivation; every keyless child removes the variable, so neither
+        // the root nor an account's key can stand for a process that serves
+        // several. The log line names the decision only, and the two keyless
+        // decisions stay distinct: `root_key_missing` is a downgrade the
+        // operator must see, `group_engine_no_account_key` is the legacy
+        // topology doing exactly what it promises. Neither the key nor the
+        // derivation is ever printed.
+        match &config.store_key {
+            crate::store::EngineStoreKey::Account(key) => {
+                let encoded = key.to_hex();
+                command.env(crate::store::STORE_KEY_ENV, encoded.as_str());
+                tracing::info!(
+                    engine_store_key = config.store_key.decision(),
+                    "engine child store key injected"
+                );
+            }
+            crate::store::EngineStoreKey::RootKeyMissing => {
+                command.env_remove(crate::store::STORE_KEY_ENV);
+                tracing::info!(
+                    engine_store_key = config.store_key.decision(),
+                    "engine child runs without a store key: no root key is configured"
+                );
+            }
+            crate::store::EngineStoreKey::GroupEngineNoAccountKey => {
+                command.env_remove(crate::store::STORE_KEY_ENV);
+                tracing::info!(
+                    engine_store_key = config.store_key.decision(),
+                    "legacy group engine carries no account store key"
+                );
+            }
+        }
+        // The single-account guard is a connector decision, never something the
+        // child inherits (P1 runtime isolation, contract revision 1.288
+        // §4.274): armed pooled slots pin `=1`, every other engine removes the
+        // variable so an exported dev/test env cannot silently change topology.
+        if config.single_account_guard {
+            command.env(crate::pool::SINGLE_ACCOUNT_ENV, "1");
+        } else {
+            command.env_remove(crate::pool::SINGLE_ACCOUNT_ENV);
+        }
         let mut child = command.spawn().map_err(|_| EngineError::StartFailed)?;
 
         let pid = child.id().ok_or(EngineError::StartFailed)?;
@@ -3292,6 +3650,7 @@ async fn run_actor(
     // when admission succeeds again so a `recovered` state is emitted once.
     let mut receive_degraded = false;
     let terminal_state;
+    let terminal_cause: &'static str;
 
     loop {
         tokio::select! {
@@ -3339,6 +3698,7 @@ async fn run_actor(
                                 };
                                 let _ = response.send(Err(failure));
                                 terminal_state = EngineState::Exited;
+                                terminal_cause = "stdin_writer_closed";
                                 break;
                             }
                         }
@@ -3351,12 +3711,14 @@ async fn run_actor(
                         stop_child(&child, limits.shutdown_grace).await;
                         let _ = response.send(());
                         terminal_state = EngineState::Stopped;
+                        terminal_cause = "shutdown_requested";
                         break;
                     }
                     None => {
                         writer.abort();
                         stop_child(&child, limits.shutdown_grace).await;
                         terminal_state = EngineState::Stopped;
+                        terminal_cause = "command_channel_closed";
                         break;
                     }
                 }
@@ -3366,6 +3728,7 @@ async fn run_actor(
             // failures, exactly as an inline write error used to.
             _ = writer_failed_rx.recv() => {
                 terminal_state = EngineState::Exited;
+                terminal_cause = "stdin_writer_failed";
                 break;
             }
             line = lines.recv() => {
@@ -3379,11 +3742,13 @@ async fn run_actor(
                             &mut receive_degraded,
                         ).await.is_err() {
                             terminal_state = EngineState::Faulted;
+                            terminal_cause = "upstream_protocol_error";
                             break;
                         }
                     }
                     Some(PumpedLine::FramingError) => {
                         terminal_state = EngineState::Faulted;
+                        terminal_cause = "stdout_framing_error";
                         break;
                     }
                     // The pump returned: the child's stdout hit EOF, so the
@@ -3391,6 +3756,7 @@ async fn run_actor(
                     // inline `None` arm.
                     None => {
                         terminal_state = EngineState::Exited;
+                        terminal_cause = "stdout_eof";
                         break;
                     }
                 }
@@ -3405,16 +3771,24 @@ async fn run_actor(
         // The loop only breaks on a terminal state; this arm is unreachable.
         EngineState::Running => "running",
     };
+    let child_exit = {
+        let mut guard = child.lock().await;
+        guard.try_wait().ok().flatten()
+    };
     if matches!(terminal_state, EngineState::Stopped) {
         tracing::info!(
             state = terminal_class,
+            cause = terminal_cause,
             pid = process_pid,
+            exit = ?child_exit,
             "engine process stopped"
         );
     } else {
         tracing::warn!(
             state = terminal_class,
+            cause = terminal_cause,
             pid = process_pid,
+            exit = ?child_exit,
             "engine terminated without a shutdown request"
         );
     }
@@ -3464,7 +3838,14 @@ async fn run_stdin_writer(
     failed: mpsc::Sender<()>,
 ) {
     while let Some(frame) = frames.recv().await {
-        if stdin.write_all(&frame).await.is_err() || stdin.flush().await.is_err() {
+        let bytes = frame.len();
+        if let Err(error) = stdin.write_all(&frame).await {
+            tracing::warn!(bytes, error = %error, "engine stdin writer failed");
+            let _ = failed.try_send(());
+            break;
+        }
+        if let Err(error) = stdin.flush().await {
+            tracing::warn!(bytes, error = %error, "engine stdin flush failed");
             let _ = failed.try_send(());
             break;
         }
@@ -3681,6 +4062,31 @@ async fn handle_upstream_line(
                     }
                 }
             }
+        } else if method == "connectionState" {
+            let params = object.get("params");
+            let account = params
+                .and_then(|params| params.get("account"))
+                .and_then(Value::as_str)
+                .filter(|account| !account.is_empty());
+            let state = params
+                .and_then(|params| params.get("state"))
+                .and_then(Value::as_str)
+                .filter(|state| !state.is_empty());
+            let close_code = params
+                .and_then(|params| params.get("closeCode"))
+                .and_then(Value::as_u64)
+                .map(|code| code as u16);
+            if let (Some(account), Some(state)) = (account, state) {
+                let _ = events.send(EngineEvent::ConnectionState {
+                    account: account.to_string(),
+                    state: state.to_string(),
+                    close_code,
+                });
+            } else {
+                let _ = events.send(EngineEvent::ProtocolWarning {
+                    kind: "unknownNotification",
+                });
+            }
         } else if method == "accountUnbound" {
             // Contract 1.113 §4.94: the engine's unbound stop-ring (B4) pushes
             // a single `accountUnbound` notification when a 401 credential
@@ -3832,6 +4238,9 @@ async fn handle_upstream_line(
                     });
                 }
                 _ => {
+                    // SIGNAL-GATE-TRACE-PLAN §2: the connector's shape gate
+                    // dropped an initial-sync notification before any forward.
+                    crate::gate_trace::line("initial-sync", account, "fail", "shape-gate");
                     let _ = events.send(EngineEvent::ProtocolWarning {
                         kind: "unknownNotification",
                     });
@@ -3916,6 +4325,9 @@ async fn handle_upstream_line(
                     });
                 }
                 _ => {
+                    // SIGNAL-GATE-TRACE-PLAN §2: the connector's shape gate
+                    // dropped a storage-pull notification before any forward.
+                    crate::gate_trace::line("storage-pull", account, "fail", "shape-gate");
                     let _ = events.send(EngineEvent::ProtocolWarning {
                         kind: "unknownNotification",
                     });
@@ -3981,6 +4393,19 @@ async fn handle_upstream_line(
             // vs. an exact allowlist literal), so the order only documents
             // that the §4.17 recovery chain keeps precedence.
             let _ = request.response.send(Err(class));
+        } else if let Some(class) =
+            upstream_error_resource_class(object.get("error"), request.class)
+        {
+            // Contract 1.285 §4.269: the engine's M4/M5 resource faces —
+            // the dispatch-level busy/timeout rejections (-32000) and the
+            // attachment gate's slot-busy / byte-budget refusals (-32603).
+            // Each surfaces as its own variant so the host sees the
+            // contract-fixed code and retryability instead of the generic
+            // upstream face; the engine's `error.data` object rides along
+            // verbatim. No event, and the arm sits before the structured-code
+            // ladder (an embedded anchor in a longer message vs. an exact
+            // allowlist literal — the two cannot collide).
+            let _ = request.response.send(Err(class));
         } else if let Some(code) = upstream_error_code(object.get("error")) {
             // Contract 1.36 faces: the engine answers structured errors with
             // a code field (STICKER_*, STORAGE_*, CONVERSATION_NOT_RESOLVED
@@ -3991,11 +4416,7 @@ async fn handle_upstream_line(
             // facts such as PROFILE_UPLOAD_FAILED's {retryable, textSaved})
             // rides along verbatim when present — pass-through only, no
             // key invention, no stripping.
-            let data = object
-                .get("error")
-                .and_then(|error| error.get("data"))
-                .filter(|data| data.is_object())
-                .cloned();
+            let data = object.get("error").and_then(upstream_error_data);
             let _ = request
                 .response
                 .send(Err(EngineError::UpstreamCode { code, data }));
@@ -4095,6 +4516,19 @@ const ENGINE_SEND_RATE_LIMITED_ANCHOR: &str = "(RateLimitExceeded)";
 const ENGINE_SEND_PROOF_REQUIRED_ANCHOR: &str = "(ProofRequiredException)";
 const ENGINE_SEND_SERVER_UNAVAILABLE_ANCHOR: &str = "(ServerUnavailableException)";
 const ENGINE_SEND_IDENTITY_UNVERIFIED_ANCHOR: &str = "(UntrustedIdentityException)";
+const ENGINE_SEND_APP_EXPIRED_ANCHOR: &str = "(AppExpiredException)";
+
+/// Contract 1.285 §4.269: the engine's M4/M5 resource faces — four fixed
+/// literals the engine pins in its JSON-RPC compatibility contract
+/// (jsonrpc-compat §3/§5). Two are dispatch-level (-32000, any method): the
+/// in-flight limit rejection and the request-budget cancellation. Two are the
+/// attachment upload gate's (-32603, send chain): the upload-slot busy face
+/// and the decoded-byte budget face. Matched exactly, like the §4.80/§4.95
+/// anchors above, so incidental message text can never flip a class.
+const ENGINE_BUSY_ANCHOR: &str = "(EngineBusyException)";
+const ENGINE_TIMEOUT_ANCHOR: &str = "(EngineTimeoutException)";
+const ENGINE_ATTACHMENT_BUSY_ANCHOR: &str = "(AttachmentBusyException)";
+const ENGINE_ATTACHMENT_BUDGET_ANCHOR: &str = "(AttachmentBudgetException)";
 
 /// Classify a send-chain error (contract 1.99 §4.80, joined by the 1.114
 /// §4.95 identity gate) from the raw JSON-RPC error body: `Some` variant when
@@ -4122,6 +4556,59 @@ fn upstream_error_send_class(error: Option<&Value>) -> Option<EngineError> {
         Some(EngineError::ServerUnavailable)
     } else if message.contains(ENGINE_SEND_IDENTITY_UNVERIFIED_ANCHOR) {
         Some(EngineError::IdentityUnverified)
+    } else if message.contains(ENGINE_SEND_APP_EXPIRED_ANCHOR) {
+        Some(EngineError::AppExpired)
+    } else {
+        None
+    }
+}
+
+/// The engine's optional `error.data` object, pass-through only (contract
+/// 1.50: the connector never invents a data face and never strips keys from
+/// one the engine sent). A non-object data face reads as absent.
+fn upstream_error_data(error: &Value) -> Option<Value> {
+    error.get("data").filter(|data| data.is_object()).cloned()
+}
+
+/// Classify the engine's M4/M5 resource faces (contract 1.285 §4.269) from
+/// the raw JSON-RPC error body: `Some` variant when the error `message`
+/// embeds one of the four fixed anchors, `None` otherwise. The dispatch faces
+/// ride `-32000` and the attachment-gate faces `-32603`; the classifier
+/// reads the message text only (the anchor is the contract — the numeric code
+/// and the additive `data.reason` hint are not required), exactly like the
+/// §4.80/§4.95 send-chain classifier. The request's call class decides the
+/// timeout face: a read-only cancellation cannot have written anything and
+/// keeps [`EngineError::EngineRequestTimeout`]; a mutating cancellation may
+/// already have been written and folds to [`EngineError::UnknownOutcome`]
+/// (the pre-existing unknown-outcome face, so the send funnel settles the row
+/// unknown and never retries it). The engine's `data` object rides along
+/// verbatim when present (the busy face's `{reason, retryable,
+/// inFlightLimit}`, the read-only timeout face's `{reason, retryable,
+/// timeoutMs}`); nothing is invented for the two attachment faces, which
+/// carry no data. No event: a resource refusal never touches account state.
+fn upstream_error_resource_class(error: Option<&Value>, class: CallClass) -> Option<EngineError> {
+    let error = error?;
+    let message = error.get("message").and_then(Value::as_str)?;
+    let data = upstream_error_data(error);
+    if message.contains(ENGINE_BUSY_ANCHOR) {
+        Some(EngineError::EngineBusy { data })
+    } else if message.contains(ENGINE_TIMEOUT_ANCHOR) {
+        // The cancelled dispatch may already have been written — the
+        // engine's own `retryable: false` is the honest admission. A
+        // mutating call therefore folds to the existing unknown-outcome
+        // face (the same answer the connector's own mutating request
+        // deadline gives), so the send funnel settles the row unknown and
+        // never retries it automatically; a read-only call cannot have
+        // written anything and keeps the structured timeout face with the
+        // engine's payload.
+        match class {
+            CallClass::Mutating => Some(EngineError::UnknownOutcome),
+            CallClass::ReadOnly => Some(EngineError::EngineRequestTimeout { data }),
+        }
+    } else if message.contains(ENGINE_ATTACHMENT_BUSY_ANCHOR) {
+        Some(EngineError::AttachmentBusy { data })
+    } else if message.contains(ENGINE_ATTACHMENT_BUDGET_ANCHOR) {
+        Some(EngineError::AttachmentBudget { data })
     } else {
         None
     }
@@ -4334,6 +4821,12 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     "PHONE_INVALID",
     "PHONE_RATE_LIMITED",
     "PHONE_SERVER_FAILED",
+    // QR B1 (issue #951): the engine's provisioning channel died after the
+    // URL handoff (WS close / timeout / stream end). The engine answers
+    // -1 + LINK_LOST deterministically; the host maps it to the same-named
+    // code, retryable=true (a fresh link.start is the remedy — the dead QR
+    // can never commit).
+    "LINK_LOST",
 ];
 
 /// Extract a known structured engine error code from a JSON-RPC error object.
@@ -6993,13 +7486,21 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
     // envelope is our own account and the records name their own subjects
     // (the read/viewed precedent).
     if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object) {
-        let contacts = normalized_sync_contact_records(sync.get("contacts"));
-        if !contacts.is_empty() {
+        let contacts_face = sync.get("contacts");
+        let contacts = normalized_sync_contact_records(contacts_face);
+        let complete = contacts_face
+            .and_then(Value::as_object)
+            .and_then(|face| face.get("complete"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // Official contactSync:complete is a signal in its own right: an empty
+        // final blob still completes the post-registration wait.
+        if complete || !contacts.is_empty() {
             return Some(ControlRouting {
                 direction: "incoming",
                 source: None,
                 group_id: None,
-                control: ControlReceive::SyncContacts { contacts },
+                control: ControlReceive::SyncContacts { contacts, complete },
             });
         }
     }
@@ -7395,7 +7896,20 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
 
     // Typing and body-less reaction / remote-delete receives carry no message
     // row; they route as control events and never persist.
-    if let Some(routing) = control_routing(envelope) {
+    let routing = control_routing(envelope);
+    // SIGNAL-GATE-TRACE-PLAN §2: a `syncMessage.contacts` face that failed
+    // the shape gates (or carried no records and no complete flag) never
+    // reaches the contacts arm; one connector-hop drop line records the
+    // shape-gate loss with the same account fingerprint the engine emits.
+    if routing.is_none()
+        && envelope
+            .get("syncMessage")
+            .and_then(Value::as_object)
+            .is_some_and(|sync| sync.contains_key("contacts"))
+    {
+        crate::gate_trace::line("contact-sync", account.as_deref(), "fail", "shape-gate");
+    }
+    if let Some(routing) = routing {
         let ControlRouting {
             direction,
             source,
@@ -8210,6 +8724,108 @@ mod tests {
             config.shutdown_grace + SHUTDOWN_TIMEOUT_MARGIN,
             Duration::from_secs(12)
         );
+    }
+
+    /// M6 D3: the migration child's argv is the engine's documented mode shape
+    /// and nothing else - no account name (a pooled directory holds exactly
+    /// one), and --json always, because the connector reads the document.
+    #[test]
+    fn store_migrate_args_match_the_engine_mode_shape() {
+        let apply: Vec<std::ffi::OsString> = ["--data-dir", "/data", "storeMigrate", "--json"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(store_migrate_args(Path::new("/data"), false), apply);
+        let plan: Vec<std::ffi::OsString> =
+            ["--data-dir", "/data", "storeMigrate", "--dry-run", "--json"]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+        assert_eq!(store_migrate_args(Path::new("/data"), true), plan);
+        // The subcommand must sit after the data-dir *value*: the engine routes
+        // on a non-value position, and a directory literally named storeMigrate
+        // must keep launching jsonRpc.
+        assert_eq!(apply[2], std::ffi::OsString::from("storeMigrate"));
+    }
+
+    #[test]
+    fn the_json_document_supplies_evidence_but_never_the_verdict() {
+        let document = r#"{"ok":true,"dryRun":false,"freeBytes":1,"needBytes":2,"accounts":[{"lk":"lk-01","action":"migrate","code":"store_migrated","bytes":16,"elapsedMs":4,"keyid":"abcd","backup":null,"checks":["rows"]}],"plan":["checkpoint","backup","export","verify","swap"],"did":["checkpoint","backup","export","verify","swap"]}"#;
+        let run = parse_store_migration_document(document);
+        assert_eq!(run.action.as_deref(), Some("migrate"));
+        assert_eq!(run.code.as_deref(), Some("store_migrated"));
+        assert_eq!(
+            run.plan,
+            vec!["checkpoint", "backup", "export", "verify", "swap"]
+        );
+        // Exit is only ever the child's; a parsed document invents nothing.
+        assert_eq!(run.exit, None);
+        assert!(!run.timed_out);
+        assert!(!run.failed);
+    }
+
+    #[test]
+    fn a_top_level_error_is_the_code_when_no_account_reported_one() {
+        let run = parse_store_migration_document(
+            r#"{"ok":false,"accounts":[],"plan":[],"did":[],"error":{"code":"StoreKeyRequired","retryable":false}}"#,
+        );
+        assert_eq!(run.code.as_deref(), Some("StoreKeyRequired"));
+        assert_eq!(run.action, None);
+    }
+
+    /// task-24: an empty `accounts` array is the migrator's no-op shape for a
+    /// slot with no store. Before the fix it parsed as no action at all, and
+    /// exit 0 then fell back to `completed` -> the face rendered `failed`.
+    #[test]
+    fn an_empty_accounts_array_is_a_noop_not_an_unclassified_run() {
+        let mut run = parse_store_migration_document(
+            r#"{"ok":true,"dryRun":false,"accounts":[],"plan":[],"did":[]}"#,
+        );
+        run.exit = Some(0);
+        assert_eq!(run.action.as_deref(), Some("noop"));
+        assert_eq!(run.code, None);
+        assert_eq!(
+            crate::pool::classify_store_migration(crate::pool::StoreMigrationMode::Apply, &run),
+            crate::pool::StoreMigrationDecision::Start { outcome: "noop" },
+            "an empty store list must land on migrated, never failed"
+        );
+    }
+
+    #[test]
+    fn unparseable_output_yields_an_empty_run_not_an_invented_verdict() {
+        for text in ["", "not json", "{\"ok\":", "   "] {
+            let run = parse_store_migration_document(text);
+            assert_eq!(run.exit, None);
+            assert_eq!(run.action, None);
+            assert_eq!(run.code, None);
+            assert!(run.plan.is_empty());
+            assert_eq!(run.outcome_label(), "no_exit");
+        }
+    }
+
+    #[test]
+    fn the_last_json_line_wins_because_the_engine_prints_one_at_the_end() {
+        let run = parse_store_migration_document(
+            "noise before\n{\"accounts\":[{\"action\":\"noop\",\"code\":\"store_migration_noop\"}]}\n",
+        );
+        assert_eq!(run.action.as_deref(), Some("noop"));
+        assert_eq!(run.code.as_deref(), Some("store_migration_noop"));
+    }
+
+    #[test]
+    fn the_outcome_label_prefers_the_failure_shape_over_an_exit_code() {
+        let mut run = StoreMigrationRun {
+            exit: Some(11),
+            ..StoreMigrationRun::default()
+        };
+        assert_eq!(run.outcome_label(), "exit_11");
+        run.timed_out = true;
+        assert_eq!(run.outcome_label(), "timed_out");
+        let failed = StoreMigrationRun {
+            failed: true,
+            ..StoreMigrationRun::default()
+        };
+        assert_eq!(failed.outcome_label(), "spawn_failed");
     }
 
     #[test]
@@ -9414,6 +10030,103 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    /// Contract 1.285 §4.269: all four resource anchors reach the pending
+    /// request through the real line handler with their engine payloads
+    /// intact, and none emits an account event (a resource refusal is never
+    /// account state).
+    #[tokio::test]
+    async fn resource_anchor_responses_classify_through_the_line_handler() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+
+        let cases = [
+            (
+                CallClass::Mutating,
+                json!({
+                    "code": -32000,
+                    "message": "Engine busy: in-flight request limit reached. (EngineBusyException)",
+                    "data": { "reason": "ENGINE_BUSY", "retryable": true, "inFlightLimit": 8 }
+                }),
+                EngineError::EngineBusy {
+                    data: Some(json!({
+                        "reason": "ENGINE_BUSY",
+                        "retryable": true,
+                        "inFlightLimit": 8
+                    })),
+                },
+            ),
+            (
+                CallClass::ReadOnly,
+                json!({
+                    "code": -32000,
+                    "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                    "data": { "reason": "REQUEST_TIMEOUT", "retryable": false, "timeoutMs": 60000 }
+                }),
+                EngineError::EngineRequestTimeout {
+                    data: Some(json!({
+                        "reason": "REQUEST_TIMEOUT",
+                        "retryable": false,
+                        "timeoutMs": 60000
+                    })),
+                },
+            ),
+            (
+                CallClass::Mutating,
+                json!({
+                    "code": -32000,
+                    "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                    "data": { "reason": "REQUEST_TIMEOUT", "retryable": false, "timeoutMs": 120000 }
+                }),
+                EngineError::UnknownOutcome,
+            ),
+            (
+                CallClass::Mutating,
+                json!({
+                    "code": -32603,
+                    "message": "Failed to send message: Attachment upload slot busy. (AttachmentBusyException)"
+                }),
+                EngineError::AttachmentBusy { data: None },
+            ),
+            (
+                CallClass::Mutating,
+                json!({
+                    "code": -32603,
+                    "message": "Failed to send message: Attachment byte budget exhausted. (AttachmentBudgetException)"
+                }),
+                EngineError::AttachmentBudget { data: None },
+            ),
+        ];
+
+        for (index, (class, error, expected)) in cases.into_iter().enumerate() {
+            let id = format!("kt-resource-{index}");
+            let (response_tx, response_rx) = oneshot::channel();
+            pending.insert(
+                id.clone(),
+                PendingRequest {
+                    class,
+                    account: Some("+15555550100".to_string()),
+                    response: response_tx,
+                },
+            );
+            let line = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": error
+            }))
+            .unwrap();
+            handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+                .await
+                .unwrap();
+            assert_eq!(response_rx.await.unwrap(), Err(expected));
+            assert!(
+                event_rx.try_recv().is_err(),
+                "a resource refusal must not emit an account event"
+            );
+        }
+    }
+
     /// §4.166 regression pin: resolution is strictly per request id — a
     /// response completes only its own waiting call, the other pending call
     /// stays waiting, and an id with no waiting request warns and completes
@@ -9660,6 +10373,13 @@ mod tests {
                 retry_after_secs: None
             })
         );
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Client version expired. (AppExpiredException)"
+            })),
+            Some(EngineError::AppExpired)
+        );
     }
 
     /// Contract 1.114 §4.95: the identity gate joins the send-chain
@@ -9768,6 +10488,177 @@ mod tests {
         );
     }
 
+    /// Contract 1.285 §4.269: the four fixed resource anchors each classify
+    /// to their own variant, with the engine's `data` object riding verbatim
+    /// (the two dispatch faces carry one; the attachment faces carry none
+    /// today), and both the realistic wire shape and the bare literal
+    /// classify — the anchor is a contained literal, not a trailing suffix.
+    #[test]
+    fn resource_anchor_classifier_maps_the_four_anchors() {
+        let classify = |error: serde_json::Value| {
+            upstream_error_resource_class(Some(&error), CallClass::Mutating)
+        };
+        let classify_read = |error: serde_json::Value| {
+            upstream_error_resource_class(Some(&error), CallClass::ReadOnly)
+        };
+
+        // M4 dispatch-level busy (-32000): the request was never executed.
+        assert_eq!(
+            classify(json!({
+                "code": -32000,
+                "message": "Engine busy: in-flight request limit reached. (EngineBusyException)",
+                "data": { "reason": "ENGINE_BUSY", "retryable": true, "inFlightLimit": 8 }
+            })),
+            Some(EngineError::EngineBusy {
+                data: Some(json!({
+                    "reason": "ENGINE_BUSY",
+                    "retryable": true,
+                    "inFlightLimit": 8
+                }))
+            })
+        );
+
+        // M5 dispatch-level timeout (-32000): a READ-ONLY cancellation cannot
+        // have written anything and keeps the structured timeout face with the
+        // engine's payload.
+        assert_eq!(
+            classify_read(json!({
+                "code": -32000,
+                "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                "data": { "reason": "REQUEST_TIMEOUT", "retryable": false, "timeoutMs": 60000 }
+            })),
+            Some(EngineError::EngineRequestTimeout {
+                data: Some(json!({
+                    "reason": "REQUEST_TIMEOUT",
+                    "retryable": false,
+                    "timeoutMs": 60000
+                }))
+            })
+        );
+
+        // The same anchor on a MUTATING call may already have been written:
+        // it folds to the existing unknown-outcome face (the send funnel then
+        // settles the row unknown and never retries it). The advisory payload
+        // is dropped with it — the unknown face is content-free by contract.
+        assert_eq!(
+            classify(json!({
+                "code": -32000,
+                "message": "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+                "data": { "reason": "REQUEST_TIMEOUT", "retryable": false, "timeoutMs": 60000 }
+            })),
+            Some(EngineError::UnknownOutcome)
+        );
+
+        // The attachment gate's two -32603 faces carry no data today.
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Attachment upload slot busy. (AttachmentBusyException)"
+            })),
+            Some(EngineError::AttachmentBusy { data: None })
+        );
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Attachment byte budget exhausted. (AttachmentBudgetException)"
+            })),
+            Some(EngineError::AttachmentBudget { data: None })
+        );
+
+        // A future data face on an attachment refusal rides verbatim too
+        // (pass-through only: no key invented, none stripped).
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "(AttachmentBudgetException)",
+                "data": { "budgetBytes": 335544320u64 }
+            })),
+            Some(EngineError::AttachmentBudget {
+                data: Some(json!({ "budgetBytes": 335544320u64 }))
+            })
+        );
+
+        // Bare literals classify as well (contained literal, not a suffix).
+        assert_eq!(
+            classify(json!({ "code": -32000, "message": "(EngineBusyException)" })),
+            Some(EngineError::EngineBusy { data: None })
+        );
+        assert_eq!(
+            classify(json!({ "code": -32603, "message": "(AttachmentBusyException)" })),
+            Some(EngineError::AttachmentBusy { data: None })
+        );
+    }
+
+    /// Contract 1.285 §4.269 boundary and no-regression pin: the new
+    /// classifier answers only for its own four anchors. Near misses, an
+    /// anchor in the `code` slot, every pre-1.285 send-chain/identity anchor,
+    /// and ordinary errors stay `None` — the old classification surface is
+    /// untouched.
+    #[test]
+    fn resource_anchor_classifier_answers_none_outside_its_contract() {
+        let classify = |error: serde_json::Value| {
+            upstream_error_resource_class(Some(&error), CallClass::Mutating)
+        };
+        let classify_read = |error: serde_json::Value| {
+            upstream_error_resource_class(Some(&error), CallClass::ReadOnly)
+        };
+        assert_eq!(
+            upstream_error_resource_class(None, CallClass::Mutating),
+            None
+        );
+        assert_eq!(classify(json!({ "code": -32000 })), None);
+        assert_eq!(classify(json!({ "code": -32000, "message": 42 })), None);
+
+        // Near misses: the class name without the parenthesized anchor.
+        for message in [
+            "EngineBusyException without the wrapper",
+            "Request timed out (EngineTimeout)",
+            "Attachment upload slot busy (AttachmentBusy) and over budget (AttachmentBudget)",
+        ] {
+            assert_eq!(
+                classify(json!({ "code": -32000, "message": message })),
+                None,
+                "{message} must not classify"
+            );
+        }
+        // The read-only face reads the same message-only anchor: a near miss
+        // stays unclassified there too.
+        assert_eq!(
+            classify_read(json!({
+                "code": -32000,
+                "message": "Request timed out (EngineTimeout)"
+            })),
+            None
+        );
+        // An anchor only in the `code` slot is not a classification.
+        assert_eq!(
+            classify(json!({ "code": "(EngineBusyException)", "message": "fixture" })),
+            None
+        );
+
+        // The pre-1.285 send-chain anchors keep their own classifier.
+        for message in [
+            "Failed to send message: Timed out waiting for a response (RateLimitExceeded)",
+            "Failed to send message: Proof required (ProofRequiredException)",
+            "Failed to send message: Bad gateway (ServerUnavailableException)",
+            "Failed to send message: Identity unverified. (UntrustedIdentityException)",
+            "Failed to send message: Client version expired. (AppExpiredException)",
+        ] {
+            let error = json!({ "code": -32603, "message": message });
+            assert_eq!(classify(error.clone()), None, "{message}");
+            assert!(
+                upstream_error_send_class(Some(&error)).is_some(),
+                "the pre-1.285 anchor still classifies: {message}"
+            );
+        }
+
+        // Ordinary engine errors stay unclassified (the ladder's else arm).
+        assert_eq!(
+            classify(json!({ "code": -32603, "message": "fixture send failed" })),
+            None
+        );
+    }
+
     /// Red line (audit conclusion): the §4.17 authorization matcher's match
     /// set is frozen — a message carrying only a transport anchor never
     /// trips it, so the AccountUnauthorized → ACCOUNT_UNLINKED chain cannot
@@ -9778,6 +10669,13 @@ mod tests {
             "Failed to send message: Timed out waiting for a response (RateLimitExceeded)",
             "Failed to send message: Proof required (ProofRequiredException)",
             "Failed to send message: Bad gateway (ServerUnavailableException)",
+            // Contract 1.285 §4.269: the resource anchors are not account
+            // state either — a busy/timeout/attachment-gate refusal must
+            // never fold into ACCOUNT_UNLINKED.
+            "Engine busy: in-flight request limit reached. (EngineBusyException)",
+            "Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+            "Failed to send message: Attachment upload slot busy. (AttachmentBusyException)",
+            "Failed to send message: Attachment byte budget exhausted. (AttachmentBudgetException)",
         ] {
             assert!(
                 !upstream_error_is_unauthorized(Some(&json!({ "message": message }))),
@@ -10023,6 +10921,19 @@ mod tests {
             .await,
             Err(EngineError::UpstreamCode {
                 code: "CONVERSATION_NOT_RESOLVED",
+                data: None,
+            })
+        );
+        // QR B1: the engine's terminal provisioning face must classify
+        // structurally, not as the generic -32603 upstream error.
+        assert_eq!(
+            classify(json!({
+                "code": -1,
+                "message": "LINK_LOST"
+            }))
+            .await,
+            Err(EngineError::UpstreamCode {
+                code: "LINK_LOST",
                 data: None,
             })
         );
@@ -12782,7 +13693,7 @@ mod tests {
             .map(|routing| (routing.control, routing.source))
         };
 
-        let Some((ControlReceive::SyncContacts { contacts }, source)) = routing(json!({
+        let Some((ControlReceive::SyncContacts { contacts, complete }, source)) = routing(json!({
             "contacts": {
                 "complete": true,
                 "records": [
@@ -12803,6 +13714,7 @@ mod tests {
         })) else {
             panic!("expected a contacts control routing");
         };
+        assert!(complete);
         assert_eq!(contacts.len(), 2);
         assert_eq!(contacts[0].aci, "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae");
         assert_eq!(contacts[0].number.as_deref(), Some("+15551234567"));
@@ -12812,9 +13724,19 @@ mod tests {
         assert!(contacts[1].name.is_none());
         assert!(source.is_none(), "the envelope is our own account");
 
+        // Completion-only final blob: no records, but the complete flag still
+        // routes so the inbox gate can settle.
+        let Some((ControlReceive::SyncContacts { contacts, complete }, _)) =
+            routing(json!({ "contacts": { "complete": true, "records": [] } }))
+        else {
+            panic!("completion-only contacts must route");
+        };
+        assert!(contacts.is_empty());
+        assert!(complete);
+
         // The optional faces bound per key: a 200-char name truncates to the
         // 64-char cache-title cap the pull path applies.
-        let Some((ControlReceive::SyncContacts { contacts }, _)) = routing(json!({
+        let Some((ControlReceive::SyncContacts { contacts, .. }, _)) = routing(json!({
             "contacts": {
                 "records": [{ "aci": "a", "name": "長".repeat(200) }],
             },
@@ -12823,10 +13745,23 @@ mod tests {
         };
         assert_eq!(contacts[0].name.as_deref(), Some("長".repeat(64).as_str()));
 
-        // A completion-only envelope (the `complete` flag alone) and a face
-        // whose every record dropped are no cache write — the plain skip.
+        // A completion-only envelope still routes (the official
+        // contactSync:complete signal); a face whose every record dropped
+        // without the flag stays the plain skip.
+        let Some((ControlReceive::SyncContacts { contacts, complete }, _)) = control_routing(
+            json!({
+                "timestamp": 1727000000000u64,
+                "syncMessage": { "contacts": { "complete": true, "records": [] } },
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .map(|routing| (routing.control, routing.source)) else {
+            panic!("completion-only contacts must route");
+        };
+        assert!(contacts.is_empty());
+        assert!(complete);
         for sync in [
-            json!({ "contacts": { "complete": true, "records": [] } }),
             json!({ "contacts": { "records": [{ "number": "+15551234568" }] } }),
             json!({ "contacts": {} }),
         ] {

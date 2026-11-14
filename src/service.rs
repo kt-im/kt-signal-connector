@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(test)]
 use std::time::Duration;
 
 use rand::RngCore;
@@ -61,13 +60,14 @@ fn mrr_has_spam(response_type: u8) -> bool {
 
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, random_id, stable_hash_id};
-use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
+use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, LinkSlotState, now_ms};
 use crate::media::{MEDIA_CHUNK_BYTES, MediaGovernor, MediaHandleError, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::store::{
     AccountDeletePlan, AccountRow, AccountSummary, AdjacentMediaDirection, CommonGroupRow,
-    ContactSummary, ConversationRow, ConversationSummary, HistoryAttachmentLocator, MessageRecord,
-    Page, ReceiptResupply, RetryClaim, Store, StoreError, SyncedContact,
+    ContactSummary, ConversationRow, ConversationSummary, EVENT_PAGE_DEFAULT_LIMIT,
+    EVENT_PAGE_MAX_LIMIT, EVENT_TOKEN_MAX_CHARS, EventLedgerPage, HistoryAttachmentLocator,
+    MessageRecord, Page, ReceiptResupply, RetryClaim, Store, StoreError, SyncedContact,
 };
 
 /// Bounds below are the code-side enforcement of the host-facing schema
@@ -118,6 +118,11 @@ pub const MAX_PINNED_CONVERSATIONS: usize = 128;
 /// connector enforces only the bound — the grammar itself is the upstream's
 /// definite UserError, never a local re-derivation.
 pub const IDENTITY_SAFETY_NUMBER_MAX_CHARS: usize = 256;
+/// identities.get / identities.verify 的 peerKey 寻址 bound（契约 1.281,
+/// §4.265）：ACI UUID 恒 36 字符，E.164 至多 16 字符，64 给一个 wire frame
+/// 留足余量——形状本身（UUID 8-4-4-4-12 或 `+\d{7,15}`）由 service 层的
+/// 形状闸逐条判，这个常数只封上界。
+pub const IDENTITY_PEER_KEY_MAX_CHARS: usize = 64;
 /// Group invite-link faces (contract revision 1.117, §4.98): the link string
 /// bound (the official `https://signal.group/#<websafe>` shape encodes a
 /// ~52-byte proto — roughly 95 chars end to end; 1024 keeps one wire frame
@@ -983,6 +988,14 @@ impl ServiceError {
                     "REPORT_SPAM_FAILED" => {
                         ApiError::new("REPORT_SPAM_FAILED", "the report was rejected", false)
                     }
+                    // QR B1 (issue #951): the engine's provisioning channel
+                    // died after the URL handoff, so the QR can never commit.
+                    // Retryable=true is the "start a fresh link" face: the
+                    // failed QR must be cleared and a new link.start minted,
+                    // never a blind finish retry on the dead session.
+                    "LINK_LOST" => {
+                        ApiError::new("LINK_LOST", "link session was lost; start a new link", true)
+                    }
                     // No data object (or an older engine face): the code still
                     // maps — retryable=true per the engine's contract note (the
                     // desktop may retry the avatar face), textSaved unknowable.
@@ -1053,6 +1066,11 @@ impl ServiceError {
                 "the upstream rate-limited the send",
                 false,
             ),
+            ServiceError::Engine(EngineError::AppExpired) => ApiError::new(
+                "SEND_APP_EXPIRED",
+                "the client version is no longer accepted; upgrade required",
+                false,
+            ),
             ServiceError::Engine(EngineError::ProofRequired) => ApiError::new(
                 "SEND_PROOF_REQUIRED",
                 "the upstream requires a proof challenge before the send",
@@ -1074,6 +1092,48 @@ impl ServiceError {
                 "the send was rejected: the recipient identity is unverified",
                 false,
             ),
+            // Contract 1.285 §4.269: the engine's M4/M5 resource faces. The
+            // engine's `error.data` object rides verbatim when present (the
+            // busy face's {reason, retryable, inFlightLimit}, the timeout
+            // face's {reason, retryable, timeoutMs}); the content-free face
+            // answers without it. Retryability is the contract-fixed family
+            // face and always wins over the `with_data` derivation:
+            // ENGINE_BUSY / ATTACHMENT_BUSY were never executed (a later
+            // attempt is safe), while ENGINE_TIMEOUT (the read-only face — a
+            // cancelled mutating dispatch folds to the unknown outcome in the
+            // classifier before it can reach this mapping) /
+            // ATTACHMENT_BUDGET are never retried automatically; the same
+            // attachment batch can stay over budget.
+            ServiceError::Engine(EngineError::EngineBusy { data }) => engine_resource_face_error(
+                "ENGINE_BUSY",
+                "the engine is busy with other requests",
+                true,
+                data,
+            ),
+            ServiceError::Engine(EngineError::EngineRequestTimeout { data }) => {
+                engine_resource_face_error(
+                    "ENGINE_TIMEOUT",
+                    "the engine cancelled the request after its budget expired",
+                    false,
+                    data,
+                )
+            }
+            ServiceError::Engine(EngineError::AttachmentBusy { data }) => {
+                engine_resource_face_error(
+                    "ATTACHMENT_BUSY",
+                    "the attachment upload slot is busy; nothing was delivered",
+                    true,
+                    data,
+                )
+            }
+            ServiceError::Engine(EngineError::AttachmentBudget { data }) => {
+                engine_resource_face_error(
+                    "ATTACHMENT_BUDGET",
+                    "the attachment byte budget is exhausted; nothing was uploaded",
+                    false,
+                    data,
+                )
+            }
             ServiceError::Engine(EngineError::Backpressure) => {
                 ApiError::new("INTERNAL_ERROR", "engine request queue is full", true)
             }
@@ -1082,6 +1142,29 @@ impl ServiceError {
                 "engine runtime could not be started",
                 true,
             ),
+            // Contract 1.291 (§4.277 C): a spawn the store gate deferred. The
+            // payload is the closed literal for the lifecycle state; every arm
+            // is retryable except a blocked store, which is exactly the shape
+            // the wake path already answers.
+            ServiceError::Engine(EngineError::StoreDeferred { code }) => ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                crate::pool::store_gate_deferral_message(code),
+                !matches!(
+                    code,
+                    "store_migration_blocked" | "store_plaintext_requires_migration"
+                ),
+            ),
+            // O1: a slot woken by an account call can hit the same contract
+            // refusal `runtime.start` answers. Non-retryable by construction:
+            // the fault is latched and the same engine binary cannot heal it.
+            ServiceError::Engine(EngineError::ContractMismatch(fault)) => ApiError {
+                data: Some(fault.report_data()),
+                ..ApiError::new(
+                    "ENGINE_CONTRACT_MISMATCH",
+                    "the engine contract revision is outside this connector's supported range",
+                    false,
+                )
+            },
             // Local filesystem work outside the store (§4.38 step-3 download
             // media-directory handling): the established local-world answer.
             ServiceError::Io => {
@@ -1089,6 +1172,36 @@ impl ServiceError {
             }
         }
     }
+}
+
+/// Contract 1.285 §4.269: the engine's M4/M5 resource faces. The engine's
+/// `data` object rides verbatim when present; the content-free face answers
+/// without it, and the anchor-fixed retryability always wins over the
+/// `with_data` default derivation (the engine's own advisory `retryable`
+/// bit is carried as data, never as the host flag — the contract fixes each
+/// family: busy faces were never executed and may be retried, timeout and
+/// budget faces are never retried automatically). The literal `ApiError::new`
+/// sites are the schema-consistency scanner's code-side anchors: every host
+/// error code must appear at one, so the content-free face spells each family
+/// out.
+fn engine_resource_face_error(
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+    data: Option<Value>,
+) -> ApiError {
+    let Some(data) = data else {
+        return match code {
+            "ENGINE_BUSY" => ApiError::new("ENGINE_BUSY", message, retryable),
+            "ENGINE_TIMEOUT" => ApiError::new("ENGINE_TIMEOUT", message, retryable),
+            "ATTACHMENT_BUSY" => ApiError::new("ATTACHMENT_BUSY", message, retryable),
+            "ATTACHMENT_BUDGET" => ApiError::new("ATTACHMENT_BUDGET", message, retryable),
+            _ => ApiError::new("UPSTREAM_ERROR", message, retryable),
+        };
+    };
+    let mut api = ApiError::with_data(code, message, data);
+    api.retryable = retryable;
+    api
 }
 
 /// The §4.69 message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED
@@ -1217,6 +1330,18 @@ pub enum HostSideEvent {
         state: &'static str,
     },
     AccountChanged(AccountSummary),
+    /// Official contactSync:complete: the primary's contact attachment has
+    /// been parsed and applied. This — not the contacts.sync RPC return — is
+    /// the inbox gate's contacts half.
+    ContactSyncCompleted {
+        account_id: String,
+    },
+    /// C: connection-axis state from the engine. Never an account terminal.
+    ConnectionStateChanged {
+        account_id: String,
+        state: String,
+        close_code: Option<u16>,
+    },
     ConversationChanged(ConversationSummary),
     /// Contract 1.259 (§4.243, batch Z1 · S14): one direct-identity fold
     /// completed — the number-keyed shell row named by `from_conversation_id`
@@ -2390,6 +2515,16 @@ impl ConnectorService {
         self.store.count_accounts_in_group(proxy_group).unwrap_or(0)
     }
 
+    /// Terminal account state projected for the host's mutating gate.
+    /// `device_unlinked` is the upstream authoritative terminal state; no
+    /// send-family method may reach an engine after it is observed.
+    pub fn account_state(&self, account_id: &str) -> Result<Option<&'static str>, ServiceError> {
+        Ok(self
+            .store
+            .account_summary(account_id)?
+            .map(|summary| summary.state))
+    }
+
     pub fn account_signal_number(&self, account_id: &str) -> Result<String, ServiceError> {
         self.store
             .account_by_id(account_id)?
@@ -2462,9 +2597,42 @@ impl ConnectorService {
         device_name: String,
         device_link_uri: String,
     ) -> Result<Value, ServiceError> {
+        self.begin_link_with_engine_attempt(device_name, device_link_uri, None)
+    }
+
+    /// `link.start` with the engine's own rotate key (contract 1.286, §4.272).
+    /// The response keeps the pre-rotate shape — `linkSessionId` is slot 0's
+    /// id, `qrPayload` its code — and adds the attempt face: `linkAttemptId`,
+    /// `deviceLinkUri` (the same slot-0 code under the rotate contract's name)
+    /// and `slots` (`[{deviceLinkUri, slot}]`, live slots only). A host that
+    /// predates the rotate face ignores the three new members and keeps
+    /// linking exactly as before.
+    pub fn begin_link_with_engine_attempt(
+        &mut self,
+        device_name: String,
+        device_link_uri: String,
+        engine_attempt_id: Option<String>,
+    ) -> Result<Value, ServiceError> {
+        self.begin_link_with_identities(device_name, device_link_uri, engine_attempt_id, None)
+    }
+
+    /// The pooled variant: `connector_attempt_id` is minted by the registry
+    /// **before** the slot is provisioned, so the slot's attempt lease and the
+    /// host-facing `linkAttemptId` name the same owner. Absent keeps the
+    /// legacy service-minted id byte-for-byte.
+    pub fn begin_link_with_identities(
+        &mut self,
+        device_name: String,
+        device_link_uri: String,
+        engine_attempt_id: Option<String>,
+        connector_attempt_id: Option<String>,
+    ) -> Result<Value, ServiceError> {
         validate_device_name(&device_name)?;
         if let Some(existing) = self.link.as_ref() {
-            if !existing.is_expired(now_ms()) {
+            // QR B1: an attempt with no live slot (lost, committed, or fully
+            // rotated away) is terminal, never a live occupant — a fresh QR
+            // replaces it instead of answering LINK_IN_PROGRESS.
+            if existing.has_live_slot() && !existing.is_expired(now_ms()) {
                 return Err(ServiceError::Api(ApiError::new(
                     "LINK_IN_PROGRESS",
                     "a link session is already active",
@@ -2473,10 +2641,20 @@ impl ConnectorService {
             }
             self.link = None;
         }
-        let session = ActiveLinkSession::new(device_name, device_link_uri, LINK_SESSION_TTL);
+        let session = ActiveLinkSession::with_engine_attempt_and_id(
+            device_name,
+            device_link_uri,
+            LINK_SESSION_TTL,
+            engine_attempt_id,
+            connector_attempt_id,
+        );
+        let device_link_uri = session.qr_payload().to_string();
         let response = json!({
             "linkSessionId": session.session_id,
-            "qrPayload": session.qr_payload(),
+            "linkAttemptId": session.attempt_id,
+            "qrPayload": device_link_uri,
+            "deviceLinkUri": device_link_uri,
+            "slots": [{ "deviceLinkUri": device_link_uri, "slot": 0 }],
             "expiresAt": session.expires_at_ms,
         });
         self.link = Some(session);
@@ -2485,6 +2663,12 @@ impl ConnectorService {
 
     pub fn ensure_link_available(&mut self) -> Result<(), ServiceError> {
         if let Some(existing) = self.link.as_ref() {
+            // QR B1: an attempt with no live slot (lost or committed) does
+            // not block a fresh start; begin_link replaces it once the engine
+            // hands over the new QR.
+            if !existing.has_live_slot() {
+                return Ok(());
+            }
             if !existing.is_expired(now_ms()) {
                 return Err(ServiceError::Api(ApiError::new(
                     "LINK_IN_PROGRESS",
@@ -2492,6 +2676,14 @@ impl ConnectorService {
                     false,
                 )));
             }
+        }
+        // Expiry keeps its pre-B1 cleanup: an expired session is consumed
+        // here so it cannot linger behind a failed startLink.
+        if self
+            .link
+            .as_ref()
+            .is_some_and(|session| session.is_expired(now_ms()))
+        {
             self.link = None;
         }
         Ok(())
@@ -2503,10 +2695,34 @@ impl ConnectorService {
         link_session_id: &str,
     ) -> Result<(String, String), ServiceError> {
         let session = self.require_active_link(link_session_id)?;
-        Ok((
-            session.device_name.clone(),
-            session.qr_payload().to_string(),
-        ))
+        let device_link_uri = session
+            .slot_uri(link_session_id)
+            .unwrap_or_default()
+            .to_string();
+        Ok((session.device_name.clone(), device_link_uri))
+    }
+
+    /// Pin the link session for an in-flight finish: the finish budget
+    /// (`LINK_FINISH_TIMEOUT`, 370 s) outlives the advertised QR lifetime
+    /// (`LINK_SESSION_TTL`, 300 s), so an approval that lands inside the
+    /// finish window must still be commitable — the engine has already linked
+    /// the device, and refusing the commit with LINK_EXPIRED would strand a
+    /// real link. Only the in-memory deadline moves; the QR's advertised
+    /// `expiresAt` is unchanged. An expired or unknown session keeps its own
+    /// answer (LINK_EXPIRED / LINK_NOT_FOUND).
+    pub fn pin_link_for_finish(
+        &mut self,
+        link_session_id: &str,
+        budget: Duration,
+    ) -> Result<(), ServiceError> {
+        self.require_active_link(link_session_id)?;
+        let deadline = now_ms().saturating_add(budget.as_millis().min(u64::MAX as u128) as u64);
+        let session = self
+            .link
+            .as_mut()
+            .expect("require_active_link keeps a live session");
+        session.expires_at_ms = session.expires_at_ms.max(deadline);
+        Ok(())
     }
 
     pub fn complete_link_session(
@@ -2533,7 +2749,20 @@ impl ConnectorService {
         aci: Option<&str>,
         preferred_account_id: Option<&str>,
     ) -> Result<AccountSummary, ServiceError> {
-        let _ = self.require_active_link(link_session_id)?;
+        // Link commit replay (contract 1.276, §4.260): a finish whose result
+        // was lost after the upstream commit must answer the same account
+        // instead of LINK_NOT_FOUND / a second device. Check before consuming
+        // or requiring the in-memory session. Rotation (contract 1.286,
+        // §4.272) widens the journal surface: the commit is journaled under
+        // every slot id of the attempt, and a committed attempt itself answers
+        // the account from any of its codes.
+        if let Some(summary) = self.replay_link_commit(link_session_id)? {
+            return Ok(summary);
+        }
+        // The commit accepts any slot of the attempt that still exists: a
+        // rotation that retired this very code while finishLink was in flight
+        // must not lose the engine's committed result.
+        let (slot_state, slot_number) = self.require_link_slot_for_commit(link_session_id)?;
         // [KT 适配] Relink gate (§9.10 item 7): an unfinished local-data delete
         // for this number keeps the old account row in place. Committing a
         // relink here would upsert that row back to `ready` while the delete
@@ -2544,7 +2773,7 @@ impl ConnectorService {
         // official app has no multi-account delete face, hence no upstream
         // anchor for this gate.
         if let Some(state) = self.store.unfinished_account_delete_state(number)? {
-            let _ = self.take_link_session(link_session_id);
+            let _ = self.take_link_attempt(link_session_id);
             return Err(unfinished_delete_relink_error(&state));
         }
         // Per-engine account ceiling (optimization-plan §6.4 M3.3): refuse a
@@ -2554,7 +2783,50 @@ impl ConnectorService {
         if self.link_would_exceed_ceiling(number, proxy_group)? {
             return Err(account_limit_error(proxy_group));
         }
-        let _ = self.take_link_session(link_session_id)?;
+        // Attempt-scoped single flight: the whole attempt leaves the table
+        // here, so no second code of the same attempt can run a second commit
+        // (contract 1.286, §4.272). The attempt is put back below, committed.
+        let mut attempt = self.take_link_attempt(link_session_id)?;
+        if slot_state == LinkSlotState::Retired {
+            // The rotation dropped this code while `finishLink` was in flight;
+            // the engine still linked the device, so this commit owns that
+            // result and journals the account under every slot id (contract
+            // 1.286, §4.272) — the retired code replays it from here on.
+            tracing::info!(
+                slot = slot_number,
+                "link commit accepted a code a rotation retired while the finish was in flight"
+            );
+        }
+        // Re-link takeover (§4.279, contract 1.292 follow-up): the number's
+        // row can still be parked in the terminal `device_unlinked` state —
+        // the host may have skipped its purge, or the purge failed. The store
+        // keeps exactly one row per number and keeps a terminal row on
+        // upsert, so leaving it in place let the pooled commit answer the OLD
+        // account and the registry roll the freshly linked device back with
+        // ACCOUNT_ALREADY_LINKED — after flipping the dead row to `ready`
+        // behind a parked engine (a zombie the desktop could never re-link).
+        // A fresh `link.finish` is the one explicit human intent the terminal
+        // state names ("link it again"), so the commit takes the number over:
+        // the dead rows go now, the files are reaped by the registry once the
+        // commit lands, and the pre-allocated slot owns the row. Only the
+        // pooled path carries a pre-allocated id; the legacy group engine
+        // keeps its immutable re-key behavior unchanged.
+        if let Some(preferred) = preferred_account_id
+            && let Some(existing) = self.store.account_by_signal(number)?
+            && existing.id != preferred
+            && self
+                .store
+                .account_summary(&existing.id)?
+                .is_some_and(|row| row.state == "device_unlinked")
+        {
+            self.store
+                .complete_account_delete_recorded(&existing.id, None, now_ms())?;
+            tracing::info!(
+                account_id = %existing.id,
+                replacement_account_id = %preferred,
+                "a re-link replaced a parked device_unlinked account row"
+            );
+        }
         // The binding is fixed here, at link.finish success, and immutable for
         // the life of the account (ADR 0001 R3).
         let summary = self.store.upsert_account_from_signal_with_id(
@@ -2563,6 +2835,13 @@ impl ConnectorService {
             proxy_group,
             preferred_account_id,
         )?;
+        // Runtime state authority (contract 1.275): a successful finish is a
+        // fresh engine answer, so it may clear a prior terminal unlink. An
+        // inventory sync alone never reaches this path.
+        let summary = self
+            .store
+            .mark_account_ready_by_id(&summary.id, "engine")?
+            .unwrap_or(summary);
         // Contract 1.142 (§4.138): persist the engine's own-ACI answer when
         // the finishLink face carried one; a face without the key — or with a
         // value that does not parse as an ACI — leaves any stored identity in
@@ -2572,6 +2851,27 @@ impl ConnectorService {
         let canonical = aci.and_then(crate::store::canonical_aci);
         if let Some(aci) = canonical.as_deref() {
             self.store.set_account_aci(&summary.id, Some(aci))?;
+        }
+        // The attempt's single commit is now real: every remaining slot is
+        // retired (its code can never be used again) and the attempt stays
+        // addressable so a lost finish result replays from any of its codes.
+        attempt.mark_committed(summary.id.clone());
+        let slot_ids = attempt.session_ids();
+        self.link = Some(attempt);
+        for slot_id in slot_ids {
+            if let Err(error) =
+                self.store
+                    .record_link_commit(&slot_id, &summary.id, canonical.as_deref())
+            {
+                // The upstream commit is already real; a journal write failure
+                // must not turn it into a failed finish. The desktop's lost-finish
+                // adoption remains the fallback.
+                tracing::warn!(
+                    error_class = error.class(),
+                    "link commit journal write failed after a successful finish"
+                );
+                break;
+            }
         }
         Ok(self.store.account_summary(&summary.id)?.unwrap_or(summary))
     }
@@ -2602,25 +2902,241 @@ impl ConnectorService {
     }
 
     pub fn cancel_link(&mut self, link_session_id: &str) -> Result<Value, ServiceError> {
-        let _ = self.take_link_session(link_session_id)?;
+        // A committed attempt has nothing left to cancel: the link is real,
+        // and dropping the attempt would take the lost-finish replay away
+        // (contract 1.286, §4.272).
+        if self.link.as_ref().is_some_and(|session| {
+            session.has_slot(link_session_id) && session.committed_account().is_some()
+        }) {
+            return Ok(json!({}));
+        }
+        // Cancel is a dispatch face, not a commit: a code the rotation retired
+        // (or the engine reported dead) has nothing to cancel and keeps its
+        // definite LINK_LOST, so a stale code can never take down the live
+        // codes of the attempt it belongs to.
+        self.require_active_link(link_session_id)?;
+        let _ = self.take_link_attempt(link_session_id)?;
         Ok(json!({}))
     }
 
-    /// True while a non-expired link session exists. Restarting signal-cli would
-    /// invalidate its deviceLinkUri, so the watchdog must not restart meanwhile.
+    /// True while a non-expired live slot exists. Restarting signal-cli would
+    /// invalidate its deviceLinkUri, so the watchdog must not restart
+    /// meanwhile. An attempt with no live slot is dead — the watchdog must not
+    /// stay suppressed by it (QR B1, contract 1.286 §4.272).
     pub fn has_pending_link(&self) -> bool {
         self.link
             .as_ref()
-            .is_some_and(|session| !session.is_expired(now_ms()))
+            .is_some_and(|session| session.has_live_slot() && !session.is_expired(now_ms()))
     }
 
-    /// Whether this group's service owns the link session, expired or not:
+    /// Mark one slot lost (QR B1). The attempt stays in the table so the
+    /// router can still attribute any of its ids and finish/cancel answer the
+    /// definite LINK_LOST instead of LINK_NOT_FOUND; has_pending_link turns
+    /// false once the last live slot is gone, and the next begin_link replaces
+    /// the attempt. Returns false when no attempt owns that slot.
+    pub fn mark_link_lost(&mut self, link_session_id: &str) -> bool {
+        match self.link.as_mut() {
+            Some(session) => session.mark_slot_lost(link_session_id, now_ms()),
+            None => false,
+        }
+    }
+
+    /// Pre-dispatch gate for `link.rotate` (contract 1.286, §4.272): the
+    /// attempt must be open, unexpired, and minted by an engine that handed
+    /// over its rotate key. `None` is the capability answer — the engine
+    /// predates the rotate face, so the caller answers NOT_SUPPORTED and the
+    /// single slot keeps working untouched.
+    pub fn begin_rotate(&mut self, link_attempt_id: &str) -> Result<Option<String>, ServiceError> {
+        let Some(session) = self.link.as_ref() else {
+            return Err(link_attempt_not_found_error());
+        };
+        if session.attempt_id != link_attempt_id {
+            return Err(link_attempt_not_found_error());
+        }
+        if session.committed_account().is_some() {
+            return Err(link_attempt_committed_error());
+        }
+        if session.is_expired(now_ms()) {
+            self.link = None;
+            return Err(ServiceError::Api(ApiError::new(
+                "LINK_EXPIRED",
+                "link session has expired",
+                false,
+            )));
+        }
+        Ok(session.engine_attempt_id.clone())
+    }
+
+    /// Record the slot a `rotateLink` answer just minted. The attempt keeps at
+    /// most [`crate::link::MAX_LIVE_LINK_SLOTS`] live codes: a third one
+    /// retires the oldest live slot, whose code can never commit again.
+    pub fn attach_rotated_slot(
+        &mut self,
+        link_attempt_id: &str,
+        device_link_uri: String,
+        at_ms: u64,
+    ) -> Result<LinkRotate, ServiceError> {
+        let Some(session) = self.link.as_mut() else {
+            return Err(link_attempt_not_found_error());
+        };
+        if session.attempt_id != link_attempt_id {
+            return Err(link_attempt_not_found_error());
+        }
+        if session.committed_account().is_some() {
+            return Err(link_attempt_committed_error());
+        }
+        if session.is_expired(at_ms) {
+            self.link = None;
+            return Err(ServiceError::Api(ApiError::new(
+                "LINK_EXPIRED",
+                "link session has expired",
+                false,
+            )));
+        }
+        let added = session.add_slot(device_link_uri, at_ms);
+        let device_link_uri = session
+            .slot_uri(&added.link_session_id)
+            .unwrap_or_default()
+            .to_string();
+        let slots = live_link_slots(session);
+        Ok(LinkRotate {
+            link_attempt_id: session.attempt_id.clone(),
+            link_session_id: added.link_session_id,
+            device_link_uri,
+            slot: added.slot,
+            retired: added.retired,
+            slots,
+            expires_at_ms: session.expires_at_ms,
+        })
+    }
+
+    /// The lost-finish replay (contract 1.276 §4.260 widened by 1.286 §4.272):
+    /// a finish whose result was lost answers the account the attempt already
+    /// committed — from the journal, or from the committed attempt itself —
+    /// instead of LINK_NOT_FOUND, a second device, or a second commit.
+    pub fn replay_link_commit(
+        &mut self,
+        link_session_id: &str,
+    ) -> Result<Option<AccountSummary>, ServiceError> {
+        if let Some((account_id, _)) = self.store.link_commit(link_session_id)? {
+            let summary = self
+                .store
+                .account_summary(&account_id)?
+                .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
+            return Ok(Some(summary));
+        }
+        let Some(session) = self.link.as_ref() else {
+            return Ok(None);
+        };
+        if !session.has_slot(link_session_id) {
+            return Ok(None);
+        }
+        let Some(account_id) = session.committed_account().map(str::to_string) else {
+            return Ok(None);
+        };
+        let summary = self
+            .store
+            .account_summary(&account_id)?
+            .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
+        Ok(Some(summary))
+    }
+
+    /// Runtime state authority: a 401 observed while a link/re-key owns the
+    /// service is provisioning noise. The event watcher defers the terminal
+    /// write until the window closes; the next real 401 or whoami decides.
+    pub fn should_persist_account_unlink(&self) -> bool {
+        !self.has_pending_link()
+    }
+
+    /// Drop the named session after a pre-dispatch refusal that spends it
+    /// (the per-engine account ceiling): the QR can never commit while the
+    /// group stays full, so leaving it pending would suppress the watchdog
+    /// for the rest of its TTL and answer the next `link.start` with
+    /// LINK_IN_PROGRESS instead of a fresh QR. A session that is already
+    /// gone (a concurrent cancel, or a lost session the next begin replaced)
+    /// is left alone.
+    pub fn discard_link_session(&mut self, link_session_id: &str) {
+        if self.has_link_session(link_session_id) {
+            self.link = None;
+        }
+    }
+
+    /// Whether this group's service owns the link session, expired or lost:
     /// routing a finish/cancel to its owning group must preserve the distinct
-    /// LINK_EXPIRED answer an expired session produces at dispatch time.
+    /// LINK_EXPIRED / LINK_LOST answers those states produce at dispatch time.
+    /// Every slot id of the attempt answers true — a rotation mints an id the
+    /// router has never seen, and a committed attempt keeps replaying from any
+    /// of its codes (contract 1.286, §4.272).
     pub fn has_link_session(&self, link_session_id: &str) -> bool {
         self.link
             .as_ref()
-            .is_some_and(|session| session.session_id == link_session_id)
+            .is_some_and(|session| session.has_slot(link_session_id))
+    }
+
+    /// Whether this group's service owns the link attempt (the `link.rotate`
+    /// routing face).
+    pub fn has_link_attempt(&self, link_attempt_id: &str) -> bool {
+        self.link
+            .as_ref()
+            .is_some_and(|session| session.attempt_id == link_attempt_id)
+    }
+
+    /// Test-only: the attempt's current deadline, so the finish pin's
+    /// arithmetic is observable without waiting out a real budget.
+    #[cfg(test)]
+    pub(crate) fn link_session_deadline_for_test(&self, link_session_id: &str) -> Option<u64> {
+        self.link
+            .as_ref()
+            .filter(|session| session.has_slot(link_session_id))
+            .map(|session| session.expires_at_ms)
+    }
+
+    /// Test-only: plant an attempt with an engine rotate key, so the registry
+    /// and supervisor rotate faces are exercisable without a live engine.
+    #[cfg(test)]
+    pub(crate) fn plant_link_attempt_for_test(
+        &mut self,
+        device_name: &str,
+        engine_attempt_id: Option<&str>,
+        ttl: Duration,
+    ) -> (String, String) {
+        let session = ActiveLinkSession::with_engine_attempt(
+            device_name.to_string(),
+            "sgnl://link?test".into(),
+            ttl,
+            engine_attempt_id.map(str::to_string),
+        );
+        let ids = (session.attempt_id.clone(), session.session_id.clone());
+        self.link = Some(session);
+        ids
+    }
+
+    /// Test-only: the attempt's live slot codes, oldest first.
+    #[cfg(test)]
+    pub(crate) fn live_slots_uri_for_test(&self) -> Vec<String> {
+        self.link
+            .as_ref()
+            .map(|session| {
+                session
+                    .live_slots()
+                    .map(|slot| slot.uri().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Test-only: the attempt's live slot ids, oldest first.
+    #[cfg(test)]
+    pub(crate) fn live_link_slots_for_test(&self) -> Vec<(u32, String)> {
+        self.link
+            .as_ref()
+            .map(|session| {
+                session
+                    .live_slots()
+                    .map(|slot| (slot.slot, slot.link_session_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Test-only: plant a link session with an explicit TTL so registry and
@@ -3021,6 +3537,7 @@ impl ConnectorService {
             false,
             story_reply_author,
             story_reply_timestamp,
+            None,
         )
     }
 
@@ -3119,6 +3636,7 @@ impl ConnectorService {
             false,
             story_reply_author,
             story_reply_timestamp,
+            None,
         )
     }
 
@@ -3259,6 +3777,10 @@ impl ConnectorService {
     /// caller-controlled path reaches upstream. The pending row carries the
     /// metadata-only descriptor (same wire shape as inbound, contract 1.15) so
     /// the host renders the outgoing attachment from its first tick.
+    /// 稳定的单数附件准备面（契约 1.294 前的 13 参形状）：声明尺寸走
+    /// `prepare_send_attachment_with_dimensions` 的 additively 扩展面，
+    /// 本包装恒传 None——既有无尺寸调用点（含集成测试与历史调用方）逐字
+    /// 不变，旧 data URI 与 descriptor 字节形状零变化。
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_send_attachment(
         &self,
@@ -3276,68 +3798,60 @@ impl ConnectorService {
         blur_hash: Option<&str>,
         gif: bool,
     ) -> Result<PreparedSend, ServiceError> {
-        validate_attachment_send_payload(data_base64, size_bytes)?;
-        validate_attachment_descriptor(filename, "filename")?;
-        validate_attachment_content_type(content_type)?;
-        // §4.127: the blur placeholder rides the descriptor verbatim; the
-        // bound is the receive face's own constant (one constant, both
-        // directions), enforced before the pending row exists.
-        validate_blur_hash(blur_hash)?;
-        // §4.30: the voice flag requires an audio attachment — the official
-        // recorder only produces audio, and a non-audio voice flag would
-        // render as an unplayable bubble. Deterministic rejection before the
-        // pending row exists.
-        if voice_note && !content_type.is_some_and(|value| value.starts_with("audio/")) {
-            return Err(ServiceError::Api(ApiError::new(
-                "INVALID_REQUEST",
-                "voiceNote requires an audio/* contentType",
-                false,
-            )));
-        }
-        // §4.36: the view-once flag requires a photo or video, no caption, no
-        // quote, and no voice flag — the official view-once faces, enforced
-        // deterministically before the pending row exists (the single-
-        // attachment structure of §4.12 makes the combination unambiguous).
-        if view_once {
-            if !content_type
-                .is_some_and(|value| value.starts_with("image/") || value.starts_with("video/"))
-            {
-                return Err(ServiceError::Api(ApiError::new(
-                    "INVALID_REQUEST",
-                    "viewOnce requires an image/* or video/* contentType",
-                    false,
-                )));
-            }
-            if voice_note {
-                return Err(ServiceError::Api(ApiError::new(
-                    "INVALID_REQUEST",
-                    "viewOnce and voiceNote are mutually exclusive",
-                    false,
-                )));
-            }
-            if quote_message_id.is_some() {
-                return Err(ServiceError::Api(ApiError::new(
-                    "INVALID_REQUEST",
-                    "viewOnce does not support quoteMessageId",
-                    false,
-                )));
-            }
-            if text.is_some_and(|caption| !caption.is_empty()) {
-                return Err(ServiceError::Api(ApiError::new(
-                    "INVALID_REQUEST",
-                    "viewOnce does not support a caption",
-                    false,
-                )));
-            }
-        }
-        let caption = text.unwrap_or_default();
-        if !caption.is_empty() {
-            validate_text(caption)?;
-        }
-        validate_opaque_id(client_request_id, "clientRequestId")?;
-        if let Some(quote) = quote_message_id {
-            validate_opaque_id(quote, "quoteMessageId")?;
-        }
+        self.prepare_send_attachment_with_dimensions(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            None,
+        )
+    }
+
+    /// 单数附件准备面 + 声明尺寸（契约 1.294 §4.284，BUG-11 wire 批）：
+    /// `dimensions` 成对时 data URI 增 `;width=;height=` 两参数、pending 行
+    /// descriptor 记录两键；None = 旧形状逐字节不变。
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_send_attachment_with_dimensions(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        data_base64: &str,
+        size_bytes: u64,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+    ) -> Result<PreparedSend, ServiceError> {
+        // 契约 1.294 §4.284：声明尺寸在写任何行之前复核（host 已配对，
+        // service 只复核值域；越界 = INVALID_REQUEST，无 pending 行残留）。
+        let dimensions = validate_attachment_dimensions_pair(dimensions)?;
+        let caption = validate_attachment_send_request(
+            client_request_id,
+            Some(data_base64),
+            Some(size_bytes),
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+        )?;
         if let Some(existing) = self
             .store
             .message_by_client_request(account_id, client_request_id)?
@@ -3346,8 +3860,29 @@ impl ConnectorService {
         }
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_send_conversation(account_id, target)?;
-        let data_uri =
-            build_attachment_data_uri(data_base64, filename, content_type, voice_note, gif)?;
+        let data_uri = build_attachment_data_uri(
+            data_base64,
+            filename,
+            content_type,
+            voice_note,
+            gif,
+            dimensions,
+        )?;
+        // 契约 1.279（§4.263）：首发前把这条附件的原始 data URI 落进
+        // outgoing_attachment_payloads——单附件面写 index 0（契约 1.280 起复合
+        // 主键的固定槽位）。失败/unknown 保留、成功删除，于是刷新或重启之后仍能
+        // 按同一个 clientRequestId 重试——payload 不再只活在桌面内存里。已有行
+        // 保留原 payload（ON CONFLICT DO NOTHING），幂等重放不会把首发的数据
+        // 覆盖成后来的请求。写失败即失败：不发送，否则修复会静默退化回
+        // 「刷新即丢」。
+        self.store.remember_outgoing_attachment_payload(
+            account_id,
+            &conversation.id,
+            client_request_id,
+            0,
+            &data_uri,
+            now_ms(),
+        )?;
         // The pending row carries the same metadata-only descriptor the
         // renderer projects (contract 1.15 wire shape), so the desktop bubble
         // and conversation preview exist from the first pending tick instead
@@ -3360,8 +3895,11 @@ impl ConnectorService {
             content_type: content_type.map(str::to_string),
             filename: filename.map(str::to_string),
             size: Some(size_bytes),
-            width: None,
-            height: None,
+            // 契约 1.294 §4.284：声明尺寸同步落 pending 行 descriptor——
+            // 发送方自己的气泡从首个 tick 就是终态盒（与 blurHash/gif 同款
+            // 「首发陈述即行面」纪律）。
+            width: dimensions.map(|(width, _)| width),
+            height: dimensions.map(|(_, height)| height),
             is_voice_note: voice_note,
             caption: None,
             // §4.127: the caller-computed placeholder, shipped verbatim —
@@ -3396,6 +3934,376 @@ impl ConnectorService {
             view_once,
             None,
             None,
+            None,
+        )
+    }
+
+    /// Retry one definitively-failed outgoing attachment IN PLACE (contract
+    /// revision 1.278, §4.262; payload persistence = 1.279, §4.263; the
+    /// multi-attachment rebuild = 1.280, §4.264 — the §4.134 successor): the row
+    /// addressed by its ORIGINAL clientRequestId is rearmed failed -> pending,
+    /// its content faces take this request's values, and the SAME row id is
+    /// re-dispatched, in the shape the original used (singular or plural). The
+    /// engine re-uploads the bytes (a retry is a real send, never a replay of a
+    /// stored pointer), and settlement lands on the row the bubble already
+    /// renders — so the history keeps exactly one row per logical message: no
+    /// new clientRequestId, no new row id, no delete-and-recreate.
+    ///
+    /// The bytes are optional (contract 1.279, §4.263). dataBase64 +
+    /// sizeBytes may be omitted together; the connector then reads the
+    /// original data URI group it persisted at the first send
+    /// (outgoing_attachment_payloads, one row per attachment index), re-derives
+    /// each payload and size, takes the descriptor faces (filename, content type,
+    /// voice/gif/blur markers) from the row's own descriptors, and re-sends all
+    /// of them. This is what makes a failed attachment — singular OR plural —
+    /// retryable after a desktop refresh/restart, when the in-memory payload is
+    /// gone. A caller that supplies bytes still wins for a SINGLE-attachment row:
+    /// the request is validated through the same §4.12 corpus as the first send
+    /// and the persisted index-0 row is rewritten with the caller's bytes (so the
+    /// next refresh can retry again). A plural row refuses caller bytes
+    /// (RETRY_NOT_ALLOWED) because one call cannot restate every entry's byte set;
+    /// it retries ids-only from its persisted group. A missing or incomplete
+    /// payload group answers RETRY_NOT_ALLOWED — for the singular face with the
+    /// explicit "retry with dataBase64+sizeBytes" wording — and the row itself is
+    /// untouched.
+    ///
+    /// Guards, in the §4.172 order (idempotent replay before rebuild):
+    /// - no row -> MESSAGE_NOT_FOUND (the original request never arrived);
+    /// - another conversation, or an incoming/system row -> INVALID_REQUEST;
+    /// - a completed original (sent/delivered/read) -> the persisted terminal
+    ///   row, untouched and never re-dispatched;
+    /// - unknown -> RETRY_OUTCOME_UNKNOWN (its wire outcome was never settled,
+    ///   so a blind resend could double-deliver — §4.172's red line);
+    /// - pending -> RETRY_IN_FLIGHT;
+    /// - any other state -> RETRY_NOT_ALLOWED (messages.retryText owns text rows;
+    ///   the state is judged before the content face, so a row that already
+    ///   settled, or whose retry is in flight, is answered by its state and
+    ///   never by a content guess);
+    /// - a definitively failed row with no attachment descriptor left ->
+    ///   RETRY_NOT_ALLOWED with the "no descriptors" wording (never the text-send
+    ///   wording: the row is a failed attachment whose descriptor face is gone,
+    ///   and retryText refuses it for the same reason);
+    /// - caller-supplied bytes on a plural row -> RETRY_NOT_ALLOWED;
+    /// - a plural row whose persisted payload group is not exactly one row per
+    ///   descriptor -> RETRY_NOT_ALLOWED (a partial group cannot be rebuilt).
+    ///
+    /// 稳定的同行重发面（契约 1.294 前的 13 参形状）：声明尺寸走
+    /// `prepare_retry_attachment_with_dimensions`，本包装恒传 None（ids-only
+    /// 重发照旧从行 descriptor 恢复既有尺寸，行为不变）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_retry_attachment(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        data_base64: Option<&str>,
+        size_bytes: Option<u64>,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+    ) -> Result<PreparedSend, ServiceError> {
+        self.prepare_retry_attachment_with_dimensions(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            None,
+        )
+    }
+
+    /// 同行重发面 + 声明尺寸（契约 1.294 §4.284）：调用方重述尺寸优先，
+    /// 否则回落到行 descriptor 的既有 width/height 对。
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_retry_attachment_with_dimensions(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        data_base64: Option<&str>,
+        size_bytes: Option<u64>,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+    ) -> Result<PreparedSend, ServiceError> {
+        // 契约 1.294 §4.284：调用方重述的声明尺寸与其余描述面同口径——先
+        // 复核再碰 store；缺席时回落到行自己的 descriptor（见下方解析臂）。
+        let caller_dimensions = validate_attachment_dimensions_pair(dimensions)?;
+        // A caller-supplied payload/size mismatch is rejected before any store
+        // read (the first send's own rejection class); the remaining faces are
+        // checked once the persisted payload has supplied whatever the caller
+        // omitted — nothing is written before that check passes.
+        validate_attachment_payload_pair(data_base64, size_bytes)?;
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_send_conversation(account_id, target)?;
+        let row = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+            .ok_or(ServiceError::Store(StoreError::MessageNotFound))?;
+        if row.conversation_id != conversation.id {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "clientRequestId does not belong to this conversation",
+                false,
+            )));
+        }
+        if row.direction != "outgoing" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "only outgoing messages can be retried",
+                false,
+            )));
+        }
+        // §4.172 replay-first: a completed original answers its terminal row
+        // projection, untouched and never re-dispatched — the same face the
+        // text retry serves, so a desktop that retries a bubble the wire
+        // already settled converges instead of double-sending.
+        if matches!(row.status, "sent" | "delivered" | "read") {
+            let mut replay = row.clone();
+            self.store
+                .attach_reactions(account_id, std::slice::from_mut(&mut replay))?;
+            self.store
+                .attach_outgoing_quotes(account_id, std::slice::from_mut(&mut replay))?;
+            return Ok(PreparedSend::Existing(Box::new(replay)));
+        }
+        if row.status == "unknown" {
+            return Err(ServiceError::Api(ApiError::new(
+                "RETRY_OUTCOME_UNKNOWN",
+                "the original send outcome is still unknown; resend is refused to avoid double delivery",
+                false,
+            )));
+        }
+        if row.status == "pending" {
+            return Err(ServiceError::Api(ApiError::new(
+                "RETRY_IN_FLIGHT",
+                "retry already in flight",
+                false,
+            )));
+        }
+        if row.status != "failed" {
+            return Err(ServiceError::Api(ApiError::new(
+                "RETRY_NOT_ALLOWED",
+                "only a definitively failed send can be retried",
+                false,
+            )));
+        }
+        // The status guards settle the row's state before the content face is
+        // judged: a failed row that lost its descriptors is still a failed
+        // ATTACHMENT (its attachment face was erased, or it predates the
+        // persisted descriptor), and answering "this is a text send" would be a
+        // lie about a row retryText refuses for the very same reason — there is
+        // nothing left to rebuild. Only a definitively failed row reaches here,
+        // so this is the honest "no descriptor" answer.
+        if row.attachments.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "RETRY_NOT_ALLOWED",
+                "the clientRequestId no longer carries attachment descriptors; this row cannot be rebuilt as an attachment",
+                false,
+            )));
+        }
+        // §4.264: caller-supplied bytes serve the singular form only — a plural
+        // message carries one byte set per entry, and one call cannot restate
+        // them all. A multi-attachment row is retried from its own persisted
+        // payload group (ids-only, still possible after a refresh). The refusal
+        // sits after the status guards, so the failed row stays exactly as it
+        // was and remains retryable ids-only.
+        if row.attachments.len() > 1 && data_base64.is_some() {
+            return Err(ServiceError::Api(ApiError::new(
+                "RETRY_NOT_ALLOWED",
+                "a multi-attachment send is retried from its persisted payloads; omit dataBase64+sizeBytes",
+                false,
+            )));
+        }
+        // §4.263 + §4.264: caller bytes win; otherwise the persisted payload
+        // group is the resend source. The row's own descriptor is the
+        // authoritative fallback for every face the caller did not restate, so a
+        // sparse refresh retry preserves the original filename/contentType/voice/
+        // gif/blurHash instead of inventing builder defaults. The singular row
+        // reads index 0; a plural row reads the whole group by ascending index and
+        // refuses when the group is not exactly one entry per descriptor — a
+        // partial group is not a rebuildable generation.
+        let resolved: Vec<ResolvedAttachmentPayload> = match data_base64.zip(size_bytes) {
+            Some((data_base64, size_bytes)) => {
+                let descriptor = row.attachments.first();
+                vec![ResolvedAttachmentPayload {
+                    data_base64: data_base64.to_string(),
+                    size_bytes,
+                    content_type: content_type
+                        .map(str::to_string)
+                        .or_else(|| descriptor.and_then(|entry| entry.content_type.clone())),
+                    filename: filename
+                        .map(str::to_string)
+                        .or_else(|| descriptor.and_then(|entry| entry.filename.clone())),
+                    voice: voice_note || descriptor.is_some_and(|entry| entry.is_voice_note),
+                    gif: gif || descriptor.is_some_and(|entry| entry.is_gif),
+                    blur_hash: blur_hash
+                        .map(str::to_string)
+                        .or_else(|| descriptor.and_then(|entry| entry.blur_hash.clone())),
+                    dimensions: caller_dimensions
+                        .or_else(|| descriptor.and_then(|entry| entry.width.zip(entry.height))),
+                }]
+            }
+            None => {
+                let stored = self
+                    .store
+                    .outgoing_attachment_payloads(account_id, client_request_id)?;
+                let complete = stored.len() == row.attachments.len()
+                    && stored
+                        .iter()
+                        .enumerate()
+                        .all(|(index, (stored_index, _))| *stored_index == index as u32);
+                if !complete {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "RETRY_NOT_ALLOWED",
+                        if row.attachments.len() > 1 {
+                            "the original attachment payloads are no longer available; this multi-attachment row cannot be retried"
+                        } else {
+                            "the original attachment payload is no longer available; retry with dataBase64+sizeBytes"
+                        },
+                        false,
+                    )));
+                }
+                let mut resolved = Vec::with_capacity(stored.len());
+                for ((_, data_uri), descriptor) in stored.iter().zip(row.attachments.iter()) {
+                    let parsed = parse_attachment_data_uri(data_uri)?;
+                    // Descriptor faces come from the row, never from the URI: the
+                    // URI's mime/filename are builder defaults, and a field the
+                    // first send genuinely lacked must not be conjured back.
+                    resolved.push(ResolvedAttachmentPayload {
+                        data_base64: parsed.data_base64,
+                        size_bytes: parsed.size_bytes,
+                        content_type: descriptor.content_type.clone(),
+                        filename: descriptor.filename.clone(),
+                        voice: descriptor.is_voice_note,
+                        gif: descriptor.is_gif,
+                        blur_hash: descriptor.blur_hash.clone(),
+                        // 声明尺寸同样以行为准（首发陈述落行，URI 只作字节源）。
+                        dimensions: descriptor.width.zip(descriptor.height),
+                    });
+                }
+                resolved
+            }
+        };
+        // ids-only retry restores every face the row already owns: caption,
+        // quote and the view-once marker are part of the original message, not
+        // caller-restated builder defaults. Caller values still win when given.
+        let preserved_text = text.or_else(|| row.text.as_deref().filter(|value| !value.is_empty()));
+        let preserved_quote = quote_message_id.or(row.quote_message_id.as_deref());
+        let preserved_view_once = view_once || row.rich.as_ref().is_some_and(|rich| rich.view_once);
+        // A stored voice/gif marker or content type can complete a composition
+        // the caller's sparse request did not spell out: re-run the metadata
+        // corpus against each resolved entry before anything is written.
+        for entry in &resolved {
+            validate_attachment_send_metadata(
+                client_request_id,
+                entry.filename.as_deref(),
+                entry.content_type.as_deref(),
+                preserved_text,
+                preserved_quote,
+                entry.voice,
+                preserved_view_once,
+                entry.blur_hash.as_deref(),
+            )?;
+            // 契约 1.294 §4.284：行面/调用方来的尺寸在重建 URI 之前复核，
+            // 坏值（越界/零）不得进上行帧。
+            validate_attachment_dimensions_pair(entry.dimensions)?;
+        }
+        let caption = preserved_text.unwrap_or_default();
+        // The descriptor id is the first attempt's own (§4.12 stable-id
+        // derivation over the same account + clientRequestId + array position),
+        // so the retry replaces the bytes behind the SAME descriptors: §4.183's
+        // local stash lands on the same files, and the sender's bubble keys never
+        // change.
+        let mut data_uris = Vec::with_capacity(resolved.len());
+        let mut descriptors = Vec::with_capacity(resolved.len());
+        let mut payloads = Vec::with_capacity(resolved.len());
+        for (index, entry) in resolved.iter().enumerate() {
+            let data_uri = build_attachment_data_uri(
+                &entry.data_base64,
+                entry.filename.as_deref(),
+                entry.content_type.as_deref(),
+                entry.voice,
+                entry.gif,
+                entry.dimensions,
+            )?;
+            payloads.push((index as u32, data_uri.clone()));
+            data_uris.push(json!(data_uri));
+            descriptors.push(NormalizedAttachment {
+                locator: None,
+                id: stable_hash_id(&[
+                    account_id,
+                    client_request_id,
+                    "attachment",
+                    &index.to_string(),
+                ]),
+                content_type: entry.content_type.clone(),
+                filename: entry.filename.clone(),
+                size: Some(entry.size_bytes),
+                // 契约 1.294 §4.284：重试重建的 descriptor 携带同一对声明
+                // 尺寸（行面恢复或调用方重述），气泡盒子不因重试回退。
+                width: entry.dimensions.map(|(width, _)| width),
+                height: entry.dimensions.map(|(_, height)| height),
+                is_voice_note: entry.voice,
+                caption: None,
+                blur_hash: entry.blur_hash.clone(),
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: entry.gif,
+                waveform: None,
+                duration: None,
+            });
+        }
+        // §4.263 + §4.264: the payload rows follow the bytes actually re-sent.
+        // Caller bytes overwrite index 0; the ids-only arm writes the rebuilt
+        // group back (refreshing updated_at, so a long-lived failed row keeps its
+        // resend source through the retention window). Write failure aborts the
+        // retry before the row is rearmed.
+        let payload_refs: Vec<(u32, &str)> = payloads
+            .iter()
+            .map(|(index, data_uri)| (*index, data_uri.as_str()))
+            .collect();
+        self.store.update_outgoing_attachment_payloads(
+            account_id,
+            &conversation.id,
+            client_request_id,
+            &payload_refs,
+            now_ms(),
+        )?;
+        self.dispatch_send(
+            &account,
+            &conversation,
+            caption,
+            client_request_id,
+            preserved_quote,
+            None,
+            None,
+            None,
+            Some(data_uris),
+            descriptors,
+            preserved_view_once,
+            None,
+            None,
+            Some(&row),
         )
     }
 
@@ -3462,6 +4370,9 @@ impl ConnectorService {
             validate_attachment_content_type(entry.content_type.as_deref())?;
             // §4.127: the plural face carries the blur placeholder per entry.
             validate_blur_hash(entry.blur_hash.as_deref())?;
+            // 契约 1.294 §4.284：复数面条目级声明尺寸同校验同值域，任一条
+            // 坏形状整批 INVALID_REQUEST（写任何行之前）。
+            validate_attachment_dimensions(entry.width, entry.height)?;
         }
         if let Some(caption) = text
             && !caption.is_empty()
@@ -3482,14 +4393,21 @@ impl ConnectorService {
         let conversation = self.resolve_send_conversation(account_id, target)?;
         let mut data_uris = Vec::with_capacity(entries.len());
         let mut descriptors = Vec::with_capacity(entries.len());
+        // 契约 1.280（§4.264）：多附件消息的每个条目各存一份原始 data URI，
+        // index 就是它在 attachments 数组里的位置（0..n-1）。整组在一个事务里
+        // 落库，ids-only 重试才能按 index 重建出完整的一代字节。
+        let mut payloads = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
+            let dimensions = validate_attachment_dimensions(entry.width, entry.height)?;
             let data_uri = build_attachment_data_uri(
                 &entry.data_base64,
                 entry.filename.as_deref(),
                 entry.content_type.as_deref(),
                 false,
                 entry.gif,
+                dimensions,
             )?;
+            payloads.push((index as u32, data_uri.clone()));
             data_uris.push(json!(data_uri));
             descriptors.push(NormalizedAttachment {
                 locator: None,
@@ -3502,8 +4420,9 @@ impl ConnectorService {
                 content_type: entry.content_type.clone(),
                 filename: entry.filename.clone(),
                 size: Some(entry.size_bytes),
-                width: None,
-                height: None,
+                // 契约 1.294 §4.284：条目级声明尺寸同步落 descriptor。
+                width: dimensions.map(|(width, _)| width),
+                height: dimensions.map(|(_, height)| height),
                 is_voice_note: false,
                 caption: None,
                 // §4.127: per-entry placeholder, same posture as the
@@ -3520,6 +4439,19 @@ impl ConnectorService {
                 duration: None,
             });
         }
+        let payload_refs: Vec<(u32, &str)> = payloads
+            .iter()
+            .map(|(index, data_uri)| (*index, data_uri.as_str()))
+            .collect();
+        // 写失败即不发送（与单附件面同一纪律）：没有 payload 的多附件失败行
+        // 在刷新后无法 ids-only 重试，而它也没有单份 bytes 可以补。
+        self.store.remember_outgoing_attachment_payloads(
+            account_id,
+            &conversation.id,
+            client_request_id,
+            &payload_refs,
+            now_ms(),
+        )?;
         self.dispatch_send(
             &account,
             &conversation,
@@ -3532,6 +4464,7 @@ impl ConnectorService {
             Some(data_uris),
             descriptors,
             false,
+            None,
             None,
             None,
         )
@@ -3660,12 +4593,15 @@ impl ConnectorService {
         // §4.147: the sticker image rides the single-item upload face the
         // engine keeps out of the shared attachment path — the official
         // sticker pointer has no GIF bit, so this URI never carries the flag.
+        // 贴纸图不经普通附件尺寸参数面（贴纸尺寸走上游 sticker.width/
+        // height 对象键，见 §4.31）；dimensions 恒 None，字节形状零变化。
         let data_uri = build_attachment_data_uri(
             &image.data_base64,
             None,
             Some(&image.content_type),
             false,
             false,
+            None,
         )?;
         // The sent row's descriptor records the sticker image (metadata only)
         // and the row itself records the pack identity, so the sender's bubble
@@ -3807,17 +4743,58 @@ impl ConnectorService {
         view_once: bool,
         story_reply_author: Option<String>,
         story_reply_timestamp: Option<Value>,
+        retry_row: Option<&MessageRecord>,
     ) -> Result<PreparedSend, ServiceError> {
         let account_id = account.id.as_str();
         let conversation_id = conversation.id.as_str();
+        // BUG-16 刀2：裸号码 direct 对端先过桥解析成 ACI（行 id/标题不动，
+        // 只换引擎定址键；桥 miss 原样放行——见 resolver 头注）。
+        let conversation = self.resolve_direct_send_recipient(account_id, conversation)?;
         // Quote resolution is part of send validation and runs before the
         // pending row exists: a rejected quote leaves nothing behind, so the
         // same clientRequestId stays a fresh (re-validated) request.
         let quote = quote_message_id
-            .map(|id| self.resolve_quote(account, conversation, id))
+            .map(|id| self.resolve_quote(account, &conversation, id))
             .transpose()?;
-        let pending_id =
-            stable_hash_id(&[account_id, conversation_id, "outgoing", client_request_id]);
+        // §4.262: an in-place retry addresses the ORIGINAL row by its own id —
+        // the deterministic first-send id is the same value by construction
+        // (same account, conversation and clientRequestId), so this branch
+        // only states which write follows, never a second identity.
+        let pending_id = match retry_row {
+            Some(row) => row.id.clone(),
+            None => stable_hash_id(&[account_id, conversation_id, "outgoing", client_request_id]),
+        };
+        // §4.126: the rich body face (preview card, §4.62 style ranges, §4.36
+        // view-once marker) is built once and shared by both write arms.
+        let rich = {
+            let previews: Vec<crate::engine::NormalizedPreview> = link_preview
+                .iter()
+                .map(|card| crate::engine::NormalizedPreview {
+                    url: card.url.clone(),
+                    title: Some(card.title.clone()),
+                    description: card.description.clone(),
+                    date: card.date,
+                    image: None,
+                })
+                .collect();
+            (view_once || text_styles.is_some() || !previews.is_empty()).then(|| {
+                crate::engine::NormalizedRich {
+                    previews,
+                    view_once,
+                    text_styles: text_styles
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|style| crate::engine::NormalizedTextStyle {
+                            style: style.style.clone(),
+                            start: style.start,
+                            length: style.length,
+                        })
+                        .collect(),
+                    ..crate::engine::NormalizedRich::default()
+                }
+            })
+        };
         let pending = MessageRecord {
             is_erased: false,
             delete_failed: false,
@@ -3856,35 +4833,7 @@ impl ConnectorService {
             // transit-only material), so the optimistic row renders the same
             // stamp the eventual mirror carries and the retry rebuild
             // restores the card.
-            rich: {
-                let previews: Vec<crate::engine::NormalizedPreview> = link_preview
-                    .iter()
-                    .map(|card| crate::engine::NormalizedPreview {
-                        url: card.url.clone(),
-                        title: Some(card.title.clone()),
-                        description: card.description.clone(),
-                        date: card.date,
-                        image: None,
-                    })
-                    .collect();
-                (view_once || text_styles.is_some() || !previews.is_empty()).then(|| {
-                    crate::engine::NormalizedRich {
-                        previews,
-                        view_once,
-                        text_styles: text_styles
-                            .as_deref()
-                            .unwrap_or(&[])
-                            .iter()
-                            .map(|style| crate::engine::NormalizedTextStyle {
-                                style: style.style.clone(),
-                                start: style.start,
-                                length: style.length,
-                            })
-                            .collect(),
-                        ..crate::engine::NormalizedRich::default()
-                    }
-                })
-            },
+            rich: rich.clone(),
             reactions: Vec::new(),
             edits: Vec::new(),
             delivered_at: None,
@@ -3909,18 +4858,48 @@ impl ConnectorService {
                 .find_map(|a| a.filename.as_deref().filter(|f| !f.is_empty()))
                 .map(str::to_string)
         });
-        let inserted = self.store.insert_message(
-            &pending,
-            Some(client_request_id),
-            preview.as_deref(),
-            false,
-        )?;
-        if !inserted
-            && let Some(existing) = self
-                .store
-                .message_by_client_request(account_id, client_request_id)?
-        {
-            return Ok(PreparedSend::Existing(Box::new(existing)));
+        match retry_row {
+            // §4.262: the in-place retry writes the ORIGINAL row — one
+            // guarded \`failed -> pending\` transition carrying this request's
+            // faces, never an insert. The store's status guard is the
+            // concurrency face: a row a concurrent retry already rearmed (or
+            // that settled while this request was travelling) answers
+            // RETRY_IN_FLIGHT instead of arming a second dispatch of the same
+            // row, so one row can never leave as two upstream sends.
+            Some(row) => {
+                let (_, changed) = self
+                    .store
+                    .rearm_failed_attachment_retry(
+                        &row.id,
+                        text,
+                        pending.quote_message_id.as_deref(),
+                        &pending.attachments,
+                        rich.as_ref(),
+                    )?
+                    .ok_or(ServiceError::Store(StoreError::MessageNotFound))?;
+                if !changed {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "RETRY_IN_FLIGHT",
+                        "retry already in flight",
+                        false,
+                    )));
+                }
+            }
+            None => {
+                let inserted = self.store.insert_message(
+                    &pending,
+                    Some(client_request_id),
+                    preview.as_deref(),
+                    false,
+                )?;
+                if !inserted
+                    && let Some(existing) = self
+                        .store
+                        .message_by_client_request(account_id, client_request_id)?
+                {
+                    return Ok(PreparedSend::Existing(Box::new(existing)));
+                }
+            }
         }
         // §4.183: the official outgoing-attachment local retention — while
         // the caller's bytes are still in hand as data URIs, stash them
@@ -3954,7 +4933,7 @@ impl ConnectorService {
             text_styles.as_deref(),
             attachments,
             quote,
-            conversation,
+            &conversation,
             view_once,
             story_reply_author,
             story_reply_timestamp,
@@ -3963,8 +4942,15 @@ impl ConnectorService {
             pending_id,
             account_id: account_id.to_string(),
             conversation_id: conversation_id.to_string(),
-            params,
-            pending_sent_at: pending.sent_at,
+            params: {
+                let mut params = params;
+                params["dispatchId"] = json!(client_request_id);
+                params
+            },
+            // §4.262: a retry keeps the ORIGINAL row's stamp as the fallback
+            // settlement time — the message's position in the timeline is the
+            // original send's, not the retry's.
+            pending_sent_at: retry_row.map_or(pending.sent_at, |row| row.sent_at),
         })
     }
 
@@ -5162,6 +6148,44 @@ impl ConnectorService {
         })
     }
 
+    /// BUG-16 刀2（2026-11-13 · 发送侧反向解析）：direct 发送的裸号码对端，
+    /// 经 peer_identities 桥（aci_for_peer_key，与 report_target_aci 同款
+    /// §4.48 阶梯）解析成 ACI 后再发。
+    ///
+    /// 事实修正（engine resolve_recipient 源码核对）：引擎**收**裸号码——
+    /// 经它自己的 contacts 数字位匹配解析；BUG-16 现场 1ms 拒是因为该号
+    /// 不在引擎 contacts（手机联系人同步未达）而 ACI 只在 connector 桥里
+    /// （带 ACI 的入站信封记的）——两个身份库各知一半。桥命中 → 按 ACI 发
+    /// （本机权威映射，不依赖手机同步）；桥 miss → **原样放行号码**（引擎
+    /// contacts 或能自解，旧路径行为不变——诚实分类在 supervisor 定址点
+    /// 做，见 dispatch_prepared 的 unregistered_recipient 臂）。
+    fn resolve_direct_send_recipient(
+        &self,
+        account_id: &str,
+        conversation: &ConversationRow,
+    ) -> Result<ConversationRow, ServiceError> {
+        if conversation.kind != "direct" || crate::engine::is_uuid_shaped(&conversation.peer_key) {
+            return Ok(conversation.clone());
+        }
+        // BUG-16 刀2a 修正（双拼写）：真机实证 peer_identities 存的号码拼写
+        // 与会话 peer_key 差一「+」，精确单查假 miss——改走 aci_for_phone_key
+        //（§4.144 双拼写：先精确再替身形，非号码键自然只走精确臂）。
+        match self
+            .store
+            .aci_for_phone_key(account_id, &conversation.peer_key)?
+        {
+            Some(aci) => {
+                if aci.is_empty() {
+                    return Ok(conversation.clone());
+                }
+                let mut resolved = conversation.clone();
+                resolved.peer_key = aci;
+                Ok(resolved)
+            }
+            None => Ok(conversation.clone()),
+        }
+    }
+
     /// The report address (contract revision 1.49, §4.48): a UUID-shaped
     /// peer key is the ACI itself; otherwise the ingest-recorded
     /// ACI↔peer-key mapping answers. A numeric peer with no recorded
@@ -5812,6 +6836,15 @@ impl ConnectorService {
         &self,
         account_id: &str,
     ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({ "account": account.signal_account }))
+    }
+
+    /// accounts.getSyncState (contract revision 1.286, §4.281): account bounds
+    /// and existence — the sync-window projection is the engine's own
+    /// process-memory book, the service reads nothing locally.
+    pub fn prepare_accounts_get_sync_state(&self, account_id: &str) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         let account = self.resolve_account(account_id)?;
         Ok(json!({ "account": account.signal_account }))
@@ -7154,89 +8187,126 @@ impl ConnectorService {
         }
     }
 
-    /// identities.get / identities.verify (contract revision 1.68, §4.61):
-    /// bounds and resolution — the §4.47/§4.56 ladder verbatim, gated to the
+    /// identities.get / identities.verify (contract revision 1.68, §4.61;
+    /// peer arm added by contract revision 1.281, §4.265): bounds and
+    /// resolution for both addressing forms.
+    ///
+    /// The conversation arm is the §4.47/§4.56 ladder verbatim, gated to the
     /// 1:1 shape. Identity keys are a per-contact concept (the official
     /// desktop gates the details row on `!isGroup`, ConversationDetails.dom
     /// .tsx:654), so group/legacy rows fail closed before any upstream call;
     /// the §4.42 self row (empty peer reference) fails closed the same way.
-    /// The upstream key is the resolved peer reference verbatim — the pinned
+    ///
+    /// The peer arm skips the conversation ladder entirely: the caller named
+    /// the peer's own protocol address (ACI UUID or E.164, shape-gated by
+    /// `identities_addressing`), so the account's identity store is read /
+    /// written directly by that reference. No conversation row is resolved,
+    /// required, or created — a peer the host has never had a thread with is
+    /// exactly the case this face exists for, and a peer with no identity row
+    /// yet answers the honest empty-list face rather than
+    /// CONVERSATION_NOT_FOUND.
+    ///
+    /// Either way the upstream key is the peer reference verbatim — the pinned
     /// `listIdentities`/`trust` recipient parameter accepts a phone number,
     /// ACI UUID, `PNI:` or `u:` username form (RecipientIdentifier.java:26-49),
-    /// which is exactly the peer_key shape taxonomy, so the connector passes
-    /// it through and never re-classifies.
+    /// so the connector passes it through and never re-classifies.
     fn prepare_identities_face(
         &self,
         account_id: &str,
-        conversation_id: &str,
+        target: &IdentitiesTarget<'_>,
     ) -> Result<(Value, String), ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
-        if conversation_id.is_empty()
-            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
-        {
-            return Err(ServiceError::Api(ApiError::new(
-                "INVALID_REQUEST",
-                "conversationId must contain between 1 and 256 characters",
-                false,
-            )));
+        // 形状先于解析（§4.61 的原顺序：会话面的空 / 超长 conversationId 即使
+        // 账号未知也答 INVALID_REQUEST）；peerKey 面同一纪律，畸形键不落到
+        // account / conversation 解析上。
+        match target {
+            IdentitiesTarget::Conversation(conversation_id)
+                if conversation_id.is_empty()
+                    || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS =>
+            {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "conversationId must contain between 1 and 256 characters",
+                    false,
+                )));
+            }
+            IdentitiesTarget::Peer(peer_key) if !identity_peer_key_shaped(peer_key) => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "peerKey must be an ACI UUID or an E.164 phone number",
+                    false,
+                )));
+            }
+            _ => {}
         }
         let account = self.resolve_account(account_id)?;
-        let conversation = self.resolve_conversation(account_id, conversation_id)?;
-        match conversation.kind.as_str() {
-            "direct" => {
-                if conversation.peer_key.is_empty() {
-                    return Err(ServiceError::Api(ApiError::new(
-                        "INVALID_REQUEST",
-                        "this conversation has no upstream address",
-                        false,
-                    )));
+        let peer_key = match target {
+            IdentitiesTarget::Conversation(conversation_id) => {
+                let conversation = self.resolve_conversation(account_id, conversation_id)?;
+                match conversation.kind.as_str() {
+                    "direct" => {
+                        if conversation.peer_key.is_empty() {
+                            return Err(ServiceError::Api(ApiError::new(
+                                "INVALID_REQUEST",
+                                "this conversation has no upstream address",
+                                false,
+                            )));
+                        }
+                        conversation.peer_key
+                    }
+                    "group" | "legacyGroup" => {
+                        return Err(ServiceError::Api(ApiError::new(
+                            "INVALID_REQUEST",
+                            "safety numbers are a 1:1 conversation face",
+                            false,
+                        )));
+                    }
+                    _ => {
+                        return Err(ServiceError::Api(ApiError::new(
+                            "INVALID_REQUEST",
+                            "unsupported conversation kind",
+                            false,
+                        )));
+                    }
                 }
-                Ok((
-                    json!({ "account": account.signal_account }),
-                    conversation.peer_key,
-                ))
             }
-            "group" | "legacyGroup" => Err(ServiceError::Api(ApiError::new(
-                "INVALID_REQUEST",
-                "safety numbers are a 1:1 conversation face",
-                false,
-            ))),
-            _ => Err(ServiceError::Api(ApiError::new(
-                "INVALID_REQUEST",
-                "unsupported conversation kind",
-                false,
-            ))),
-        }
+            // 契约 §4.265：peerKey 面——不解析、不要求 direct 会话；账号的
+            // identity store 直接按 peer 引用读/写（引擎是唯一权威）。
+            IdentitiesTarget::Peer(peer_key) => (*peer_key).to_string(),
+        };
+        Ok((json!({ "account": account.signal_account }), peer_key))
     }
 
-    /// identities.get (contract revision 1.68, §4.61, capability
-    /// safety-number): the prepared pinned `listIdentities` call — the
-    /// upstream reads one identity when the recipient parameter is present,
-    /// so the connector narrows the read to the resolved peer reference and
-    /// never requests the account-wide list.
+    /// identities.get (contract revision 1.68, §4.61; peer arm 1.281, §4.265,
+    /// capability safety-number): the prepared pinned `listIdentities` call —
+    /// the upstream reads one identity when the recipient parameter is
+    /// present, so the connector narrows the read to the addressed peer
+    /// reference and never requests the account-wide list. The peer arm reads
+    /// the account identity store directly: no conversation row is resolved,
+    /// required, or created.
     pub fn prepare_identities_get(
         &self,
         account_id: &str,
         conversation_id: &str,
     ) -> Result<Value, ServiceError> {
-        let (mut upstream, peer_key) = self.prepare_identities_face(account_id, conversation_id)?;
+        self.prepare_identities_get_for_target(
+            account_id,
+            &IdentitiesTarget::Conversation(conversation_id),
+        )
+    }
+
+    pub fn prepare_identities_get_for_target(
+        &self,
+        account_id: &str,
+        target: &IdentitiesTarget<'_>,
+    ) -> Result<Value, ServiceError> {
+        let (mut upstream, peer_key) = self.prepare_identities_face(account_id, target)?;
         if let Some(map) = upstream.as_object_mut() {
             map.insert("number".to_string(), Value::String(peer_key));
         }
         Ok(upstream)
     }
 
-    /// identities.verify (contract revision 1.68, §4.61, capability
-    /// safety-number): the prepared pinned `trust` call in its
-    /// `verifiedSafetyNumber` form — the safety number string is the exact
-    /// digits the desktop just displayed (the official verify semantics:
-    /// only use this option if you have verified the safety number,
-    /// TrustCommand.java:37). The upstream parses spaced 60-digit groups,
-    /// 66-char hex fingerprints, or base64 scannable payloads
-    /// (IdentityVerificationCode.java:20-32); the connector enforces only
-    /// the wire bound and never invents a second grammar — a malformed
-    /// string is the upstream's definite UserError, not a local guess.
-    /// The testing-only `trustAllKnownKeys` mode is never sent.
     /// 契约 §4.224：删除失败态落库/清除（supervisor 结算臂调用）。
     pub fn set_message_delete_failed(
         &self,
@@ -7250,13 +8320,41 @@ impl ConnectorService {
             .map_err(ServiceError::from)
     }
 
+    /// identities.verify (contract revision 1.68, §4.61; peer arm 1.281,
+    /// §4.265, capability safety-number): the prepared pinned `trust` call in
+    /// its `verifiedSafetyNumber` form — the safety number string is the
+    /// exact digits the desktop just displayed (the official verify
+    /// semantics: only use this option if you have verified the safety
+    /// number, TrustCommand.java:37). The upstream parses spaced 60-digit
+    /// groups, 66-char hex fingerprints, or base64 scannable payloads
+    /// (IdentityVerificationCode.java:20-32); the connector enforces only
+    /// the wire bound and never invents a second grammar — a malformed
+    /// string is the upstream's definite UserError, not a local guess.
+    /// The testing-only `trustAllKnownKeys` mode is never sent.
+    ///
+    /// The peer arm writes the same `trust` frame with the peer reference as
+    /// `recipient` and needs no conversation row: the account identity store
+    /// is the write target, exactly as on the read face.
     pub fn prepare_identities_verify(
         &self,
         account_id: &str,
         conversation_id: &str,
         intent: &IdentitiesVerifyIntent,
     ) -> Result<Value, ServiceError> {
-        let (mut upstream, peer_key) = self.prepare_identities_face(account_id, conversation_id)?;
+        self.prepare_identities_verify_for_target(
+            account_id,
+            &IdentitiesTarget::Conversation(conversation_id),
+            intent,
+        )
+    }
+
+    pub fn prepare_identities_verify_for_target(
+        &self,
+        account_id: &str,
+        target: &IdentitiesTarget<'_>,
+        intent: &IdentitiesVerifyIntent,
+    ) -> Result<Value, ServiceError> {
+        let (mut upstream, peer_key) = self.prepare_identities_face(account_id, target)?;
         match intent {
             IdentitiesVerifyIntent::Verified { safety_number } => {
                 if safety_number.is_empty()
@@ -7286,6 +8384,33 @@ impl ConnectorService {
             }
         }
         Ok(upstream)
+    }
+
+    /// identities.verify 成功后的本地写穿腿（契约 1.260, §4.244；peer 面
+    /// 1.281, §4.265）：把这次写出的信任词落到本地投影，读面（会话摘要的
+    /// `verified` 位）下一帧就能看见——官方 `#_setVerified` 写协议库并落
+    /// 记录的同位语义。两条寻址各自走对应的 store 面：
+    /// `conversationId` → 按行 id 盖章；`peerKey` → 按 direct 行的
+    /// peer_key 盖章（没有 direct 行就没有可写穿的投影，`Ok(false)` 是
+    /// 诚实答案，不是错误——引擎侧的信任已经落库，下一次读面仍会收敛）。
+    pub fn stamp_identity_verified(
+        &self,
+        account_id: &str,
+        target: &IdentitiesTarget<'_>,
+        trust_level: &str,
+    ) -> Result<bool, StoreError> {
+        match target {
+            IdentitiesTarget::Conversation(conversation_id) => self
+                .store
+                .set_conversation_identity_verified_for_conversation(
+                    account_id,
+                    conversation_id,
+                    trust_level,
+                ),
+            IdentitiesTarget::Peer(peer_key) => self
+                .store
+                .set_conversation_identity_verified_for_peer(account_id, peer_key, trust_level),
+        }
     }
 
     /// calls.sendSignal (contract revision 1.53, §4.49): the shape gate plus
@@ -7876,6 +9001,49 @@ impl ConnectorService {
             params["storyReplyTimestamp"] = timestamp;
         }
         params
+    }
+
+    /// events.list (contract 1.283, §4.267): the durable change ledger's read
+    /// face. The host presents its last applied seq and the token it was given,
+    /// and gets back one bounded page of thin events plus the reset verdict.
+    /// Validation is the wire's own: a negative cursor or an oversized token is
+    /// a malformed request (INVALID_REQUEST), a limit outside 1..=500 is the
+    /// schema's own bound, and nothing here mutates or takes the store's writer
+    /// lock (the page reads on the read pool).
+    pub fn events_page(&self, params: EventsListParams) -> Result<EventLedgerPage, ServiceError> {
+        let after_seq = match params.after_seq {
+            Some(after_seq) if after_seq < 0 => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "afterSeq must be zero or greater",
+                    false,
+                )));
+            }
+            other => other,
+        };
+        if let Some(token) = params.token.as_deref()
+            && (token.is_empty() || token.chars().count() > EVENT_TOKEN_MAX_CHARS)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "token must be 1-128 characters",
+                false,
+            )));
+        }
+        let limit = match params.limit {
+            Some(limit) if !(1..=EVENT_PAGE_MAX_LIMIT).contains(&limit) => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "limit must be between 1 and 500",
+                    false,
+                )));
+            }
+            Some(limit) => limit,
+            None => EVENT_PAGE_DEFAULT_LIMIT,
+        };
+        self.store
+            .events_page(after_seq, params.token.as_deref(), limit)
+            .map_err(Into::into)
     }
 
     /// messages.getByClientRequestId (contract 1.172, §4.172): the read-only
@@ -9776,6 +10944,21 @@ impl ConnectorService {
         self.store
             .attach_outgoing_quotes(account_id, std::slice::from_mut(&mut updated.0))?;
         let (updated, status_transitioned) = updated;
+        // 契约 1.279（§4.263）+ 1.280（§4.264）：发送已成功——整条消息（单附件
+        // 或多附件的整组条目）的原始 payload 完成使命，立即全部删除（失败/
+        // unknown 保留）。结算本身已经落库，清理失败只 warn：把已送达的发送
+        // 改判失败会引出重发。
+        if let Some(client_request_id) = updated.client_request_id.as_deref()
+            && let Err(error) = self
+                .store
+                .delete_outgoing_attachment_payloads(&updated.account_id, client_request_id)
+        {
+            tracing::warn!(
+                kind = "outgoing_attachment_payload_cleanup",
+                class = error.class(),
+                "successful send left its attachment payload behind"
+            );
+        }
         let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
             updated.clone(),
         ))];
@@ -9835,6 +11018,21 @@ impl ConnectorService {
             return Ok(Vec::new());
         };
         let account_id = updated.account_id.clone();
+        // 契约 1.279（§4.263）+ 1.280（§4.264）：对账确认「确实已发送」= 成功，
+        // 整组 payload 全部删除（与 complete_send_success 同一纪律，
+        // best-effort）。
+        if dispatched
+            && let Some(client_request_id) = updated.client_request_id.as_deref()
+            && let Err(error) = self
+                .store
+                .delete_outgoing_attachment_payloads(&account_id, client_request_id)
+        {
+            tracing::warn!(
+                kind = "outgoing_attachment_payload_cleanup",
+                class = error.class(),
+                "reconciled send left its attachment payload behind"
+            );
+        }
         self.store
             .attach_reactions(&account_id, std::slice::from_mut(&mut updated))?;
         self.store
@@ -9952,10 +11150,33 @@ impl ConnectorService {
         contacts_ok: bool,
         groups_ok: bool,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
-        let Some(account) = self.resolve_account_transient(signal_account, "engine.storagePull")?
-        else {
-            return Ok(Vec::new());
+        let account = match self.resolve_account_transient(signal_account, "engine.storagePull") {
+            Ok(Some(account)) => account,
+            Ok(None) => {
+                crate::gate_trace::line(
+                    "storage-pull",
+                    Some(signal_account),
+                    "fail",
+                    "account-unresolved",
+                );
+                return Ok(Vec::new());
+            }
+            Err(error) => {
+                crate::gate_trace::line(
+                    "storage-pull",
+                    Some(signal_account),
+                    "fail",
+                    "store-error",
+                );
+                return Err(error);
+            }
         };
+        crate::gate_trace::line(
+            "storage-pull",
+            Some(signal_account),
+            "ok",
+            &format!("forwarded trigger={trigger} contactsOk={contacts_ok} groupsOk={groups_ok}"),
+        );
         Ok(vec![HostSideEvent::StoragePull {
             account_id: account.id.clone(),
             trigger: trigger.to_string(),
@@ -9973,11 +11194,34 @@ impl ConnectorService {
         manifest_ok: bool,
         profiles_ok: bool,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
-        let Some(account) =
-            self.resolve_account_transient(signal_account, "engine.initialSyncComplete")?
-        else {
-            return Ok(Vec::new());
-        };
+        let account =
+            match self.resolve_account_transient(signal_account, "engine.initialSyncComplete") {
+                Ok(Some(account)) => account,
+                Ok(None) => {
+                    crate::gate_trace::line(
+                        "initial-sync",
+                        Some(signal_account),
+                        "fail",
+                        "account-unresolved",
+                    );
+                    return Ok(Vec::new());
+                }
+                Err(error) => {
+                    crate::gate_trace::line(
+                        "initial-sync",
+                        Some(signal_account),
+                        "fail",
+                        "store-error",
+                    );
+                    return Err(error);
+                }
+            };
+        crate::gate_trace::line(
+            "initial-sync",
+            Some(signal_account),
+            "ok",
+            &format!("forwarded manifestOk={manifest_ok} profilesOk={profiles_ok}"),
+        );
         Ok(vec![HostSideEvent::InitialSyncComplete {
             account_id: account.id.clone(),
             manifest_ok,
@@ -10428,12 +11672,24 @@ impl ConnectorService {
     /// structured deterministic refusals, the proof/identity gates, the
     /// timeout family, the unknown outcome (the red line) — settles plain
     /// failed with no automatic follow-up.
+    ///
+    /// Contract 1.285 §4.269 joins the curve with the two provably-unexecuted
+    /// resource faces: `ENGINE_BUSY` (the in-flight limit rejected the frame
+    /// before dispatch) and `ATTACHMENT_BUSY` (both upload slots stayed
+    /// occupied, so no upload started). Both degraded to the generic upstream
+    /// face before the anchors were claimed and rode `Backoff` there, so the
+    /// automatic follow-up is preserved rather than narrowed. The two
+    /// deterministic faces stay plain `None`: `ENGINE_TIMEOUT` cancelled a
+    /// dispatch future that may already have been written (AGENTS.md: an
+    /// unknown send outcome is never retried automatically), and
+    /// `ATTACHMENT_BUDGET` can stay over budget on the same batch.
     pub(crate) fn auto_retry_schedule(error: &EngineError) -> crate::store::SendRetrySchedule {
         match error {
             EngineError::RateLimited { .. } => crate::store::SendRetrySchedule::RateLimit,
-            EngineError::ServerUnavailable | EngineError::Upstream { .. } => {
-                crate::store::SendRetrySchedule::Backoff
-            }
+            EngineError::ServerUnavailable
+            | EngineError::Upstream { .. }
+            | EngineError::EngineBusy { .. }
+            | EngineError::AttachmentBusy { .. } => crate::store::SendRetrySchedule::Backoff,
             _ => crate::store::SendRetrySchedule::None,
         }
     }
@@ -10771,9 +12027,21 @@ impl ConnectorService {
             .as_deref()
             .map(|text| text.chars().take(120).collect::<String>());
         let increment_unread = direction == "incoming";
-        let inserted =
-            self.store
-                .insert_message(&message, None, preview.as_deref(), increment_unread)?;
+        // 契约 1.283（§4.267）：账本只记「变了什么」。这一行不再序列化整条
+        // 消息投影——回放消费方拿到 (seq, type) 后去读面重取，正文副本不再
+        // 落盘，事件行的写放大从正文量级降到几十字节。
+        let event = crate::store::EventLogWrite {
+            epoch: self.store.account_engine_epoch(&account.id)?.unwrap_or(0),
+            account_id: Some(account.id.clone()),
+            event_type: "message.upserted".to_string(),
+        };
+        let inserted = self.store.insert_message_with_event(
+            &message,
+            None,
+            preview.as_deref(),
+            increment_unread,
+            &event,
+        )?;
         if !inserted {
             // A race lost to the identity check above: `insert_message`'s
             // duplicate arm merged this envelope's descriptor/locator faces
@@ -11546,23 +12814,68 @@ impl ConnectorService {
         let Some(control) = receive.control else {
             return Ok(Vec::new());
         };
+        // SIGNAL-GATE-TRACE-PLAN §2: only the contacts sync shares this
+        // attribution entry with every other control face; its drops below
+        // must be visible (the inbox gate waits on contactSync:complete).
+        let trace_contact_sync = matches!(&control, ControlReceive::SyncContacts { .. });
         // Route to the account the same way messages do.
         let signal_account = match receive.account.as_deref().filter(|s| !s.is_empty()) {
             Some(account) => account.to_string(),
             None => {
                 let accounts = self.store.list_accounts_in_group(owner_group)?;
                 if accounts.len() != 1 {
+                    if trace_contact_sync {
+                        crate::gate_trace::line(
+                            "contact-sync",
+                            None,
+                            "fail",
+                            "account-unresolved group-ambiguous",
+                        );
+                    }
                     return Ok(Vec::new());
                 }
                 match self.store.account_by_id(&accounts[0].id)? {
                     Some(row) => row.signal_account,
-                    None => return Ok(Vec::new()),
+                    None => {
+                        if trace_contact_sync {
+                            crate::gate_trace::line(
+                                "contact-sync",
+                                None,
+                                "fail",
+                                "account-unresolved row-missing",
+                            );
+                        }
+                        return Ok(Vec::new());
+                    }
                 }
             }
         };
-        let account = match self.store.account_by_signal(&signal_account).ok().flatten() {
-            Some(account) => account,
-            None => return Ok(Vec::new()),
+        let account = match self.store.account_by_signal(&signal_account) {
+            Ok(Some(account)) => account,
+            Ok(None) => {
+                if trace_contact_sync {
+                    crate::gate_trace::line(
+                        "contact-sync",
+                        Some(signal_account.as_str()),
+                        "fail",
+                        "account-unresolved unbound",
+                    );
+                }
+                return Ok(Vec::new());
+            }
+            Err(_) => {
+                // The store hiccup already ends the face silently on this
+                // attribution entry; the gate-trace line names it honestly.
+                if trace_contact_sync {
+                    crate::gate_trace::line(
+                        "contact-sync",
+                        Some(signal_account.as_str()),
+                        "fail",
+                        "store-error",
+                    );
+                }
+                return Ok(Vec::new());
+            }
         };
         // §4.37: the view-once open sync names its target by (author ACI,
         // timestamp) across conversations — the envelope's own source is our
@@ -11657,8 +12970,8 @@ impl ConnectorService {
         // addresses its own subjects (the records carry their identities),
         // never an envelope source (the envelope is our own account) — the
         // same interception family as the verified/call-event siblings above.
-        if let ControlReceive::SyncContacts { contacts } = &control {
-            return self.apply_sync_contacts(&account, contacts);
+        if let ControlReceive::SyncContacts { contacts, complete } = &control {
+            return self.apply_sync_contacts(&account, contacts, *complete);
         }
         // Contract 1.175 (§4.175): the backfill-response sync addresses its
         // own target (the face carries its conversation identity), never an
@@ -13998,8 +15311,33 @@ impl ConnectorService {
         &mut self,
         account: &AccountRow,
         contacts: &[crate::engine::SyncContactRecord],
+        complete: bool,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        // The passive attachment changed the contact cache; the 60s sync
+        // throttle must not hide it from the gate's immediate projection.
+        self.store.clear_contacts_synced_at(&account.id)?;
         if contacts.is_empty() {
+            if complete {
+                tracing::warn!(
+                    account_id = %account.id,
+                    "contactSync complete consumed (empty final blob)"
+                );
+                crate::gate_trace::line(
+                    "contact-sync",
+                    Some(account.signal_account.as_str()),
+                    "ok",
+                    "forwarded records=0 complete=true",
+                );
+                return Ok(vec![HostSideEvent::ContactSyncCompleted {
+                    account_id: account.id.clone(),
+                }]);
+            }
+            crate::gate_trace::line(
+                "contact-sync",
+                Some(account.signal_account.as_str()),
+                "-",
+                "partial records=0 complete=false",
+            );
             return Ok(Vec::new());
         }
         let mut synced: Vec<(String, String, String)> = Vec::new();
@@ -14091,6 +15429,29 @@ impl ConnectorService {
             }
         }
         events.extend(merge_events);
+        if complete {
+            tracing::warn!(
+                account_id = %account.id,
+                records = contacts.len(),
+                "contactSync complete consumed"
+            );
+            crate::gate_trace::line(
+                "contact-sync",
+                Some(account.signal_account.as_str()),
+                "ok",
+                &format!("forwarded records={} complete=true", contacts.len()),
+            );
+            events.push(HostSideEvent::ContactSyncCompleted {
+                account_id: account.id.clone(),
+            });
+        } else {
+            crate::gate_trace::line(
+                "contact-sync",
+                Some(account.signal_account.as_str()),
+                "-",
+                &format!("partial records={} complete=false", contacts.len()),
+            );
+        }
         Ok(events)
     }
 
@@ -15565,40 +16926,172 @@ fn early_control_entry(
     })
 }
 
+/// Which answer a slot's commit-time state earns.
+enum LinkSlotVerdict {
+    Live,
+    Lost,
+    Expired,
+    Unknown,
+}
+
+impl LinkSlotVerdict {
+    fn of(session: &ActiveLinkSession, link_session_id: &str, at_ms: u64) -> Self {
+        let Some(slot) = session.slot(link_session_id) else {
+            return Self::Unknown;
+        };
+        match slot.state {
+            // QR B1: a lost slot is addressable (so finish/cancel answer the
+            // definite LINK_LOST) but can never commit. A retired slot — the
+            // rotation dropped it — can never commit either.
+            LinkSlotState::Lost | LinkSlotState::Retired => Self::Lost,
+            LinkSlotState::Pending if session.is_expired(at_ms) => Self::Expired,
+            LinkSlotState::Pending => Self::Live,
+        }
+    }
+}
+
 impl ConnectorService {
+    /// The dispatch-time gate shared by finish, cancel, and the finish pin:
+    /// only a live slot proceeds; every other state answers its own definite
+    /// code. Expiry is consumed here exactly like before QR B1 (the next
+    /// link.start simply mints a fresh attempt).
     fn require_active_link(
         &mut self,
         link_session_id: &str,
     ) -> Result<&ActiveLinkSession, ServiceError> {
-        match self.link.as_ref() {
-            Some(session) if session.session_id == link_session_id => {
-                if session.is_expired(now_ms()) {
-                    self.link = None;
-                    return Err(ServiceError::Api(ApiError::new(
-                        "LINK_EXPIRED",
-                        "link session has expired",
-                        false,
-                    )));
-                }
+        let verdict = match self.link.as_ref() {
+            Some(session) => LinkSlotVerdict::of(session, link_session_id, now_ms()),
+            None => LinkSlotVerdict::Unknown,
+        };
+        match verdict {
+            LinkSlotVerdict::Live => Ok(self.link.as_ref().expect("link slot present")),
+            LinkSlotVerdict::Lost => Err(link_lost_error()),
+            LinkSlotVerdict::Expired => {
+                self.link = None;
+                Err(link_expired_error())
             }
-            Some(_) | None => {
-                return Err(ServiceError::Api(ApiError::new(
-                    "LINK_NOT_FOUND",
-                    "link session was not found",
-                    false,
-                )));
-            }
+            LinkSlotVerdict::Unknown => Err(link_not_found_error()),
         }
-        Ok(self.link.as_ref().expect("link session present"))
     }
 
-    fn take_link_session(
+    /// The commit's own gate. Every slot that still exists may commit — a
+    /// rotation that retired this very code while `finishLink` was in flight
+    /// must not lose the engine's committed result (contract 1.286, §4.272) —
+    /// while a slot the engine reported dead still answers LINK_LOST and an
+    /// expired attempt LINK_EXPIRED.
+    ///
+    /// Retired is not lost. Only `Lost` is the engine saying that provisioning
+    /// channel died before an approval; a `Retired` code was dropped by this
+    /// connector's own rotation while the engine was still completing the
+    /// finish, so the commit accepts it and journals the account under every
+    /// slot id of the attempt (the retired code then replays it).
+    ///
+    /// Returns the accepting slot so the commit can journal the retired-code
+    /// acceptance at the point the commit is actually taken — this gate runs
+    /// twice per commit (once before the commit-time refusals, once inside
+    /// `take_link_attempt`), so it must not log on its own.
+    fn require_link_slot_for_commit(
+        &mut self,
+        link_session_id: &str,
+    ) -> Result<(LinkSlotState, u32), ServiceError> {
+        let (state, slot_number, expired) = match self.link.as_ref() {
+            Some(session) => match session.slot(link_session_id) {
+                Some(slot) => (slot.state, slot.slot, session.is_expired(now_ms())),
+                None => return Err(link_not_found_error()),
+            },
+            None => return Err(link_not_found_error()),
+        };
+        if state == LinkSlotState::Lost {
+            return Err(link_lost_error());
+        }
+        if expired {
+            self.link = None;
+            return Err(link_expired_error());
+        }
+        Ok((state, slot_number))
+    }
+
+    /// Take the attempt out of the table for its single commit (or for a
+    /// commit-time refusal that spends it). It re-runs the **commit** gate,
+    /// never the dispatch gate: `require_active_link` folds Retired into Lost
+    /// and would therefore throw away an engine result the commit gate just
+    /// accepted — the in-flight finish whose code a rotation retired
+    /// (contract 1.286, §4.272). Lost still answers LINK_LOST here.
+    fn take_link_attempt(
         &mut self,
         link_session_id: &str,
     ) -> Result<ActiveLinkSession, ServiceError> {
-        let _ = self.require_active_link(link_session_id)?;
-        Ok(self.link.take().expect("link session present"))
+        self.require_link_slot_for_commit(link_session_id)?;
+        Ok(self.link.take().expect("link attempt present"))
     }
+}
+
+/// Error faces the link gates share, so their wire codes cannot drift between
+/// the dispatch-time gate and the commit-time gate.
+fn link_lost_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "LINK_LOST",
+        "link session was lost; start a new link",
+        true,
+    ))
+}
+
+fn link_expired_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "LINK_EXPIRED",
+        "link session has expired",
+        false,
+    ))
+}
+
+fn link_not_found_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "LINK_NOT_FOUND",
+        "link session was not found",
+        false,
+    ))
+}
+
+/// `link.rotate` for an attempt this connector does not hold (contract 1.286,
+/// §4.272): a wrong id, a replaced attempt, or one already consumed.
+fn link_attempt_not_found_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "LINK_ATTEMPT_NOT_FOUND",
+        "link attempt was not found",
+        false,
+    ))
+}
+
+fn link_attempt_committed_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "INVALID_REQUEST",
+        "this link attempt is already committed; start a new link instead",
+        false,
+    ))
+}
+
+/// The live slots of one attempt, oldest first, on the `link.rotate` wire
+/// shape (`[{deviceLinkUri, slot}]`). Retired and lost slots are omitted: the
+/// host renders codes, and a dead code is never rendered.
+pub fn live_link_slots(session: &ActiveLinkSession) -> Vec<Value> {
+    session
+        .live_slots()
+        .map(|slot| json!({ "deviceLinkUri": slot.uri(), "slot": slot.slot }))
+        .collect()
+}
+
+/// One `link.rotate` outcome: the new slot plus the attempt's live codes.
+#[derive(Debug)]
+pub struct LinkRotate {
+    pub link_attempt_id: String,
+    pub link_session_id: String,
+    pub device_link_uri: String,
+    pub slot: u32,
+    /// The slot number this rotation retired (the attempt's oldest live code),
+    /// when the third code pushed it out.
+    pub retired: Option<u32>,
+    pub slots: Vec<Value>,
+    pub expires_at_ms: u64,
 }
 
 #[derive(Debug)]
@@ -16180,6 +17673,28 @@ pub struct DeviceList {
     pub devices: Vec<DeviceEntry>,
 }
 
+/// The closed phase vocabulary of the engine's `getSyncState` projection
+/// (contract revision 1.286, §4.281): the login-window sync arm's three
+/// halves. `idle` = no window (or the one-shot window already elapsed),
+/// `inflight` = window open and that half unsettled, `done`/`failed` = the
+/// observed settle face. The connector never invents a fifth word.
+pub const SYNC_STATE_PHASES: [&str; 4] = ["idle", "inflight", "done", "failed"];
+
+/// The §4.281 result of `accounts.getSyncState` (contract revision 1.286):
+/// the engine's read-only login-window projection verbatim — the three half
+/// phases plus `sinceMs` (the current window's opening epoch-ms, the
+/// consumer's freshness anchor: a window opened before the caller's own
+/// gate/activation is a stale face). Purely read-only: nothing persisted,
+/// nothing logged, repeated calls answer the same face.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSyncState {
+    pub contacts: String,
+    pub storage: String,
+    pub profile: String,
+    pub since_ms: u64,
+}
+
 /// The §4.47 result of `conversations.getAvatar` (contract revision 1.48):
 /// the decrypted avatar as a data URI (MIME sniffed engine-side from the
 /// magic bytes, `application/octet-stream` when unrecognized) plus the
@@ -16379,6 +17894,24 @@ pub struct AccountDeleteLocalDataParams {
     pub operation_id: Option<String>,
 }
 
+/// events.list params (contract 1.283, §4.267). All three keys are optional:
+/// a bare request is a cold start and answers a reset, so the host's very first
+/// call is the same shape as every later poll. Unknown keys fail closed (the
+/// same deny_unknown_fields discipline as the neighbouring param structs).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventsListParams {
+    /// The last seq the caller applied. Absent on a cold start.
+    pub after_seq: Option<i64>,
+    /// The token the previous page handed back. A mismatch means the ledger
+    /// rotated (fresh store, upgrade, account deletion) and the caller must
+    /// reload instead of resuming.
+    pub token: Option<String>,
+    /// Page size, 1..=500; absent means 100. The response byte budget is a
+    /// second, independent bound.
+    pub limit: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LinkStartParams {
@@ -16393,6 +17926,16 @@ pub struct LinkStartParams {
 #[serde(rename_all = "camelCase")]
 pub struct LinkSessionParams {
     pub link_session_id: String,
+}
+
+/// `link.rotate` params (contract 1.286, §4.272): the attempt to rotate, by
+/// the `linkAttemptId` `link.start` answered. Slots are addressed afterwards
+/// by their own `linkSessionId` (the rotate answer carries it), exactly like
+/// the pre-rotate single slot.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkRotateParams {
+    pub link_attempt_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -17025,6 +18568,18 @@ pub struct MessagesSendAttachmentParams {
     /// INVALID_REQUEST.
     #[serde(default)]
     pub gif: bool,
+    /// 声明尺寸（BUG-11 wire 批，契约 1.294 §4.284）：发送侧测量到的图片/
+    /// 视频自然像素尺寸。两键双参同进退（只给一边 = INVALID_REQUEST，半边
+    /// 声明对渲染面零信息量），各自 1..=[MAX_ATTACHMENT_DIMENSION_PX]。成对
+    /// 时上游 data URI 增 ";width=<px>;height=<px>" 两参数（engine 上传返回
+    /// 后置位 AttachmentPointer.width/height，接收投影同位读回），同时落
+    /// pending 行 descriptor 的 width/height——发送方自己的气泡从首个 tick
+    /// 即终态盒，不必等回波测量。单数形态键：与 §4.59 复数 attachments 数组
+    /// 同置 = INVALID_REQUEST（复数面条目自带两键）。
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
     /// §4.59 plural attachment payloads (contract revision 1.66): one
     /// upstream `send` carries every entry's data URI in its array-typed
     /// `attachments` parameter — the official forward face merges a multi-
@@ -17058,6 +18613,13 @@ pub struct MessagesSendAttachmentEntry {
     pub blur_hash: Option<String>,
     #[serde(default)]
     pub gif: bool,
+    /// 条目级声明尺寸（BUG-11 wire 批，契约 1.294 §4.284）：与单数形态
+    /// width/height 同语义同值域，双参同进退；成对时该条 data URI 增
+    /// ";width=<px>;height=<px>"，descriptor 同步记录两键。
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
 }
 
 /// `messages.sendSticker` image payload (contract revision 1.35, §4.31): the
@@ -17355,6 +18917,15 @@ pub struct AccountsDeviceCapabilitiesParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountsGetDevicesParams {
+    pub account_id: String,
+}
+
+/// `accounts.getSyncState` params (contract revision 1.286, §4.281): one
+/// account, resolved to its engine session by the prepare step — the face
+/// itself is a pure read.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountsGetSyncStateParams {
     pub account_id: String,
 }
 
@@ -17803,14 +19374,22 @@ pub struct MessageRequestParams {
     pub conversation_id: String,
 }
 
-/// `identities.get` params (contract revision 1.68, §4.61): the same
-/// addressing pair as the §4.47/§4.56 faces — the identity is addressed by
-/// the conversation it belongs to, the way the official details row does.
+/// `identities.get` params (contract revision 1.68, §4.61; the peer arm
+/// added by contract revision 1.281, §4.265): two addressing forms, exactly
+/// one per request. `conversationId` is the original face — the identity of
+/// the 1:1 conversation resolved from the local store, the way the official
+/// details row does. `peerKey` addresses the peer itself (an ACI UUID or an
+/// E.164 number) and reads the account's identity store directly, so a peer
+/// with no direct conversation row is addressable too (the host asks about
+/// someone before any thread exists). Both at once or neither answers
+/// INVALID_REQUEST fail-closed; the shape decode is
+/// [`identities_addressing`], the single point both faces share.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IdentitiesGetParams {
     pub account_id: String,
-    pub conversation_id: String,
+    pub conversation_id: Option<String>,
+    pub peer_key: Option<String>,
 }
 
 /// `identities.verify` params (contract revision 1.68, §4.61): the
@@ -17828,16 +19407,122 @@ pub enum IdentitiesVerifyIntent {
     TrustDefault,
 }
 
-#[derive(serde::Deserialize)]
+/// `identities.verify` 的 wire 形状（契约 §4.61 / §4.223）：camelCase 键名 +
+/// 未知键 fail-closed——`state` 落地时（8dc7ed3）这两个 serde 属性被连带
+/// 丢掉过一版，实测所有 camelCase 请求都折成 INVALID_REQUEST，本条注释把
+/// 它们钉在形状上。
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IdentitiesVerifyParams {
     pub account_id: String,
-    pub conversation_id: String,
+    /// 契约 §4.265 寻址两臂（同 identities.get）：`conversationId` 旧面，
+    /// `peerKey` 无会话面（ACI UUID 或 E.164）。恰一，形状解码走
+    /// [`identities_addressing`]。
+    pub conversation_id: Option<String>,
+    pub peer_key: Option<String>,
     /// 契约 §4.223：safety_number 与 state 两臂恰一。
     /// safety_number = 官方「标记为已验证」（verifiedSafetyNumber 形，比对闸）；
     /// state = 官方 sendAnyway 的信任重置（"default"，无数字比对）。
     /// 双臂同置或双缺 = INVALID_REQUEST（fail-closed，同 engine trust 语义）。
     pub safety_number: Option<String>,
     pub state: Option<String>,
+}
+
+/// 契约 §4.223 两臂解码（wire 形状 → 路由意图）：`safetyNumber` 与
+/// `state` 两臂恰一，双臂同置 / 双缺 / 词表外 state 一律 INVALID_REQUEST
+/// （fail-closed，同 engine `trust` 的 `(verified, state)` 解析语义）。
+/// 单点纯函数：supervisor 路由与单测共用同一实现，避免"文档写两臂恰一、
+/// 代码只认一半"的漂移。
+pub(crate) fn identities_verify_intent(
+    safety_number: Option<&str>,
+    state: Option<&str>,
+) -> Result<IdentitiesVerifyIntent, ApiError> {
+    match (safety_number, state) {
+        (Some(code), None) => Ok(IdentitiesVerifyIntent::Verified {
+            safety_number: code.to_string(),
+        }),
+        (None, Some("default")) => Ok(IdentitiesVerifyIntent::TrustDefault),
+        _ => Err(ApiError::new(
+            "INVALID_REQUEST",
+            "exactly one of safetyNumber or state=\"default\" is required",
+            false,
+        )),
+    }
+}
+
+/// `identities.get` / `identities.verify` 的寻址目标（契约 1.281,
+/// §4.265）：旧面按会话 id 寻址（§4.61 原生形），新面按 peer 键直接寻址
+/// （ACI UUID 或 E.164）——peer 还没有 direct 会话时也能读身份、写信任。
+/// 内部路由类型，不上 wire。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentitiesTarget<'a> {
+    Conversation(&'a str),
+    Peer(&'a str),
+}
+
+/// 契约 §4.265 的寻址解码（wire 形状 → 路由目标）：`conversationId` 与
+/// `peerKey` 恰一——双缺 / 同置一律 INVALID_REQUEST（fail-closed，与 §4.12
+/// `conversationId` vs `kind+peerKey` 的恰一纪律同源）。`conversationId`
+/// 保持 §4.61 的 1..=256 界；`peerKey` 只认 ACI UUID 或 E.164。
+/// 单点纯函数：supervisor 路由、service 装配与单测共用同一实现，避免
+/// 「schema 写恰一、代码只认一半」的漂移。
+pub(crate) fn identities_addressing<'a>(
+    conversation_id: Option<&'a str>,
+    peer_key: Option<&'a str>,
+) -> Result<IdentitiesTarget<'a>, ApiError> {
+    match (conversation_id, peer_key) {
+        (Some(conversation_id), None) => {
+            if conversation_id.is_empty()
+                || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+            {
+                return Err(ApiError::new(
+                    "INVALID_REQUEST",
+                    "conversationId must contain between 1 and 256 characters",
+                    false,
+                ));
+            }
+            Ok(IdentitiesTarget::Conversation(conversation_id))
+        }
+        (None, Some(peer_key)) => {
+            if !identity_peer_key_shaped(peer_key) {
+                return Err(ApiError::new(
+                    "INVALID_REQUEST",
+                    "peerKey must be an ACI UUID or an E.164 phone number",
+                    false,
+                ));
+            }
+            Ok(IdentitiesTarget::Peer(peer_key))
+        }
+        _ => Err(ApiError::new(
+            "INVALID_REQUEST",
+            "exactly one of conversationId or peerKey must be provided",
+            false,
+        )),
+    }
+}
+
+/// 契约 §4.265 peerKey 形状闸：ACI UUID（8-4-4-4-12 十六进制，大小写不
+/// 敏感，[engine::is_uuid_shaped] 的 §4.40 词形）或 E.164（`+` 加 7..15 位
+/// 数字，引擎 `is_valid_e164` 的同一形状，[is_e164_phone_number_shape]
+/// 单点复用）。上界走 [IDENTITY_PEER_KEY_MAX_CHARS]。用户名 / `PNI:` /
+/// 组 master key 都不在这条面的语法里——peerKey 是协议身份，不是任意
+/// recipient 拼写。
+fn identity_peer_key_shaped(peer_key: &str) -> bool {
+    peer_key.chars().count() <= IDENTITY_PEER_KEY_MAX_CHARS
+        && (crate::engine::is_uuid_shaped(peer_key) || is_e164_phone_number_shape(peer_key))
+}
+
+/// 契约 §4.244 写穿词（verify 成功后的本地投影 post-image）：verified 臂
+/// → TRUSTED_VERIFIED（引擎 `trust verifiedSafetyNumber` 的后像）；信任
+/// 重置臂（state "default"，官方 `#_setVerified(DEFAULT)` 同位）→
+/// TRUSTED_UNVERIFIED。**不是** verified：官方 sendAnyway 只写 DEFAULT
+/// （+ nonblocking approval 位），从不写 VERIFIED；本函数是这条"别名不
+/// 越权"语义的单点表达。
+pub(crate) fn identity_verify_stamp_word(intent: &IdentitiesVerifyIntent) -> &'static str {
+    match intent {
+        IdentitiesVerifyIntent::Verified { .. } => "TRUSTED_VERIFIED",
+        IdentitiesVerifyIntent::TrustDefault => "TRUSTED_UNVERIFIED",
+    }
 }
 
 /// One projected identity row (contract revision 1.68, §4.61; contract
@@ -19120,6 +20805,56 @@ fn validate_blur_hash(blur_hash: Option<&str>) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// 出向声明尺寸校验（BUG-11 wire 批，契约 1.294 §4.284）：两键双参同进退
+/// （全缺 = 未声明，旧形状逐字节不变；只有半边 = INVALID_REQUEST，半边尺寸
+/// 对渲染面无意义）、各自正整数且 ≤ MAX_ATTACHMENT_DIMENSION_PX（与
+/// messages.setAttachmentDimensions 的官方域同界）。返回成对值供 data URI
+/// 参数面 / descriptor 面消费；纯函数，可重复调用（host 形状闸与 service
+/// 准备腿各判一次，口径唯一）。
+pub(crate) fn validate_attachment_dimensions(
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<Option<(u32, u32)>, ServiceError> {
+    match (width, height) {
+        (None, None) => Ok(None),
+        (Some(width), Some(height)) => {
+            if width < 1 || height < 1 {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "width and height must be positive integers",
+                    false,
+                )));
+            }
+            if width > MAX_ATTACHMENT_DIMENSION_PX || height > MAX_ATTACHMENT_DIMENSION_PX {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "width and height must not exceed 16384",
+                    false,
+                )));
+            }
+            Ok(Some((width, height)))
+        }
+        _ => Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "width and height must be provided together",
+            false,
+        ))),
+    }
+}
+
+/// 已配对尺寸的边界复核（service 侧防御，契约 1.294 §4.284）：host 形状闸
+/// 已用 [validate_attachment_dimensions] 拒绝半边形态，service 收货时类型
+/// 本身已保证成对，这里只复核值域——越界照旧 INVALID_REQUEST，绝不把渲染
+/// 面用不上的数字写进 data URI 或 descriptor。
+pub(crate) fn validate_attachment_dimensions_pair(
+    dimensions: Option<(u32, u32)>,
+) -> Result<Option<(u32, u32)>, ServiceError> {
+    match dimensions {
+        None => Ok(None),
+        Some((width, height)) => validate_attachment_dimensions(Some(width), Some(height)),
+    }
+}
+
 /// At most one preview per send upstream (signal-cli builds `List.of(one)`);
 /// extras are ignored, `None`/empty list means no preview.
 fn previews_to_upstream(
@@ -19534,6 +21269,145 @@ fn validate_attachment_send_payload(
         )));
     }
     Ok(())
+}
+
+/// 契约 1.279（§4.263）：payload 对是「要么都带、要么都不带」。重试缺省不带
+/// 时从 payload 表还原；只带一半是调用方形状错误，确定性拒绝。
+fn validate_attachment_payload_pair(
+    data_base64: Option<&str>,
+    size_bytes: Option<u64>,
+) -> Result<(), ServiceError> {
+    match (data_base64, size_bytes) {
+        (Some(data_base64), Some(size_bytes)) => {
+            validate_attachment_send_payload(data_base64, size_bytes)
+        }
+        (None, None) => Ok(()),
+        _ => Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "dataBase64 and sizeBytes must be provided together",
+            false,
+        ))),
+    }
+}
+
+/// The shared §4.12 attachment-send metadata corpus (contract revision 1.278,
+/// §4.262; split from the payload half in 1.279, §4.263): every descriptor,
+/// flag composition and identifier shape the singular attachment face checks.
+/// The retry runs it once, after the caller-supplied or persisted faces are
+/// resolved, so a stored voice/gif marker or content type can never slip past
+/// the flag gates. Returns the validated caption (the caller's text folded to
+/// ""), so neither caller derives it a second time.
+///
+/// Order is the contract's own: filename, media type, blur hash, then the flag
+/// compositions (voiceNote's audio/*; viewOnce's photo-or-video, no caption,
+/// no quote, no voice flag), then the caption byte bound, then the identifier
+/// bounds. A caller that stops at any of these points has written nothing —
+/// which is exactly what keeps a rejected request reusable under the same
+/// clientRequestId (first send) and leaves the failed row untouched and
+/// retryable (retry).
+#[allow(clippy::too_many_arguments)]
+fn validate_attachment_send_metadata<'a>(
+    client_request_id: &str,
+    filename: Option<&str>,
+    content_type: Option<&str>,
+    text: Option<&'a str>,
+    quote_message_id: Option<&str>,
+    voice_note: bool,
+    view_once: bool,
+    blur_hash: Option<&str>,
+) -> Result<&'a str, ServiceError> {
+    validate_attachment_descriptor(filename, "filename")?;
+    validate_attachment_content_type(content_type)?;
+    // §4.127: the blur placeholder rides the descriptor verbatim; the
+    // bound is the receive face's own constant (one constant, both
+    // directions), enforced before the pending row exists.
+    validate_blur_hash(blur_hash)?;
+    // §4.30: the voice flag requires an audio attachment — the official
+    // recorder only produces audio, and a non-audio voice flag would
+    // render as an unplayable bubble. Deterministic rejection before the
+    // pending row exists.
+    if voice_note && !content_type.is_some_and(|value| value.starts_with("audio/")) {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "voiceNote requires an audio/* contentType",
+            false,
+        )));
+    }
+    // §4.36: the view-once flag requires a photo or video, no caption, no
+    // quote, and no voice flag — the official view-once faces, enforced
+    // deterministically before the pending row exists (the single-
+    // attachment structure of §4.12 makes the combination unambiguous).
+    if view_once {
+        if !content_type
+            .is_some_and(|value| value.starts_with("image/") || value.starts_with("video/"))
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "viewOnce requires an image/* or video/* contentType",
+                false,
+            )));
+        }
+        if voice_note {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "viewOnce and voiceNote are mutually exclusive",
+                false,
+            )));
+        }
+        if quote_message_id.is_some() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "viewOnce does not support quoteMessageId",
+                false,
+            )));
+        }
+        if text.is_some_and(|caption| !caption.is_empty()) {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "viewOnce does not support a caption",
+                false,
+            )));
+        }
+    }
+    let caption = text.unwrap_or_default();
+    if !caption.is_empty() {
+        validate_text(caption)?;
+    }
+    validate_opaque_id(client_request_id, "clientRequestId")?;
+    if let Some(quote) = quote_message_id {
+        validate_opaque_id(quote, "quoteMessageId")?;
+    }
+    Ok(caption)
+}
+
+/// The singular attachment-send validation entry (the first send's full
+/// corpus): payload/declared-size pair first (contract 1.279, §4.263 made the
+/// pair optional on the retry face, which validates it separately before any
+/// store read), then the metadata corpus above.
+#[allow(clippy::too_many_arguments)]
+fn validate_attachment_send_request<'a>(
+    client_request_id: &str,
+    data_base64: Option<&str>,
+    size_bytes: Option<u64>,
+    filename: Option<&str>,
+    content_type: Option<&str>,
+    text: Option<&'a str>,
+    quote_message_id: Option<&str>,
+    voice_note: bool,
+    view_once: bool,
+    blur_hash: Option<&str>,
+) -> Result<&'a str, ServiceError> {
+    validate_attachment_payload_pair(data_base64, size_bytes)?;
+    validate_attachment_send_metadata(
+        client_request_id,
+        filename,
+        content_type,
+        text,
+        quote_message_id,
+        voice_note,
+        view_once,
+        blur_hash,
+    )
 }
 
 /// Encode standard padded base64 — the same canonical form
@@ -20181,6 +22055,33 @@ pub(crate) fn device_list_from_engine(result: &Value) -> Result<DeviceList, Serv
     Ok(DeviceList { devices: projected })
 }
 
+/// Parse the engine's `getSyncState` result (contract revision 1.286,
+/// §4.281). Shape gate (the storagePull discipline): the three phases must be
+/// strings from the closed vocabulary and `sinceMs` a non-negative integer —
+/// anything else is a protocol defect (UPSTREAM_PROTOCOL_ERROR), never a
+/// guessed face.
+/// Unknown sibling keys ride ignored (additive tolerance: the connector
+/// projects the pinned four and never forwards an unpinned key).
+pub(crate) fn sync_state_from_engine(result: &Value) -> Result<AccountSyncState, ServiceError> {
+    fn phase(face: &Value, key: &str) -> Result<String, ServiceError> {
+        face.get(key)
+            .and_then(Value::as_str)
+            .filter(|word| SYNC_STATE_PHASES.contains(word))
+            .map(str::to_owned)
+            .ok_or(ServiceError::Engine(EngineError::Protocol))
+    }
+    let since_ms = result
+        .get("sinceMs")
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    Ok(AccountSyncState {
+        contacts: phase(result, "contacts")?,
+        storage: phase(result, "storage")?,
+        profile: phase(result, "profile")?,
+        since_ms,
+    })
+}
+
 /// Parse the engine's `createGroup` result (contract revision 1.126,
 /// §4.107): `{groupId, revision}` — the new group master key (standard
 /// base64) and the fresh revision. A missing or non-string groupId, or a
@@ -20336,6 +22237,62 @@ fn validate_avatar_data_uri(data_uri: &str) -> Result<String, ServiceError> {
     Ok(data_uri.to_string())
 }
 
+/// 一次重试真正要重发的字节与描述面：调用方提供 bytes 时全部来自调用方，
+/// 否则字节来自 payload 表、描述面来自消息行自己的 descriptor。多附件消息的
+/// 每个条目各解出一个（契约 1.280，§4.264）。
+struct ResolvedAttachmentPayload {
+    data_base64: String,
+    size_bytes: u64,
+    content_type: Option<String>,
+    filename: Option<String>,
+    voice: bool,
+    gif: bool,
+    blur_hash: Option<String>,
+    /// 契约 1.294 §4.284：声明尺寸（调用方重述优先，否则行 descriptor 的
+    /// 既有 width/height 对）。ids-only 重发从行面恢复，所以一份首发带尺寸
+    /// 的失败附件在刷新/重启后重试仍带同一对声明。
+    dimensions: Option<(u32, u32)>,
+}
+
+/// 契约 1.279（§4.263）：把 payload 表里存下的 RFC 2397 data URI 还原成重试
+/// 需要的字节与大小。只接受本连接器自己 build_attachment_data_uri 产出的
+/// 形状（data:<mime>[;voice=true][;gif=true][;filename=...];base64,<payload>）；
+/// 解析失败 = 存储损坏，拒绝而不是猜。size 由解码长度得出，不信任 URI 里的
+/// 任何声明；其余描述面（filename/contentType/voice/gif）以消息行自己的
+/// descriptor 为准，避免 URI 默认值覆盖首发时确实缺席的字段。
+struct StoredAttachmentPayload {
+    data_base64: String,
+    size_bytes: u64,
+}
+
+fn parse_attachment_data_uri(data_uri: &str) -> Result<StoredAttachmentPayload, ServiceError> {
+    fn invalid(detail: &'static str) -> ServiceError {
+        ServiceError::Api(ApiError::new("RETRY_NOT_ALLOWED", detail, false))
+    }
+    let Some(rest) = data_uri.strip_prefix("data:") else {
+        return Err(invalid("the stored attachment payload is not a data URI"));
+    };
+    let Some(separator) = rest.rfind(";base64,") else {
+        return Err(invalid(
+            "the stored attachment payload is not a base64 data URI",
+        ));
+    };
+    let payload = &rest[separator + ";base64,".len()..];
+    let mut decoded = Vec::with_capacity(payload.len() / 4 * 3);
+    if base64_decode_to_vec(payload, &mut decoded).is_err()
+        || decoded.is_empty()
+        || decoded.len() > MAX_ATTACHMENT_BYTES
+    {
+        return Err(invalid(
+            "the stored attachment payload is invalid or over the 100 MiB budget",
+        ));
+    }
+    Ok(StoredAttachmentPayload {
+        data_base64: payload.to_string(),
+        size_bytes: decoded.len() as u64,
+    })
+}
+
 /// Build the RFC 2397 data URI the pinned upstream accepts
 /// (AttachmentHelper: `data:<mime>;filename=<name>;base64,<payload>`). The
 /// payload is re-encoded from the already-validated base64 — decoding first
@@ -20347,12 +22304,20 @@ fn validate_avatar_data_uri(data_uri: &str) -> Result<String, ServiceError> {
 /// `gif` appends the `;gif=true` parameter (§4.147), which the engine maps
 /// to the official `Flags.GIF=8` bit — both flags are verbatim statement
 /// parameters the connector never interprets.
+/// `dimensions` (BUG-11 wire 批, 契约 1.294 §4.284) appends
+/// `;width=<px>;height=<px>` — the sender's measured pixel size, verbatim
+/// transit material: the engine parses the pair and post-sets
+/// `AttachmentPointer.width/height` on the uploaded pointer (the GIF/voice
+/// precedent), so the receive side carries the declared size from the first
+/// frame and the desktop's measurement chain degrades to a pure fallback.
+/// `None` appends nothing — every pre-1.294 payload stays byte-identical.
 fn build_attachment_data_uri(
     base64_data: &str,
     filename: Option<&str>,
     content_type: Option<&str>,
     voice: bool,
     gif: bool,
+    dimensions: Option<(u32, u32)>,
 ) -> Result<String, ServiceError> {
     let mut decoded = Vec::with_capacity(base64_data.len() / 4 * 3);
     base64_decode_to_vec(base64_data, &mut decoded).map_err(|_| {
@@ -20362,6 +22327,15 @@ fn build_attachment_data_uri(
             false,
         ))
     })?;
+    // 契约 1.294 观测点：只在这个单点记录「本次出站是否带声明尺寸」，无内容、
+    // 无号码；CONTEXT: 真机验收 BUG-11 wire 时用它确认渲染层尺寸确实到 wire。
+    if let Some((width, height)) = dimensions {
+        tracing::info!(
+            width,
+            height,
+            "outgoing attachment carries declared dimensions"
+        );
+    }
     use std::fmt::Write as _;
     let mut uri = String::with_capacity(decoded.len() / 3 * 4 + 64);
     uri.push_str("data:");
@@ -20371,6 +22345,12 @@ fn build_attachment_data_uri(
     }
     if gif {
         uri.push_str(";gif=true");
+    }
+    // 契约 1.294 §4.284（BUG-11 wire 批）：声明尺寸参数排在 gif 之后、
+    // filename 之前——纯附加参数，engine 侧按参数名解析，次序仅钉定本仓
+    // 产出的字节形状（既有形状不带两参数，逐字节不变）。
+    if let Some((width, height)) = dimensions {
+        let _ = write!(uri, ";width={width};height={height}");
     }
     if let Some(filename) = filename {
         uri.push_str(";filename=");
@@ -20424,6 +22404,37 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
         (temp, ConnectorService::new(Arc::new(store)))
+    }
+
+    #[derive(Clone, Default)]
+    struct GateTraceBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for GateTraceBuffer {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for GateTraceBuffer {
+        type Writer = GateTraceBuffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured_gate_trace(log: impl FnOnce()) -> String {
+        let buffer = GateTraceBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, log);
+        String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
     }
 
     /// A minimal incoming `MessageRecord` for report-spam preparation tests;
@@ -21323,6 +23334,311 @@ mod tests {
         );
     }
 
+    /// Contract 1.276 (§4.260): a repeated finish with the same
+    /// linkSessionId replays the committed account instead of asking the
+    /// phone again or minting a second binding.
+    #[test]
+    fn repeated_finish_same_link_session_replays_committed_account() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?test".into())
+            .unwrap();
+        let link_session_id = started["linkSessionId"].as_str().unwrap().to_string();
+
+        let first = service
+            .complete_link_session(&link_session_id, "+15555550100", group, None)
+            .unwrap();
+        let second = service
+            .complete_link_session(&link_session_id, "+15555550100", group, None)
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 1);
+    }
+
+    /// Contract 1.286 (§4.272): `link.start` keeps the pre-rotate wire
+    /// (linkSessionId = slot 0's id, qrPayload = its code) and adds the
+    /// attempt face. A pre-rotate host that only reads linkSessionId/qrPayload
+    /// keeps working unchanged.
+    #[test]
+    fn begin_link_answers_the_attempt_face_beside_the_single_slot() {
+        let (_temp, mut service) = service();
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?uuid=slot0".into())
+            .unwrap();
+        let link_session_id = started["linkSessionId"].as_str().unwrap();
+        assert!(!link_session_id.is_empty());
+        assert!(
+            started["linkAttemptId"]
+                .as_str()
+                .is_some_and(|attempt| !attempt.is_empty()),
+            "the attempt id always rides the answer: {started}"
+        );
+        assert_ne!(started["linkAttemptId"].as_str(), Some(link_session_id));
+        assert_eq!(started["qrPayload"], "sgnl://link?uuid=slot0");
+        assert_eq!(started["deviceLinkUri"], "sgnl://link?uuid=slot0");
+        assert_eq!(
+            started["slots"],
+            serde_json::json!([{ "deviceLinkUri": "sgnl://link?uuid=slot0", "slot": 0 }])
+        );
+        assert!(
+            service.has_link_session(link_session_id),
+            "slot 0 is addressable by the historical id"
+        );
+    }
+
+    /// Contract 1.286 (§4.272): two rotations fill both live slots; the third
+    /// retires the oldest code, which stays addressable but is no longer
+    /// scannable.
+    #[test]
+    fn a_third_rotation_retires_the_oldest_live_slot() {
+        let (_temp, mut service) = service();
+        let (attempt, first) = service.plant_link_attempt_for_test(
+            "KT",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let second = service
+            .attach_rotated_slot(&attempt, "sgnl://link?second".into(), now_ms())
+            .unwrap();
+        assert_eq!(second.slot, 1);
+        assert_eq!(second.retired, None);
+        assert_eq!(second.slots.len(), 2);
+        let second_session = second.link_session_id.clone();
+
+        let third = service
+            .attach_rotated_slot(&attempt, "sgnl://link?third".into(), now_ms())
+            .unwrap();
+        assert_eq!(third.slot, 2);
+        assert_eq!(third.retired, Some(0), "slot 0 is the oldest live code");
+        assert_eq!(third.slots.len(), 2, "never more than two live codes");
+        let live = service.live_link_slots_for_test();
+        assert_eq!(
+            live.iter().map(|(slot, _)| *slot).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(live[0].1, second_session);
+        assert!(
+            service.has_link_session(&first),
+            "a retired slot keeps routing (the finish answers LINK_LOST, not              LINK_NOT_FOUND)"
+        );
+        assert_eq!(
+            service.live_slots_uri_for_test(),
+            vec![
+                "sgnl://link?second".to_string(),
+                "sgnl://link?third".to_string()
+            ]
+        );
+    }
+
+    /// Contract 1.286 (§4.272): any live slot finishes the attempt and the
+    /// commit happens exactly once; the other codes then replay the same
+    /// account instead of minting a second binding.
+    #[test]
+    fn any_slot_finishes_and_the_attempt_commits_once() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let (attempt, first) = service.plant_link_attempt_for_test(
+            "KT",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let second = service
+            .attach_rotated_slot(&attempt, "sgnl://link?second".into(), now_ms())
+            .unwrap();
+
+        let committed = service
+            .complete_link_session_with_id(
+                &second.link_session_id,
+                "+15555550100",
+                group,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 1);
+
+        // The attempt stays addressable: every code replays the commit.
+        let replay = service
+            .complete_link_session_with_id(&first, "+15555550100", group, None, None)
+            .unwrap();
+        assert_eq!(replay.id, committed.id);
+        let replay_from_rotated = service
+            .complete_link_session_with_id(
+                &second.link_session_id,
+                "+15555550100",
+                group,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(replay_from_rotated.id, committed.id);
+        assert_eq!(
+            service.list_accounts_in_group(group).unwrap().len(),
+            1,
+            "the attempt committed once"
+        );
+        // Every code was retired by the commit.
+        assert!(service.live_link_slots_for_test().is_empty());
+        // A committed attempt has nothing left to rotate.
+        let refused = service
+            .begin_rotate(&attempt)
+            .expect_err("a committed attempt cannot rotate");
+        assert!(
+            matches!(refused, ServiceError::Api(ref error) if error.code == "INVALID_REQUEST"),
+            "got {refused:?}"
+        );
+        // Cancelling a committed attempt is a no-op that keeps the replay.
+        service.cancel_link(&first).unwrap();
+        assert_eq!(
+            service
+                .replay_link_commit(&first)
+                .unwrap()
+                .map(|row| row.id),
+            Some(committed.id)
+        );
+    }
+
+    /// Contract 1.286 (§4.272): rotation degrades to the single slot on an
+    /// engine that never stated a rotate key, and answers the attempt-not-found
+    /// code for an attempt this connector does not hold.
+    #[test]
+    fn rotate_is_gated_by_the_engine_key_and_the_attempt_id() {
+        let (_temp, mut service) = service();
+        let (attempt, _slot) =
+            service.plant_link_attempt_for_test("KT", None, crate::link::LINK_SESSION_TTL);
+        assert_eq!(
+            service.begin_rotate(&attempt).unwrap(),
+            None,
+            "no engine rotate key: the caller answers NOT_SUPPORTED and the single slot stays"
+        );
+
+        let missing = service
+            .begin_rotate("no-such-attempt")
+            .expect_err("an unknown attempt answers LINK_ATTEMPT_NOT_FOUND");
+        assert!(
+            matches!(missing, ServiceError::Api(ref error) if error.code == "LINK_ATTEMPT_NOT_FOUND"),
+            "got {missing:?}"
+        );
+
+        // An attempt minted by a rotate-capable engine hands its key through.
+        let (rotatable, _slot) = service.plant_link_attempt_for_test(
+            "KT-2",
+            Some("engine-attempt-9"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        assert_eq!(
+            service.begin_rotate(&rotatable).unwrap().as_deref(),
+            Some("engine-attempt-9")
+        );
+    }
+
+    /// Contract 1.286 (§4.272): a slot the engine reported lost keeps routing
+    /// so finish answers the definite LINK_LOST, while the attempt's other live
+    /// slot can still commit.
+    #[test]
+    fn a_lost_slot_keeps_routing_and_the_other_slot_still_commits() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let (attempt, first) = service.plant_link_attempt_for_test(
+            "KT",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let second = service
+            .attach_rotated_slot(&attempt, "sgnl://link?second".into(), now_ms())
+            .unwrap();
+        assert!(service.mark_link_lost(&first));
+
+        let lost = service
+            .peek_link_for_finish(&first)
+            .expect_err("a lost slot answers LINK_LOST");
+        assert!(
+            matches!(lost, ServiceError::Api(ref error) if error.code == "LINK_LOST" && error.retryable),
+            "got {lost:?}"
+        );
+        assert!(service.has_link_session(&first), "still routable");
+        assert!(service.has_pending_link(), "the second slot is still live");
+
+        let committed = service
+            .complete_link_session_with_id(
+                &second.link_session_id,
+                "+15555550100",
+                group,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(committed.state, "ready");
+    }
+
+    /// Review must-fix (contract 1.286, §4.272): the commit face and the
+    /// dispatch face answer differently for a Retired code. A slot the
+    /// engine reported dead refuses the commit (LINK_LOST, no account row),
+    /// while a slot this connector's own rotation retired still commits — the
+    /// engine's success outlives the code — and the attempt then replays that
+    /// account from every one of its codes, the retired one included.
+    #[test]
+    fn the_commit_face_refuses_a_lost_slot_and_accepts_a_retired_one() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let (attempt, first) = service.plant_link_attempt_for_test(
+            "KT",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let second = service
+            .attach_rotated_slot(&attempt, "sgnl://link?second".into(), now_ms())
+            .unwrap();
+        let third = service
+            .attach_rotated_slot(&attempt, "sgnl://link?third".into(), now_ms())
+            .unwrap();
+        assert_eq!(third.retired, Some(0), "the rotation retired slot 0");
+        // The engine reported the attempt's other early code dead.
+        assert!(service.mark_link_lost(&second.link_session_id));
+
+        let lost = service
+            .complete_link_session_with_id(
+                &second.link_session_id,
+                "+15555550100",
+                group,
+                None,
+                None,
+            )
+            .expect_err("a lost slot never commits");
+        assert!(
+            matches!(lost, ServiceError::Api(ref error) if error.code == "LINK_LOST" && error.retryable),
+            "got {lost:?}"
+        );
+        assert!(
+            service.list_accounts_in_group(group).unwrap().is_empty(),
+            "the refused commit writes no account row"
+        );
+
+        // The retired slot 0 commits: a rotation dropped the code while the
+        // engine was still completing the finish, so the result must not be
+        // thrown away by the dispatch gate.
+        let committed = service
+            .complete_link_session_with_id(&first, "+15555550100", group, None, None)
+            .expect("a retired slot still commits the engine's result");
+        assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 1);
+
+        // The retired code itself replays the commit (journaled per slot id),
+        // and so does the attempt's remaining code.
+        for link_session_id in [&first, &third.link_session_id] {
+            let replay = service
+                .complete_link_session_with_id(link_session_id, "+15555550100", group, None, None)
+                .unwrap();
+            assert_eq!(replay.id, committed.id, "replay from {link_session_id}");
+        }
+        assert_eq!(
+            service.list_accounts_in_group(group).unwrap().len(),
+            1,
+            "the attempt committed once"
+        );
+    }
+
     /// [KT 适配] §9.10 item 7: a relink of the number whose local-data delete
     /// is still in progress is refused at commit; once the delete completes
     /// the same number links. The official app has no multi-account delete
@@ -21691,6 +24007,123 @@ mod tests {
             .expect("an expired session must not block a fresh link");
     }
 
+    /// QR B1 (issue #951): a lost session is terminal but stays addressable.
+    /// It no longer suppresses the watchdog (has_pending_link=false), a
+    /// finish for its id answers the definite LINK_LOST (retryable=true), and
+    /// the next begin_link replaces it instead of answering LINK_IN_PROGRESS.
+    #[test]
+    fn lost_link_session_is_addressable_but_never_blocks_a_fresh_link() {
+        let (_temp, mut service) = service();
+        let started = service
+            .begin_link("KT-Lost".into(), "sgnl://link?lost".into())
+            .unwrap();
+        let lost_id = started["linkSessionId"].as_str().unwrap().to_string();
+        assert!(
+            service.has_pending_link(),
+            "the live QR suppresses the watchdog"
+        );
+
+        assert!(service.mark_link_lost(&lost_id));
+        let session = service.link.as_ref().expect("the lost session stays");
+        assert_eq!(session.state, crate::link::LinkSessionState::Lost);
+        assert!(session.lost_at.is_some(), "the loss instant is recorded");
+        assert!(
+            !service.has_pending_link(),
+            "a lost session must not suppress the watchdog"
+        );
+        assert!(
+            service.has_link_session(&lost_id),
+            "router attribution must survive loss so finish answers LINK_LOST"
+        );
+
+        let error = service.peek_link_for_finish(&lost_id).unwrap_err();
+        let ServiceError::Api(api) = error else {
+            panic!("expected the definite LINK_LOST api error");
+        };
+        assert_eq!(api.code, "LINK_LOST");
+        assert!(api.retryable, "a fresh link.start is the remedy");
+
+        // The next begin replaces the lost session (ensure_link_available is
+        // the supervisor's pre-mint gate and must agree).
+        service
+            .ensure_link_available()
+            .expect("a lost session does not block the next start");
+        let next = service
+            .begin_link("KT-Next".into(), "sgnl://link?next".into())
+            .expect("a lost session must not answer LINK_IN_PROGRESS");
+        let next_id = next["linkSessionId"].as_str().unwrap().to_string();
+        assert_ne!(next_id, lost_id);
+        assert!(service.has_pending_link());
+        assert!(!service.has_link_session(&lost_id));
+        assert!(!service.mark_link_lost("no-such-session"));
+    }
+
+    /// The finish budget (370 s) outlives the advertised QR lifetime (300 s),
+    /// so an in-flight finish pins the session: a phone approval that lands
+    /// after the QR's own lifetime must still commit — the engine already
+    /// linked the device, and LINK_EXPIRED would strand a real link. The
+    /// advertised `expiresAt` is untouched; only the in-memory deadline moves.
+    #[test]
+    fn an_in_flight_finish_pins_the_link_session_past_the_qr_lifetime() {
+        let (_temp, mut service) = service();
+        let started = service
+            .begin_link("KT-Pin".into(), "sgnl://link?pin".into())
+            .unwrap();
+        let link_session_id = started["linkSessionId"].as_str().unwrap().to_string();
+        let advertised = started["expiresAt"].as_u64().unwrap();
+        assert_eq!(
+            service.link_session_deadline_for_test(&link_session_id),
+            Some(advertised),
+            "begin_link advertises the session's own deadline"
+        );
+
+        let budget = Duration::from_secs(370);
+        service
+            .pin_link_for_finish(&link_session_id, budget)
+            .expect("a live session is pinnable");
+        let pinned = service
+            .link_session_deadline_for_test(&link_session_id)
+            .expect("the pinned session is still the active one");
+        assert!(
+            pinned > advertised,
+            "the finish window must outlive the advertised QR lifetime: {pinned} vs {advertised}"
+        );
+        assert!(
+            pinned - advertised >= Duration::from_secs(60).as_millis() as u64,
+            "the pin covers the finish budget, not a token extension"
+        );
+
+        // The commit still lands: pinning never consumes or re-keys the
+        // session.
+        let account = service
+            .complete_link_session(
+                &link_session_id,
+                "+15555550100",
+                crate::DEFAULT_PROXY_GROUP_ID,
+                None,
+            )
+            .expect("a pinned session commits");
+        assert_eq!(account.state, "ready");
+        assert!(!account.id.is_empty());
+
+        // Unknown ids keep their own definite answer; an expired session is
+        // refused before anything is extended (the pin is not a resurrection).
+        let missing = service
+            .pin_link_for_finish("no-such-session", budget)
+            .unwrap_err();
+        let ServiceError::Api(api) = missing else {
+            panic!("expected an api error for an unknown session");
+        };
+        assert_eq!(api.code, "LINK_NOT_FOUND");
+
+        let expired = service.plant_link_session_for_test("KT-Expired-Pin", Duration::ZERO);
+        let error = service.pin_link_for_finish(&expired, budget).unwrap_err();
+        let ServiceError::Api(api) = error else {
+            panic!("expected an api error for an expired session");
+        };
+        assert_eq!(api.code, "LINK_EXPIRED");
+    }
+
     #[test]
     fn deleting_an_account_does_not_cancel_another_session_link() {
         let (_temp, mut service) = service();
@@ -21759,6 +24192,19 @@ mod tests {
         );
     }
 
+    /// Runtime state authority: a 401 during an active link/re-key window is
+    /// provisioning noise; the terminal write is deferred until the window
+    /// closes.
+    #[test]
+    fn account_unlink_write_is_deferred_while_a_link_session_is_pending() {
+        let (_temp, mut service) = service();
+        let link = service.plant_link_session_for_test("KT Desktop", Duration::from_secs(60));
+        assert!(!service.should_persist_account_unlink());
+
+        service.cancel_link(&link).unwrap();
+        assert!(service.should_persist_account_unlink());
+    }
+
     /// The wire error for a rejected credential is ACCOUNT_UNLINKED
     /// (retryable=false) — distinct from the generic retryable upstream
     /// error, so hosts can distinguish "device was unlinked" from noise.
@@ -21805,6 +24251,114 @@ mod tests {
         }
     }
 
+    /// Contract 1.285 §4.269: the engine's resource faces map onto their own
+    /// host codes with the contract-fixed retryability — the two busy faces
+    /// proved the request never executed (retryable), and the attachment
+    /// budget face is never retried automatically. The read-only dispatch
+    /// timeout keeps ENGINE_TIMEOUT; a mutating cancellation folds to the
+    /// pre-existing unknown outcome before it reaches this mapping (asserted
+    /// below), so the send row settles unknown. The engine's `data`
+    /// object rides verbatim when present; the content-free face answers
+    /// without one, and the family flag always wins over the `with_data`
+    /// derivation (the engine's advisory `retryable` bit stays inside
+    /// `data`).
+    #[test]
+    fn engine_resource_faces_map_to_structured_codes() {
+        for (error, code, retryable) in [
+            (EngineError::EngineBusy { data: None }, "ENGINE_BUSY", true),
+            (
+                EngineError::EngineRequestTimeout { data: None },
+                "ENGINE_TIMEOUT",
+                false,
+            ),
+            (
+                EngineError::AttachmentBusy { data: None },
+                "ATTACHMENT_BUSY",
+                true,
+            ),
+            (
+                EngineError::AttachmentBudget { data: None },
+                "ATTACHMENT_BUDGET",
+                false,
+            ),
+        ] {
+            let api = ServiceError::Engine(error).into_api();
+            assert_eq!(api.code, code);
+            assert_eq!(api.retryable, retryable, "{code} retryable face");
+            assert!(api.data.is_none(), "{code} stays content-free without data");
+        }
+
+        // The dispatch payloads ride verbatim.
+        let busy_data = json!({
+            "reason": "ENGINE_BUSY",
+            "retryable": true,
+            "inFlightLimit": 8
+        });
+        let api = ServiceError::Engine(EngineError::EngineBusy {
+            data: Some(busy_data.clone()),
+        })
+        .into_api();
+        assert_eq!(api.code, "ENGINE_BUSY");
+        assert!(api.retryable);
+        assert_eq!(api.data, Some(busy_data));
+
+        let timeout_data = json!({
+            "reason": "REQUEST_TIMEOUT",
+            "retryable": false,
+            "timeoutMs": 60000
+        });
+        let api = ServiceError::Engine(EngineError::EngineRequestTimeout {
+            data: Some(timeout_data.clone()),
+        })
+        .into_api();
+        assert_eq!(api.code, "ENGINE_TIMEOUT");
+        assert!(
+            !api.retryable,
+            "the read-only dispatch was cancelled; never auto-retried"
+        );
+        assert_eq!(api.data, Some(timeout_data));
+
+        // The send-chain dispatch-timeout face never reaches ENGINE_TIMEOUT:
+        // the classifier folds a mutating cancellation to the existing
+        // unknown outcome, whose host answer stays SEND_OUTCOME_UNKNOWN and
+        // is never auto-retried.
+        let api = ServiceError::Engine(EngineError::UnknownOutcome).into_api();
+        assert_eq!((api.code, api.retryable), ("SEND_OUTCOME_UNKNOWN", false));
+        assert!(api.data.is_none(), "the unknown face is content-free");
+
+        // A data-carrying attachment refusal keeps its facts; the fixed
+        // family flag is not swayed by the advisory bit inside them.
+        let api = ServiceError::Engine(EngineError::AttachmentBusy {
+            data: Some(json!({ "retryable": false, "slots": 2 })),
+        })
+        .into_api();
+        assert_eq!(api.code, "ATTACHMENT_BUSY");
+        assert!(api.retryable, "nothing was delivered, a retry is safe");
+        assert_eq!(api.data, Some(json!({ "retryable": false, "slots": 2 })));
+
+        let api = ServiceError::Engine(EngineError::AttachmentBudget {
+            data: Some(json!({ "retryable": true, "budgetBytes": 335544320u64 })),
+        })
+        .into_api();
+        assert_eq!(api.code, "ATTACHMENT_BUDGET");
+        assert!(!api.retryable, "the same batch can stay over budget");
+        assert_eq!(
+            api.data,
+            Some(json!({ "retryable": true, "budgetBytes": 335544320u64 }))
+        );
+
+        // No regression on the pre-1.285 faces: the generic upstream answer
+        // and the connector's own deadline keep their codes and flags.
+        let api = ServiceError::Engine(EngineError::Upstream {
+            cause: None,
+            code: Some(-32603),
+        })
+        .into_api();
+        assert_eq!((api.code, api.retryable), ("UPSTREAM_ERROR", true));
+        let api = ServiceError::Engine(EngineError::Timeout).into_api();
+        assert_eq!((api.code, api.retryable), ("UPSTREAM_TIMEOUT", true));
+    }
+
     /// Structured engine error mapping (contract 1.36, §4.32/§4.33): each
     /// allowlisted engine code maps to the same-named connector code with
     /// the contract-fixed retryability; the mapping is total over the
@@ -21836,6 +24390,9 @@ mod tests {
             // §4.47: a network/download/decrypt failure may succeed on a
             // later attempt.
             "AVATAR_FETCH_FAILED",
+            // QR B1: the dead QR is repaired by a fresh link.start, never a
+            // blind finish retry; retryable=true is the start-over face.
+            "LINK_LOST",
         ];
         for code in retryable {
             let api =
@@ -21916,6 +24473,41 @@ mod tests {
         .into_api();
         assert_eq!(api.code, "DEVICES_FAILED");
         assert!(api.data.is_none());
+    }
+
+    /// §4.281 shape gate (contract 1.286): the four keys project verbatim,
+    /// a phase outside the closed vocabulary / a missing phase / a
+    /// non-numeric sinceMs is a protocol defect, and unknown sibling keys
+    /// ride ignored (additive tolerance, the pinned four only).
+    #[test]
+    fn sync_state_projection_gates_the_closed_vocabulary() {
+        let face = sync_state_from_engine(&json!({
+            "contacts": "done",
+            "storage": "inflight",
+            "profile": "failed",
+            "sinceMs": 1_760_000_000_000u64,
+            "futureKey": { "additive": true },
+        }))
+        .unwrap();
+        assert_eq!(face.contacts, "done");
+        assert_eq!(face.storage, "inflight");
+        assert_eq!(face.profile, "failed");
+        assert_eq!(face.since_ms, 1_760_000_000_000);
+
+        for bad in [
+            json!({ "contacts": "settled", "storage": "done", "profile": "idle",
+                    "sinceMs": 1u64 }),
+            json!({ "contacts": "done", "storage": 1, "profile": "idle",
+                    "sinceMs": 1u64 }),
+            json!({ "contacts": "done", "storage": "done", "profile": "idle" }),
+            json!({ "contacts": "done", "storage": "done", "profile": "idle",
+                    "sinceMs": "1" }),
+            json!({ "contacts": "done", "storage": "done", "profile": "idle",
+                    "sinceMs": -1 }),
+        ] {
+            let api = sync_state_from_engine(&bad).err().unwrap().into_api();
+            assert_eq!(api.code, "UPSTREAM_PROTOCOL_ERROR", "{bad}");
+        }
     }
 
     /// §4.103 projection (contract 1.122): entries ride in order under the
@@ -22801,6 +25393,136 @@ mod tests {
         ));
     }
 
+    /// BUG-16 刀2a：裸号码 direct 对端过 peer_identities 桥命中 → 引擎
+    /// recipient 改用 ACI（本机权威映射，不依赖手机联系人同步）；行 id/
+    /// 标题不动，消息仍落原号码会话。
+    #[test]
+    fn send_text_resolves_bare_number_recipient_through_identity_bridge() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let aci = "3f1a2b4c-5d6e-4f7a-8b9c-0d1e2f3a4b5c";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, aci, "+15555550101")
+            .unwrap();
+        let dispatch = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "bridge hit must address by ACI",
+                "req-bridge-hit",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => params,
+            other => panic!("expected dispatch, got {other:?}"),
+        };
+        assert_eq!(
+            dispatch["recipient"],
+            serde_json::json!([aci]),
+            "bridge hit must swap the engine target to the ACI"
+        );
+    }
+
+    /// BUG-16 刀2a 修正（双拼写）：桥里存的是**另一种拼写**（bare digits，
+    /// 会话 peer_key 带「+」）也必须命中——真机实证的缺口形态。
+    #[test]
+    fn send_text_resolves_number_recipient_across_alternate_spelling() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550103", "Peer")
+            .unwrap();
+        let aci = "7c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, aci, "15555550103")
+            .unwrap();
+        let dispatch = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "alternate spelling must still hit the bridge",
+                "req-alt-spelling",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => params,
+            other => panic!("expected dispatch, got {other:?}"),
+        };
+        assert_eq!(
+            dispatch["recipient"],
+            serde_json::json!([aci]),
+            "alternate-spelling bridge row must resolve to the ACI"
+        );
+    }
+
+    /// BUG-16 刀2a miss 臂：桥无映射 → 原样放行号码（引擎 contacts 或能自
+    /// 解，旧路径行为不变——诚实分类在 supervisor 定址点，不在此 fail-fast）。
+    #[test]
+    fn send_text_passes_bare_number_through_when_bridge_misses() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Peer")
+            .unwrap();
+        let dispatch = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "bridge miss keeps the number",
+                "req-bridge-miss",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => params,
+            other => panic!("expected dispatch, got {other:?}"),
+        };
+        assert_eq!(dispatch["recipient"], serde_json::json!(["+15555550102"]));
+    }
+
     #[test]
     fn send_text_projects_first_preview_onto_upstream_params() {
         let (_temp, service) = service();
@@ -22850,6 +25572,11 @@ mod tests {
             PreparedSend::Dispatch { params, .. } => params,
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
+        assert!(
+            dispatch["dispatchId"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
         assert_eq!(dispatch["previewUrl"], json!("https://example.com/a"));
         assert_eq!(dispatch["previewTitle"], json!("Example"));
         assert_eq!(dispatch["previewDescription"], json!("A page"));
@@ -22917,6 +25644,7 @@ mod tests {
                 "recipient": ["+15555550101"],
                 "storyReplyAuthor": "22222222-2222-2222-2222-222222222222",
                 "storyReplyTimestamp": 1_727_000_000_000u64,
+                "dispatchId": "req-story-reply-both",
             })
         );
 
@@ -22955,6 +25683,7 @@ mod tests {
                 "account": "+15555550100",
                 "message": "plain body",
                 "recipient": ["+15555550101"],
+                "dispatchId": "req-story-reply-plain",
             })
         );
     }
@@ -23247,6 +25976,9 @@ mod tests {
 
         // Plural: the per-entry key rides its own descriptor.
         let entries = vec![MessagesSendAttachmentEntry {
+            // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+            width: None,
+            height: None,
             data_base64: b64.to_string(),
             size_bytes: 16,
             filename: Some("notes.txt".into()),
@@ -23306,6 +26038,9 @@ mod tests {
         }
         // The plural face fails closed the same way.
         let bad_entries = vec![MessagesSendAttachmentEntry {
+            // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+            width: None,
+            height: None,
             data_base64: b64.to_string(),
             size_bytes: 16,
             filename: None,
@@ -23523,6 +26258,20 @@ mod tests {
             }),
             SendRetrySchedule::Backoff
         );
+        // Contract 1.285 §4.269: the two provably-unexecuted resource faces
+        // keep the curve — before their anchors were claimed they degraded to
+        // the generic upstream face and rode it, so the automatic follow-up
+        // is preserved rather than narrowed.
+        for error in [
+            EngineError::EngineBusy { data: None },
+            EngineError::AttachmentBusy { data: None },
+        ] {
+            assert_eq!(
+                ConnectorService::auto_retry_schedule(&error),
+                SendRetrySchedule::Backoff,
+                "{error:?} never ran, so a retry is safe"
+            );
+        }
         for error in [
             EngineError::ProofRequired,
             EngineError::IdentityUnverified,
@@ -23534,6 +26283,11 @@ mod tests {
             EngineError::NotRunning,
             EngineError::Unauthorized,
             EngineError::UnknownOutcome,
+            // Contract 1.285 §4.269: a cancelled dispatch may already have
+            // been written (the red line), and the same attachment batch can
+            // stay over budget.
+            EngineError::EngineRequestTimeout { data: None },
+            EngineError::AttachmentBudget { data: None },
         ] {
             assert_eq!(
                 ConnectorService::auto_retry_schedule(&error),
@@ -23815,6 +26569,1453 @@ mod tests {
         assert_eq!(claims.len(), 1, "{claims:?}");
         assert_eq!(claims[0].message_id, text_pending);
         assert_eq!(face(&service, &attachment_pending).0, "failed");
+    }
+
+    /// §4.262 (contract revision 1.278): an attachment retry re-sends the
+    /// ORIGINAL row — same id, same clientRequestId, one history row — with
+    /// this request's faces, and the regular settlement lands on it. The
+    /// failed row is rearmed, never deleted and never duplicated.
+    #[test]
+    fn retry_attachment_rearms_the_original_row_and_keeps_one_history_row() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let b64 = "YXR0YWNobWVudCBieXRlcw=="; // base64 of "attachment bytes"
+        let row_count = |service: &ConnectorService| -> i64 {
+            service
+                .store_ref()
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE account_id=?1 AND conversation_id=?2",
+                    params![account.id.as_str(), conversation.id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let pending_id = match service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-attach-retry",
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("first caption"),
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        service
+            .complete_send_failed_for_engine(&pending_id, &EngineError::ServerUnavailable)
+            .unwrap();
+        let failed = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(row_count(&service), 1);
+
+        let retried = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-attach-retry",
+                Some(b64),
+                Some(16),
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("retry caption"),
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch {
+            pending_id: retry_id,
+            params,
+            pending_sent_at,
+            ..
+        } = &retried
+        else {
+            panic!("a failed row must re-dispatch, not replay");
+        };
+        assert_eq!(retry_id, &pending_id, "the retry keeps the original row id");
+        assert_eq!(
+            *pending_sent_at, failed.sent_at,
+            "the row keeps its original timeline stamp"
+        );
+        assert_eq!(params["message"], "retry caption");
+        assert_eq!(
+            params["attachments"][0].as_str().unwrap(),
+            "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw==",
+            "the retry carries the bytes again — the engine re-uploads them"
+        );
+        assert_eq!(row_count(&service), 1, "a retry never adds a row");
+        let rearmed = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rearmed.status, "pending");
+        assert_eq!(
+            rearmed.client_request_id.as_deref(),
+            Some("req-attach-retry")
+        );
+        assert_eq!(rearmed.text.as_deref(), Some("retry caption"));
+        assert_eq!(rearmed.attachments.len(), 1);
+        assert_eq!(
+            rearmed.attachments[0].id, failed.attachments[0].id,
+            "the descriptor id is the first attempt's own (same bytes slot)"
+        );
+        // The manual retry is a NEW job: the automatic face is retired with
+        // the rearm (the §4.123 window never survives a manual retry).
+        let schedule: (String, Option<i64>, i64, Option<i64>) = service
+            .store_ref()
+            .conn()
+            .query_row(
+                "SELECT status, first_send_attempted_at, retry_attempt_count, next_attempt_at
+                 FROM messages WHERE id=?1",
+                params![pending_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(schedule, ("pending".into(), None, 0, None));
+
+        // Settlement completes the SAME row, so the history still holds one
+        // row and the ledger row is the one the retry addressed.
+        let (settled, _events) = service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 424_242, None)
+            .unwrap();
+        assert_eq!(settled.id, pending_id);
+        assert_eq!(settled.status, "sent");
+        assert_eq!(row_count(&service), 1);
+        let by_request = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-attach-retry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_request.id, pending_id);
+        assert_eq!(by_request.status, "sent");
+    }
+
+    /// §4.262 guards: a row still in flight answers RETRY_IN_FLIGHT (never a
+    /// second dispatch of the same row), and a row whose original send
+    /// already completed answers the §4.172 idempotent replay untouched.
+    #[test]
+    fn retry_attachment_refuses_in_flight_and_replays_a_completed_row() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let b64 = "YXR0YWNobWVudCBieXRlcw==";
+        let pending_id = match service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-attach-inflight",
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("hello"),
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+
+        let error = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-attach-inflight",
+                Some(b64),
+                Some(16),
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "RETRY_IN_FLIGHT");
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "pending", "the refusal never rearmed a row");
+
+        service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 777, None)
+            .unwrap();
+        let replay = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-attach-inflight",
+                Some(b64),
+                Some(16),
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Existing(row) = &replay else {
+            panic!("a completed original must replay, never re-dispatch");
+        };
+        assert_eq!(row.id, pending_id);
+        assert_eq!(row.status, "sent", "the replay answers the persisted row");
+        assert_eq!(row.attachments.len(), 1);
+    }
+
+    /// §4.262 guards: this face re-sends attachments only — a text row
+    /// (messages.retryText owns it) and an unknown clientRequestId refuse
+    /// deterministically, and a plural row refuses CALLER-SUPPLIED bytes
+    /// (contract 1.280, §4.264: one call cannot restate every entry's byte set;
+    /// the plural row retries ids-only from its persisted group, see
+    /// `retry_attachment_multi_ids_only_rebuilds_every_payload_same_row`).
+    #[test]
+    fn retry_attachment_refuses_text_and_multi_rows_and_a_missing_row() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let b64 = "YXR0YWNobWVudCBieXRlcw==";
+
+        // A failed TEXT row: this face refuses it too (status settled, then no
+        // attachment descriptor left); messages.retryText owns it.
+        let text_pending = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "hello",
+                "req-text-retry",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        service
+            .complete_send_failed_for_engine(&text_pending, &EngineError::ServerUnavailable)
+            .unwrap();
+        let error = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-text-retry",
+                Some(b64),
+                Some(16),
+                None,
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "RETRY_NOT_ALLOWED");
+
+        // A failed MULTI-attachment row refuses caller bytes: one call cannot
+        // restate every entry's byte set (its persisted group is the retry
+        // source).
+        let multi_pending = match service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-retry",
+                &[
+                    MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
+                        data_base64: b64.into(),
+                        size_bytes: 16,
+                        filename: Some("one.txt".into()),
+                        content_type: Some("text/plain".into()),
+                        blur_hash: None,
+                        gif: false,
+                    },
+                    MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
+                        data_base64: b64.into(),
+                        size_bytes: 16,
+                        filename: Some("two.txt".into()),
+                        content_type: Some("text/plain".into()),
+                        blur_hash: None,
+                        gif: false,
+                    },
+                ],
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        service
+            .complete_send_failed_for_engine(&multi_pending, &EngineError::ServerUnavailable)
+            .unwrap();
+        let error = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-retry",
+                Some(b64),
+                Some(16),
+                None,
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "RETRY_NOT_ALLOWED");
+
+        // No row at all: the original request never arrived.
+        let error = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-never-arrived",
+                Some(b64),
+                Some(16),
+                None,
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "MESSAGE_NOT_FOUND");
+    }
+
+    /// §4.262 守卫顺序：状态先判、描述符后判。一条 failed 的附件行如果已经没有
+    /// 任何 descriptor，答案必须是「没有描述符可重建」，绝不是「这是文本消息，
+    /// 请用 retryText」——它本来就是附件行，retryText 也会以同样的理由拒绝它。
+    /// 行还在 pending 时同样先按状态答 RETRY_IN_FLIGHT，不会因为描述符缺席被
+    /// 误判成文本。
+    #[test]
+    fn retry_attachment_without_descriptors_never_answers_as_a_text_send() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let b64 = "YXR0YWNobWVudCBieXRlcw==";
+        let pending_id = match service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-descriptor-less",
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        // The row loses its descriptor face (a pre-1.15 attachment row, or one
+        // whose attachment face was erased).
+        service
+            .store_ref()
+            .conn()
+            .execute(
+                "UPDATE messages SET attachments_json=NULL WHERE id=?1",
+                params![pending_id],
+            )
+            .unwrap();
+
+        // Status first: an in-flight retry is answered by its state.
+        let error = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-descriptor-less",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "RETRY_IN_FLIGHT");
+        assert!(
+            !error.message.contains("text send"),
+            "an in-flight attachment row is never answered as a text send: {}",
+            error.message
+        );
+
+        service
+            .complete_send_failed_for_engine(&pending_id, &EngineError::ServerUnavailable)
+            .unwrap();
+        let error = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-descriptor-less",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "RETRY_NOT_ALLOWED");
+        assert!(
+            error.message.contains("attachment descriptors"),
+            "a descriptor-less failed attachment answers about its descriptors: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("text send"),
+            "a descriptor-less failed attachment is never answered as a text send: {}",
+            error.message
+        );
+
+        // The rejection leaves the row exactly as it was: still failed, still
+        // one row, still one clientRequestId.
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "failed");
+        assert!(row.attachments.is_empty());
+        assert_eq!(
+            row.client_request_id.as_deref(),
+            Some("req-descriptor-less")
+        );
+    }
+
+    /// §4.262: the payload is validated before the store is touched, so a
+    /// rejected retry leaves the failed row exactly as it was — still
+    /// retryable, never half-rearmed.
+    #[test]
+    fn retry_attachment_rejects_a_bad_payload_without_touching_the_row() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let b64 = "YXR0YWNobWVudCBieXRlcw==";
+        let pending_id = match service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-attach-bad-retry",
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("hello"),
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        service
+            .complete_send_failed_for_engine(&pending_id, &EngineError::ServerUnavailable)
+            .unwrap();
+
+        // A size mismatch is the first send's own rejection class.
+        let error = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-attach-bad-retry",
+                Some(b64),
+                Some(15),
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "failed", "a rejected retry changes nothing");
+        assert_eq!(
+            row.client_request_id.as_deref(),
+            Some("req-attach-bad-retry")
+        );
+
+        // The same id still retries once the payload is well-formed.
+        let recovered = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-attach-bad-retry",
+                Some(b64),
+                Some(16),
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            recovered,
+            PreparedSend::Dispatch { pending_id: ref retried_id, .. } if retried_id == &pending_id
+        ));
+    }
+
+    /// §4.263 (contract 1.279): the first send persists its original data URI,
+    /// a failure keeps it across a store reopen, and the retry may omit
+    /// dataBase64/sizeBytes — it restores the same bytes on the same row id.
+    /// Success deletes the payload.
+    #[test]
+    fn retry_attachment_reuses_the_persisted_payload_after_a_store_reopen() {
+        let (temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let b64 = "YXR0YWNobWVudCBieXRlcw==";
+        let data_uri = "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw==";
+        let client_request_id = "req-attach-payload";
+        let pending_id = match service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("hello"),
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        assert_eq!(
+            service
+                .store_ref()
+                .outgoing_attachment_payload(&account.id, client_request_id, 0)
+                .unwrap()
+                .as_deref(),
+            Some(data_uri),
+            "the first send persists the original data URI"
+        );
+        // A repeated first send under the same clientRequestId is the
+        // idempotent replay: it answers the existing row and never overwrites
+        // the persisted payload with the newer request's bytes.
+        let replay = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                "b3RoZXIgYnl0ZXM=",
+                11,
+                Some("other.bin"),
+                Some("application/octet-stream"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(replay, PreparedSend::Existing(_)));
+        assert_eq!(
+            service
+                .store_ref()
+                .outgoing_attachment_payload(&account.id, client_request_id, 0)
+                .unwrap()
+                .as_deref(),
+            Some(data_uri),
+            "the idempotent replay preserves the original payload"
+        );
+        service
+            .complete_send_failed_for_engine(&pending_id, &EngineError::ServerUnavailable)
+            .unwrap();
+        assert_eq!(
+            service
+                .store_ref()
+                .outgoing_attachment_payload(&account.id, client_request_id, 0)
+                .unwrap()
+                .as_deref(),
+            Some(data_uri),
+            "a definitively failed send keeps the payload"
+        );
+
+        // The desktop refreshed/restarted: only the persisted store survives.
+        drop(service);
+        let store = Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
+        assert_eq!(
+            store
+                .outgoing_attachment_payload(&account.id, client_request_id, 0)
+                .unwrap()
+                .as_deref(),
+            Some(data_uri),
+            "a new store instance still reads the payload"
+        );
+        let service = ConnectorService::new(Arc::new(store));
+
+        let retried = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch {
+            pending_id: retry_id,
+            params,
+            ..
+        } = &retried
+        else {
+            panic!("a failed row must re-dispatch, not replay");
+        };
+        assert_eq!(retry_id, &pending_id, "the retry keeps the original row id");
+        assert_eq!(
+            params["attachments"][0].as_str(),
+            Some(data_uri),
+            "the retry rebuilds the original bytes from the persisted payload"
+        );
+        assert_eq!(
+            params["message"].as_str(),
+            Some("hello"),
+            "ids-only retry restores the original caption from the row"
+        );
+
+        let (settled, _events) = service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 515_151, None)
+            .unwrap();
+        assert_eq!(settled.id, pending_id);
+        assert_eq!(
+            service
+                .store_ref()
+                .outgoing_attachment_payload(&account.id, client_request_id, 0)
+                .unwrap(),
+            None,
+            "success deletes the payload"
+        );
+    }
+
+    /// §4.264 (contract revision 1.280): a plural send persists one payload row
+    /// per attachment index. A failed multi-attachment row is therefore retried
+    /// ids-only after a restart: the connector rebuilds EVERY entry's bytes from
+    /// its own index, re-dispatches the plural shape under the SAME row id, and a
+    /// successful settlement clears the whole group.
+    #[test]
+    fn retry_attachment_multi_ids_only_rebuilds_every_payload_same_row() {
+        let (temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let client_request_id = "req-multi-payload";
+        // "attachment bytes" / "second attachment"
+        let first_uri = "data:text/plain;filename=one.txt;base64,YXR0YWNobWVudCBieXRlcw==";
+        let second_uri = "data:application/octet-stream;gif=true;filename=two.bin;base64,c2Vjb25kIGF0dGFjaG1lbnQ=";
+        let pending_id = match service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                &[
+                    MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
+                        data_base64: "YXR0YWNobWVudCBieXRlcw==".into(),
+                        size_bytes: 16,
+                        filename: Some("one.txt".into()),
+                        content_type: Some("text/plain".into()),
+                        blur_hash: None,
+                        gif: false,
+                    },
+                    MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
+                        data_base64: "c2Vjb25kIGF0dGFjaG1lbnQ=".into(),
+                        size_bytes: 17,
+                        filename: Some("two.bin".into()),
+                        content_type: Some("application/octet-stream".into()),
+                        blur_hash: None,
+                        gif: true,
+                    },
+                ],
+                Some("first caption"),
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        assert_eq!(
+            service
+                .store_ref()
+                .outgoing_attachment_payloads(&account.id, client_request_id)
+                .unwrap(),
+            vec![(0, first_uri.to_string()), (1, second_uri.to_string())],
+            "the plural send persists every entry at its own index"
+        );
+        service
+            .complete_send_failed_for_engine(&pending_id, &EngineError::ServerUnavailable)
+            .unwrap();
+        let failed = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.attachments.len(), 2);
+        let descriptor_ids: Vec<String> = failed
+            .attachments
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(
+            service
+                .store_ref()
+                .outgoing_attachment_payloads(&account.id, client_request_id)
+                .unwrap()
+                .len(),
+            2,
+            "a failed plural send keeps its whole payload group"
+        );
+
+        // The desktop refreshed/restarted: only the persisted store survives.
+        drop(service);
+        let store = Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
+        assert_eq!(
+            store
+                .outgoing_attachment_payloads(&account.id, client_request_id)
+                .unwrap()
+                .len(),
+            2,
+            "a new store instance still reads the whole group"
+        );
+        let service = ConnectorService::new(Arc::new(store));
+
+        let retried = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                None,
+                None,
+                None,
+                None,
+                Some("retry caption"),
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch {
+            pending_id: retry_id,
+            params,
+            pending_sent_at,
+            ..
+        } = &retried
+        else {
+            panic!("a failed plural row must re-dispatch, not replay");
+        };
+        assert_eq!(retry_id, &pending_id, "the retry keeps the original row id");
+        assert_eq!(
+            *pending_sent_at, failed.sent_at,
+            "the row keeps its timeline stamp"
+        );
+        let dispatched = params["attachments"].as_array().unwrap();
+        assert_eq!(
+            dispatched.len(),
+            2,
+            "the plural shape is re-dispatched whole, never one entry"
+        );
+        assert_eq!(dispatched[0].as_str(), Some(first_uri));
+        assert_eq!(dispatched[1].as_str(), Some(second_uri));
+        assert_eq!(params["message"], "retry caption");
+        let rearmed = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rearmed.status, "pending");
+        assert_eq!(
+            rearmed
+                .attachments
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>(),
+            descriptor_ids,
+            "every descriptor keeps the first attempt's own id (same byte slots)"
+        );
+        assert_eq!(rearmed.attachments[0].filename.as_deref(), Some("one.txt"));
+        assert_eq!(
+            rearmed.attachments[0].content_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(rearmed.attachments[1].filename.as_deref(), Some("two.bin"));
+        assert!(
+            rearmed.attachments[1].is_gif,
+            "the stored gif marker rides the rebuild"
+        );
+        assert_eq!(rearmed.attachments[1].size, Some(17));
+        let row_count: i64 = service
+            .store_ref()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE account_id=?1 AND conversation_id=?2",
+                params![account.id.as_str(), conversation.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "a retry never adds a row");
+        assert_eq!(
+            service
+                .store_ref()
+                .outgoing_attachment_payloads(&account.id, client_request_id)
+                .unwrap()
+                .len(),
+            2,
+            "the rebuilt group is written back as the resend source"
+        );
+
+        let (settled, _events) = service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 616_161, None)
+            .unwrap();
+        assert_eq!(settled.id, pending_id);
+        assert_eq!(settled.status, "sent");
+        assert!(
+            service
+                .store_ref()
+                .outgoing_attachment_payloads(&account.id, client_request_id)
+                .unwrap()
+                .is_empty(),
+            "success settles the row and clears the whole payload group"
+        );
+    }
+
+    /// §4.264: the plural face refuses caller-supplied bytes (one call cannot
+    /// restate every entry's byte set) and refuses an incomplete payload group —
+    /// both before the rearm, so the failed row stays exactly as it was and stays
+    /// retryable ids-only once the group is whole again.
+    #[test]
+    fn retry_attachment_multi_refuses_bytes_and_an_incomplete_payload_group() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let client_request_id = "req-multi-guard";
+        let pending_id = match service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                &[
+                    MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
+                        data_base64: "YXR0YWNobWVudCBieXRlcw==".into(),
+                        size_bytes: 16,
+                        filename: Some("one.txt".into()),
+                        content_type: Some("text/plain".into()),
+                        blur_hash: None,
+                        gif: false,
+                    },
+                    MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
+                        data_base64: "c2Vjb25kIGF0dGFjaG1lbnQ=".into(),
+                        size_bytes: 17,
+                        filename: Some("two.bin".into()),
+                        content_type: Some("application/octet-stream".into()),
+                        blur_hash: None,
+                        gif: false,
+                    },
+                ],
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        service
+            .complete_send_failed_for_engine(&pending_id, &EngineError::ServerUnavailable)
+            .unwrap();
+
+        // Caller bytes on a plural row: refused, row untouched.
+        let error = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                Some("YXR0YWNobWVudCBieXRlcw=="),
+                Some(16),
+                Some("one.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "RETRY_NOT_ALLOWED");
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "failed", "the refusal never rearmed the row");
+
+        // A group missing one index is not a rebuildable generation.
+        assert!(
+            service
+                .store_ref()
+                .delete_outgoing_attachment_payload(&account.id, client_request_id, 1)
+                .unwrap(),
+            "the fixture drops the second entry's payload"
+        );
+        let error = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "RETRY_NOT_ALLOWED");
+        assert_eq!(
+            service
+                .store_ref()
+                .message_by_id(&account.id, &conversation.id, &pending_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+
+        // Restoring the missing index (per-index remember) makes it retryable.
+        service
+            .store_ref()
+            .remember_outgoing_attachment_payload(
+                &account.id,
+                &conversation.id,
+                client_request_id,
+                1,
+                "data:application/octet-stream;filename=two.bin;base64,c2Vjb25kIGF0dGFjaG1lbnQ=",
+                crate::link::now_ms(),
+            )
+            .unwrap();
+        let retried = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            retried,
+            PreparedSend::Dispatch { pending_id: ref retried_id, .. } if retried_id == &pending_id
+        ));
+    }
+
+    /// §4.263: a retry without bytes needs the persisted payload. When the row
+    /// is gone (legacy store, pruned, or never persisted) the retry answers
+    /// RETRY_NOT_ALLOWED and leaves the failed row retryable with bytes; the
+    /// caller-supplied arm restores the payload for the next refresh.
+    #[test]
+    fn retry_attachment_without_bytes_refuses_a_missing_payload() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let b64 = "YXR0YWNobWVudCBieXRlcw==";
+        let data_uri = "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw==";
+        let client_request_id = "req-attach-no-payload";
+        let pending_id = match service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        service
+            .complete_send_failed_for_engine(&pending_id, &EngineError::ServerUnavailable)
+            .unwrap();
+        assert!(
+            service
+                .store_ref()
+                .delete_outgoing_attachment_payloads(&account.id, client_request_id)
+                .unwrap()
+                > 0,
+            "the fixture removes the persisted payload"
+        );
+
+        let error = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                None,
+                None,
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "RETRY_NOT_ALLOWED");
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "failed", "the refusal never rearmed the row");
+
+        let retried = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                Some(b64),
+                Some(16),
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            retried,
+            PreparedSend::Dispatch { pending_id: ref retried_id, .. } if retried_id == &pending_id
+        ));
+        assert_eq!(
+            service
+                .store_ref()
+                .outgoing_attachment_payload(&account.id, client_request_id, 0)
+                .unwrap()
+                .as_deref(),
+            Some(data_uri),
+            "caller-supplied bytes restore the persisted payload"
+        );
+    }
+
+    /// §4.263: payload rows follow the same deletion cascades as the message
+    /// they belong to — dropping the conversation or the account removes the
+    /// original bytes too (the account deletion receipt counts them).
+    #[test]
+    fn attachment_payloads_follow_conversation_and_account_deletes() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let b64 = "YXR0YWNobWVudCBieXRlcw==";
+        let client_request_id = "req-attach-cascade";
+        let pending_id = match service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        service
+            .complete_send_failed_for_engine(&pending_id, &EngineError::ServerUnavailable)
+            .unwrap();
+        assert!(
+            service
+                .store_ref()
+                .outgoing_attachment_payload(&account.id, client_request_id, 0)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            service
+                .store_ref()
+                .delete_conversation(&account.id, &conversation.id, None, true)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            service
+                .store_ref()
+                .outgoing_attachment_payload(&account.id, client_request_id, 0)
+                .unwrap(),
+            None,
+            "the conversation delete takes the payload with it"
+        );
+
+        let other = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Other")
+            .unwrap();
+        let account_request = "req-attach-account-cascade";
+        let account_pending = match service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&other.id),
+                account_request,
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        service
+            .complete_send_failed_for_engine(&account_pending, &EngineError::ServerUnavailable)
+            .unwrap();
+        assert!(
+            service
+                .store_ref()
+                .delete_account_cascade(&account.id)
+                .unwrap()
+        );
+        assert_eq!(
+            service
+                .store_ref()
+                .outgoing_attachment_payload(&account.id, account_request, 0)
+                .unwrap(),
+            None,
+            "the account delete takes the payload with it"
+        );
+        let receipt = service
+            .store_ref()
+            .account_delete_receipt(&account.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.table_counts.get("outgoing_attachment_payloads"),
+            Some(&1),
+            "the deletion receipt counts the payload row"
+        );
+    }
+
+    /// §4.264: an explicit delete cascades the WHOLE payload group — dropping
+    /// the conversation removes every attachment index of a failed plural send,
+    /// not just index 0.
+    #[test]
+    fn attachment_payloads_cascade_every_index_on_explicit_delete() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let client_request_id = "req-multi-cascade";
+        let pending_id = match service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                &[
+                    MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
+                        data_base64: "YXR0YWNobWVudCBieXRlcw==".into(),
+                        size_bytes: 16,
+                        filename: Some("one.txt".into()),
+                        content_type: Some("text/plain".into()),
+                        blur_hash: None,
+                        gif: false,
+                    },
+                    MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
+                        data_base64: "c2Vjb25kIGF0dGFjaG1lbnQ=".into(),
+                        size_bytes: 17,
+                        filename: Some("two.bin".into()),
+                        content_type: Some("application/octet-stream".into()),
+                        blur_hash: None,
+                        gif: false,
+                    },
+                ],
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("a fresh request must dispatch"),
+        };
+        service
+            .complete_send_failed_for_engine(&pending_id, &EngineError::ServerUnavailable)
+            .unwrap();
+        assert_eq!(
+            service
+                .store_ref()
+                .outgoing_attachment_payloads(&account.id, client_request_id)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            service
+                .store_ref()
+                .delete_conversation(&account.id, &conversation.id, None, true)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            service
+                .store_ref()
+                .outgoing_attachment_payloads(&account.id, client_request_id)
+                .unwrap()
+                .is_empty(),
+            "the conversation delete takes every attachment index with it"
+        );
     }
 
     /// §4.134: a pre-revision attachment row that still carries a live
@@ -27735,6 +31936,7 @@ mod tests {
             Some("text/plain"),
             false,
             false,
+            None,
         )
         .unwrap();
         assert!(uri.starts_with("data:text/plain;filename=notes%20%E4%B8%8B%E8%BD%BD.txt;base64,"));
@@ -27744,32 +31946,94 @@ mod tests {
         assert_eq!(decoded, payload);
 
         // Default content type when none given.
-        let uri = build_attachment_data_uri(&b64, None, None, false, false).unwrap();
+        let uri = build_attachment_data_uri(&b64, None, None, false, false, None).unwrap();
         assert!(uri.starts_with("data:application/octet-stream;base64,"));
 
         // §4.30: the voice flag inserts the `;voice=true` parameter after the
         // mime type, before the filename and base64 payload markers.
-        let uri =
-            build_attachment_data_uri(&b64, Some("voice.ogg"), Some("audio/ogg"), true, false)
-                .unwrap();
+        let uri = build_attachment_data_uri(
+            &b64,
+            Some("voice.ogg"),
+            Some("audio/ogg"),
+            true,
+            false,
+            None,
+        )
+        .unwrap();
         assert!(uri.starts_with("data:audio/ogg;voice=true;filename=voice.ogg;base64,"));
 
         // §4.147: the GIF flag inserts the `;gif=true` parameter on the same
         // statement-parameter face — after the mime/voice slot, before the
         // filename and base64 markers — and coexists with the voice flag
         // byte-for-byte; `gif=false` inserts nothing.
-        let uri =
-            build_attachment_data_uri(&b64, Some("tenor.gif"), Some("image/gif"), false, true)
-                .unwrap();
+        let uri = build_attachment_data_uri(
+            &b64,
+            Some("tenor.gif"),
+            Some("image/gif"),
+            false,
+            true,
+            None,
+        )
+        .unwrap();
         assert!(uri.starts_with("data:image/gif;gif=true;filename=tenor.gif;base64,"));
-        let uri = build_attachment_data_uri(&b64, Some("clip.mp4"), Some("video/mp4"), true, true)
-            .unwrap();
-        assert!(uri.starts_with("data:video/mp4;voice=true;gif=true;filename=clip.mp4;base64,"));
         let uri =
-            build_attachment_data_uri(&b64, Some("clip.mp4"), Some("video/mp4"), false, false)
+            build_attachment_data_uri(&b64, Some("clip.mp4"), Some("video/mp4"), true, true, None)
                 .unwrap();
+        assert!(uri.starts_with("data:video/mp4;voice=true;gif=true;filename=clip.mp4;base64,"));
+        let uri = build_attachment_data_uri(
+            &b64,
+            Some("clip.mp4"),
+            Some("video/mp4"),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
         assert!(uri.starts_with("data:video/mp4;filename=clip.mp4;base64,"));
         assert!(!uri.contains("gif"), "gif=false appends no parameter");
+
+        // BUG-11 wire 批（契约 1.294 §4.284）：声明尺寸对插入
+        // ";width=<px>;height=<px>"（gif 之后、filename 之前），与既有
+        // 参数面共存；None = 不插任何参数（旧形状逐字节不变）。
+        let uri = build_attachment_data_uri(
+            &b64,
+            Some("photo.jpg"),
+            Some("image/jpeg"),
+            false,
+            false,
+            Some((640, 480)),
+        )
+        .unwrap();
+        assert!(
+            uri.starts_with("data:image/jpeg;width=640;height=480;filename=photo.jpg;base64,"),
+            "declared dimensions ride the data URI: {uri}"
+        );
+        let uri = build_attachment_data_uri(
+            &b64,
+            None,
+            Some("image/jpeg"),
+            false,
+            true,
+            Some((1, 16_384)),
+        )
+        .unwrap();
+        assert!(
+            uri.starts_with("data:image/jpeg;gif=true;width=1;height=16384;base64,"),
+            "dimensions append after gif and before the payload: {uri}"
+        );
+        let uri = build_attachment_data_uri(
+            &b64,
+            Some("photo.jpg"),
+            Some("image/jpeg"),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !uri.contains("width=") && !uri.contains("height="),
+            "no declared dimensions = no parameter (old shape): {uri}"
+        );
     }
 
     /// prepare_send_attachment (§4.12): validation failures leave no pending
@@ -28139,6 +32403,9 @@ mod tests {
         let b64_5 = "aGVsbG8="; // "hello", 5 raw
         let entries = vec![
             MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: b64_16.to_string(),
                 size_bytes: 16,
                 filename: Some("tenor.gif".into()),
@@ -28147,6 +32414,9 @@ mod tests {
                 gif: true,
             },
             MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: b64_5.to_string(),
                 size_bytes: 5,
                 filename: Some("notes.txt".into()),
@@ -28187,6 +32457,254 @@ mod tests {
         assert!(!row.attachments[1].is_gif);
     }
 
+    /// BUG-11 wire 批（契约 1.294 §4.284）：声明尺寸成对时上行 data URI 增
+    /// `;width=;height=` 两参数、pending 行 descriptor 记录 width/height；
+    /// 缺席 = 旧形状逐字节不变；半边/越界 = INVALID_REQUEST 且不落行。
+    #[test]
+    fn prepare_send_attachment_dimensions_ride_uri_and_descriptor() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let b64 = "YXR0YWNobWVudCBieXRlcw=="; // "attachment bytes", 16 raw
+
+        // 声明尺寸：URI 参数 + descriptor 两键（首个 tick 即终态盒）。
+        let prepared = service
+            .prepare_send_attachment_with_dimensions(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-dims-1",
+                b64,
+                16,
+                Some("photo.jpg"),
+                Some("image/jpeg"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+                Some((640, 480)),
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(
+            params["attachments"][0].as_str().unwrap(),
+            "data:image/jpeg;width=640;height=480;filename=photo.jpg;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-dims-1")
+            .unwrap()
+            .expect("the pending row exists");
+        assert_eq!(
+            (row.attachments[0].width, row.attachments[0].height),
+            (Some(640), Some(480))
+        );
+
+        // 未声明：URI 与 descriptor 逐字节回到 1.293 形状。
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-dims-2",
+                b64,
+                16,
+                Some("photo.jpg"),
+                Some("image/jpeg"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(
+            params["attachments"][0].as_str().unwrap(),
+            "data:image/jpeg;filename=photo.jpg;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-dims-2")
+            .unwrap()
+            .expect("the pending row exists");
+        assert_eq!(
+            (row.attachments[0].width, row.attachments[0].height),
+            (None, None)
+        );
+
+        // 越界与零：service 侧复核（host 形状闸的同口径第二道），不落行。
+        for bad in [
+            Some((0, 480)),
+            Some((640, 0)),
+            Some((16_385, 480)),
+            Some((640, 16_385)),
+        ] {
+            let rejected = service.prepare_send_attachment_with_dimensions(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-dims-bad",
+                b64,
+                16,
+                Some("photo.jpg"),
+                Some("image/jpeg"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+                bad,
+            );
+            assert!(rejected.is_err(), "bad dimensions {bad:?} must reject");
+            assert!(
+                service
+                    .store
+                    .message_by_client_request(&account.id, "req-dims-bad")
+                    .unwrap()
+                    .is_none(),
+                "a rejected send leaves no pending row"
+            );
+        }
+    }
+
+    /// BUG-11 wire 批复数面：条目级声明尺寸只染自己那条的 data URI 与
+    /// descriptor，逐条对齐、互不串号。
+    #[test]
+    fn prepare_send_attachment_multi_dimensions_ride_per_entry() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let b64_16 = "YXR0YWNobWVudCBieXRlcw=="; // 16 raw
+        let b64_5 = "aGVsbG8="; // 5 raw
+        let entries = vec![
+            MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
+                data_base64: b64_16.to_string(),
+                size_bytes: 16,
+                filename: Some("photo.jpg".into()),
+                content_type: Some("image/jpeg".into()),
+                blur_hash: None,
+                gif: false,
+            },
+            MessagesSendAttachmentEntry {
+                width: Some(320),
+                height: Some(240),
+                data_base64: b64_5.to_string(),
+                size_bytes: 5,
+                filename: Some("notes.txt".into()),
+                content_type: Some("text/plain".into()),
+                blur_hash: None,
+                gif: false,
+            },
+        ];
+        let prepared = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-dims",
+                &entries,
+                None,
+                None,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        let attachments = params["attachments"].as_array().unwrap();
+        assert_eq!(
+            attachments[0].as_str().unwrap(),
+            "data:image/jpeg;filename=photo.jpg;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        assert_eq!(
+            attachments[1].as_str().unwrap(),
+            "data:text/plain;width=320;height=240;filename=notes.txt;base64,aGVsbG8="
+        );
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-multi-dims")
+            .unwrap()
+            .expect("the pending multi row exists");
+        assert_eq!(
+            (row.attachments[0].width, row.attachments[0].height),
+            (None, None)
+        );
+        assert_eq!(
+            (row.attachments[1].width, row.attachments[1].height),
+            (Some(320), Some(240))
+        );
+
+        // 任一条半边 = 整批 INVALID_REQUEST，无 pending 行。
+        let bad = vec![MessagesSendAttachmentEntry {
+            width: Some(320),
+            height: None,
+            data_base64: b64_5.to_string(),
+            size_bytes: 5,
+            filename: None,
+            content_type: None,
+            blur_hash: None,
+            gif: false,
+        }];
+        let rejected = service.prepare_send_attachment_multi(
+            &account.id,
+            &AttachmentSendTarget::Conversation(&conversation.id),
+            "req-multi-dims-bad",
+            &bad,
+            None,
+            None,
+        );
+        assert!(rejected.is_err(), "a half pair must reject the whole batch");
+        assert!(
+            service
+                .store
+                .message_by_client_request(&account.id, "req-multi-dims-bad")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// BUG-11 wire 批形状矩阵：双参同进退、正整数、1..=MAX_ATTACHMENT_DIMENSION_PX。
+    #[test]
+    fn attachment_dimensions_validation_matrix() {
+        // 全缺 = 未声明（旧形状）。
+        assert_eq!(validate_attachment_dimensions(None, None).unwrap(), None);
+        // 成对合法值：下界与上界可收。
+        assert_eq!(
+            validate_attachment_dimensions(Some(1), Some(1)).unwrap(),
+            Some((1, 1))
+        );
+        assert_eq!(
+            validate_attachment_dimensions(Some(16_384), Some(16_384)).unwrap(),
+            Some((16_384, 16_384))
+        );
+        // 半边 = 同进退拒绝。
+        for (w, h) in [(Some(640), None), (None, Some(480))] {
+            let error = validate_attachment_dimensions(w, h).unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        }
+        // 零/越界 = 拒绝。
+        for (w, h) in [
+            (Some(0), Some(480)),
+            (Some(640), Some(0)),
+            (Some(16_385), Some(480)),
+            (Some(640), Some(16_385)),
+        ] {
+            let error = validate_attachment_dimensions(w, h).unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        }
+        // 已配对复核与形状复核同口径（service 侧第二道）。
+        assert_eq!(
+            validate_attachment_dimensions_pair(Some((2, 3))).unwrap(),
+            Some((2, 3))
+        );
+        assert!(validate_attachment_dimensions_pair(Some((2, 0))).is_err());
+    }
+
     /// Contract 1.66 (§4.59): the plural form sends ONE upstream message
     /// whose array-typed `attachments` carries every entry in order — the
     /// official forward face. The pending row carries one descriptor per
@@ -28208,6 +32726,9 @@ mod tests {
                 .iter()
                 .map(
                     |(data, size, filename, content_type)| MessagesSendAttachmentEntry {
+                        // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                        width: None,
+                        height: None,
                         data_base64: (*data).to_string(),
                         size_bytes: *size,
                         filename: filename.map(str::to_string),
@@ -28320,6 +32841,9 @@ mod tests {
         // behind.
         let oversized: Vec<MessagesSendAttachmentEntry> = (0..33)
             .map(|_| MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: b64_5.to_string(),
                 size_bytes: 5,
                 filename: Some("a.txt".into()),
@@ -28353,6 +32877,9 @@ mod tests {
         // rejection needs no megabyte payloads.
         let heavy: Vec<MessagesSendAttachmentEntry> = (0..2)
             .map(|_| MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: b64_5.to_string(),
                 size_bytes: 60_000_000,
                 filename: Some("big.bin".into()),
@@ -31016,13 +35543,139 @@ mod tests {
         assert!(upstream.get("recipient").is_none());
     }
 
+    /// `identities.verify` 的 wire 形状回归锁（2026-11 复核）：camelCase 键
+    /// 必须解出两臂字段——§4.223 落地批（8dc7ed3）把 `rename_all =
+    /// "camelCase", deny_unknown_fields` 一起丢了，实测每个 camelCase 请求
+    /// 都折成 INVALID_REQUEST（identities.verify 整面不可达）；未知键
+    /// （trustAllKnownKeys）继续 fail-closed。
+    #[test]
+    fn identities_verify_params_deserialize_the_camel_case_wire_shape() {
+        let verified: IdentitiesVerifyParams = serde_json::from_value(serde_json::json!({
+            "accountId": "acct-1",
+            "conversationId": "conv-1",
+            "safetyNumber": "12345 67890"
+        }))
+        .unwrap();
+        assert_eq!(verified.safety_number.as_deref(), Some("12345 67890"));
+        assert!(verified.state.is_none());
+
+        let reset: IdentitiesVerifyParams = serde_json::from_value(serde_json::json!({
+            "accountId": "acct-1",
+            "conversationId": "conv-1",
+            "state": "default"
+        }))
+        .unwrap();
+        assert_eq!(reset.state.as_deref(), Some("default"));
+        assert!(reset.safety_number.is_none());
+
+        // 契约 §4.265：peerKey 面是同一个 wire 形状（camelCase，conversationId
+        // 缺席），两臂解码与旧面同源。
+        let peer_get: IdentitiesGetParams = serde_json::from_value(serde_json::json!({
+            "accountId": "acct-1",
+            "peerKey": "99999999-9999-9999-9999-999999999999"
+        }))
+        .unwrap();
+        assert_eq!(
+            peer_get.peer_key.as_deref(),
+            Some("99999999-9999-9999-9999-999999999999")
+        );
+        assert!(peer_get.conversation_id.is_none());
+        let e164_get: IdentitiesGetParams = serde_json::from_value(serde_json::json!({
+            "accountId": "acct-1",
+            "peerKey": "+15555550199"
+        }))
+        .unwrap();
+        assert_eq!(e164_get.peer_key.as_deref(), Some("+15555550199"));
+        let peer_verify: IdentitiesVerifyParams = serde_json::from_value(serde_json::json!({
+            "accountId": "acct-1",
+            "peerKey": "+15555550199",
+            "state": "default"
+        }))
+        .unwrap();
+        assert_eq!(peer_verify.peer_key.as_deref(), Some("+15555550199"));
+        assert!(peer_verify.conversation_id.is_none());
+        assert_eq!(peer_verify.state.as_deref(), Some("default"));
+
+        // 未知键 fail-closed（testing-only trustAllKnownKeys 永不上 wire；
+        // 会话寻址键也不许搭在 peerKey 面上）。
+        assert!(
+            serde_json::from_value::<IdentitiesVerifyParams>(serde_json::json!({
+                "accountId": "acct-1",
+                "conversationId": "conv-1",
+                "safetyNumber": "12345 67890",
+                "trustAllKnownKeys": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<IdentitiesGetParams>(serde_json::json!({
+                "accountId": "acct-1",
+                "peerKey": "+15555550199",
+                "conversationId": "conv-1"
+            }))
+            .is_ok(),
+            "both addressing keys deserialize; the exactly-one gate is the \
+             addressing decoder's job, not serde's"
+        );
+        assert!(
+            serde_json::from_value::<IdentitiesGetParams>(serde_json::json!({
+                "accountId": "acct-1",
+                "peerKey": "+15555550199",
+                "kind": "direct"
+            }))
+            .is_err()
+        );
+    }
+
+    /// 契约 §4.223 两臂解码 + §4.244 写穿词的单点纯函数（verify 语义的
+    /// 唯一来源；supervisor 只装配）：两臂恰一，双臂同置 / 双缺 / 词表外
+    /// state 一律 fail-closed INVALID_REQUEST；写穿词绝不把 sendAnyway
+    /// 升格成 verified（DEFAULT 写 ≠ VERIFIED 写）。
+    #[test]
+    fn identities_verify_two_arm_decode_and_stamp_words_are_fail_closed() {
+        match identities_verify_intent(Some("12345 67890"), None).unwrap() {
+            IdentitiesVerifyIntent::Verified { safety_number } => {
+                assert_eq!(safety_number, "12345 67890", "数字原样回传");
+            }
+            other => panic!("the digits arm decodes to Verified, got {other:?}"),
+        }
+        assert!(matches!(
+            identities_verify_intent(None, Some("default")).unwrap(),
+            IdentitiesVerifyIntent::TrustDefault
+        ));
+
+        for (request_id, safety_number, state) in [
+            ("both-arms", Some("12345 67890"), Some("default")),
+            ("neither-arm", None, None),
+            ("unverified-word", None, Some("unverified")),
+            ("verified-word", None, Some("verified")),
+            ("empty-state", None, Some("")),
+        ] {
+            let error = identities_verify_intent(safety_number, state).unwrap_err();
+            assert_eq!(error.code, "INVALID_REQUEST", "{request_id}");
+        }
+
+        assert_eq!(
+            identity_verify_stamp_word(&IdentitiesVerifyIntent::Verified {
+                safety_number: "12345 67890".to_string(),
+            }),
+            "TRUSTED_VERIFIED"
+        );
+        assert_eq!(
+            identity_verify_stamp_word(&IdentitiesVerifyIntent::TrustDefault),
+            "TRUSTED_UNVERIFIED",
+            "sendAnyway 的写穿是 DEFAULT 面，绝不冒充 verified"
+        );
+    }
+
     /// The safety-number faces (contract revision 1.68, §4.61): the read
     /// narrows the pinned listIdentities call to the resolved peer reference
     /// (`number` key); the verify carries it as `recipient` beside the echoed
     /// verification digits (`verifiedSafetyNumber` — never the testing-only
-    /// trustAllKnownKeys mode). The 1:1 gate fails group/legacy rows and the
-    /// §4.42 self row (empty peer reference) closed before any upstream call;
-    /// bounds and resolution fail closed in wire order.
+    /// trustAllKnownKeys mode), or the §4.223 trust-reset `state` word on the
+    /// sendAnyway arm. The 1:1 gate fails group/legacy rows and the §4.42 self
+    /// row (empty peer reference) closed before any upstream call; bounds and
+    /// resolution fail closed in wire order.
     #[test]
     fn prepare_identity_faces_gate_one_to_one_and_forward_peer_reference() {
         let (_temp, mut service) = service();
@@ -31048,6 +35701,22 @@ mod tests {
             .unwrap();
         assert_eq!(upstream["recipient"], conversation.peer_key);
         assert_eq!(upstream["verifiedSafetyNumber"], "12345 67890");
+        assert!(upstream.get("trustAllKnownKeys").is_none());
+
+        // 契约 §4.223 信任重置臂（官方 sendAnyway）：同一 upstream 面，走
+        // peer reference + `state` 词，**不带** safetyNumber /
+        // verifiedSafetyNumber——无比对闸，数字一个键也不上 wire。
+        let upstream = service
+            .prepare_identities_verify(
+                &account.id,
+                &conversation.id,
+                &IdentitiesVerifyIntent::TrustDefault,
+            )
+            .unwrap();
+        assert_eq!(upstream["recipient"], conversation.peer_key);
+        assert_eq!(upstream["state"], "default");
+        assert!(upstream.get("safetyNumber").is_none());
+        assert!(upstream.get("verifiedSafetyNumber").is_none());
         assert!(upstream.get("trustAllKnownKeys").is_none());
 
         // The verification string bound fails closed before any upstream
@@ -31128,6 +35797,170 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.into_api().code, expected, "{request_id}");
         }
+    }
+
+    /// 契约 1.281（§4.265）peer 寻址面：无 direct 会话的 peer 直接按引用读/
+    /// 写账号 identity store；寻址恰一（双缺/同置 fail-closed）；peerKey 只认
+    /// ACI UUID 或 E.164；写穿按 peer 键落 trust 词（有 direct 行才写得到
+    /// 投影，没有就是如实的 no-row 答案）。旧 conversationId 面的写穿同位。
+    #[test]
+    fn identity_peer_addressing_reads_without_a_conversation_and_stamps_by_peer() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        const ACI: &str = "99999999-9999-9999-9999-999999999999";
+        const PEER: &str = "+15555550199";
+
+        // 寻址解码：恰一。
+        assert_eq!(
+            identities_addressing(Some("conv-1"), None).unwrap(),
+            IdentitiesTarget::Conversation("conv-1")
+        );
+        assert_eq!(
+            identities_addressing(None, Some(ACI)).unwrap(),
+            IdentitiesTarget::Peer(ACI)
+        );
+        assert_eq!(
+            identities_addressing(None, Some(PEER)).unwrap(),
+            IdentitiesTarget::Peer(PEER)
+        );
+        for (request_id, conversation_id, peer_key) in [
+            ("both-forms", Some("conv-1"), Some(PEER)),
+            ("neither-form", None, None),
+            ("empty-conversation", Some(""), None),
+            ("over-bound-conversation", Some(&"c".repeat(257)[..]), None),
+            ("empty-peer", None, Some("")),
+            ("bare-digits", None, Some("15555550199")),
+            ("group-key", None, Some("ZmFrZS1ncm91cC0x")),
+            ("username", None, Some("u:alice.01")),
+            (
+                "pni",
+                None,
+                Some("PNI:99999999-9999-9999-9999-999999999999"),
+            ),
+            ("over-bound-peer", None, Some(&"9".repeat(65)[..])),
+        ] {
+            let error = identities_addressing(conversation_id, peer_key).unwrap_err();
+            assert_eq!(error.code, "INVALID_REQUEST", "{request_id}");
+        }
+
+        // 读面：store 里没有这个 peer 的 direct 行，prepared upstream 仍直接
+        // 按 peer 引用读账号 identity store（引擎是唯一权威）。
+        assert!(
+            service
+                .store_ref()
+                .conversation_by_peer(&account.id, "direct", PEER)
+                .unwrap()
+                .is_none(),
+            "the peer arm must not need a conversation row"
+        );
+        let upstream = service
+            .prepare_identities_get_for_target(&account.id, &IdentitiesTarget::Peer(PEER))
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["number"], PEER);
+        // uuid 形原样上 wire（未解析、未小写化、未换算成号码）。
+        let upstream = service
+            .prepare_identities_get_for_target(&account.id, &IdentitiesTarget::Peer(ACI))
+            .unwrap();
+        assert_eq!(upstream["number"], ACI);
+        // 读面仍然要求账号存在（形状之后、上游之前）。
+        let error = service
+            .prepare_identities_get_for_target("no-such-account", &IdentitiesTarget::Peer(PEER))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+
+        // 写面两臂：同一 peer 引用上 wire，state 臂无数字，verified 臂带数字。
+        let reset = service
+            .prepare_identities_verify_for_target(
+                &account.id,
+                &IdentitiesTarget::Peer(PEER),
+                &IdentitiesVerifyIntent::TrustDefault,
+            )
+            .unwrap();
+        assert_eq!(reset["account"], "+15555550100");
+        assert_eq!(reset["recipient"], PEER);
+        assert_eq!(reset["state"], "default");
+        assert!(reset.get("verifiedSafetyNumber").is_none());
+        assert!(reset.get("trustAllKnownKeys").is_none());
+        let verified = service
+            .prepare_identities_verify_for_target(
+                &account.id,
+                &IdentitiesTarget::Peer(ACI),
+                &IdentitiesVerifyIntent::Verified {
+                    safety_number: "12345 67890".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(verified["recipient"], ACI);
+        assert_eq!(verified["verifiedSafetyNumber"], "12345 67890");
+        assert!(verified.get("state").is_none());
+        assert!(verified.get("trustAllKnownKeys").is_none());
+        // 数字串的 wire bound 在 peer 面同样先于任何解析。
+        let error = service
+            .prepare_identities_verify_for_target(
+                &account.id,
+                &IdentitiesTarget::Peer(PEER),
+                &IdentitiesVerifyIntent::Verified {
+                    safety_number: String::new(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // 写穿：无 direct 行 → 如实的 no-row 答案（false），不是错误。
+        assert!(
+            !service
+                .stamp_identity_verified(
+                    &account.id,
+                    &IdentitiesTarget::Peer(PEER),
+                    identity_verify_stamp_word(&IdentitiesVerifyIntent::TrustDefault),
+                )
+                .unwrap()
+        );
+        let verified_bit = |service: &ConnectorService, id: &str| {
+            service
+                .store_ref()
+                .conversation_summary(&account.id, id)
+                .unwrap()
+                .unwrap()
+                .verified
+        };
+        assert_eq!(verified_bit(&service, &conversation.id), None);
+        // peer 臂：state/safetyNumber 两臂的写穿词各自落到既有 direct 行的
+        // verified 位（TRUSTED_UNVERIFIED → false，TRUSTED_VERIFIED → true）。
+        assert!(
+            service
+                .stamp_identity_verified(
+                    &account.id,
+                    &IdentitiesTarget::Peer(&conversation.peer_key),
+                    identity_verify_stamp_word(&IdentitiesVerifyIntent::TrustDefault),
+                )
+                .unwrap()
+        );
+        assert_eq!(verified_bit(&service, &conversation.id), Some(false));
+        assert!(
+            service
+                .stamp_identity_verified(
+                    &account.id,
+                    &IdentitiesTarget::Peer(&conversation.peer_key),
+                    identity_verify_stamp_word(&IdentitiesVerifyIntent::Verified {
+                        safety_number: "12345 67890".to_string(),
+                    }),
+                )
+                .unwrap()
+        );
+        assert_eq!(verified_bit(&service, &conversation.id), Some(true));
+        // 旧 conversationId 面的写穿同位（不回归）。
+        assert!(
+            service
+                .stamp_identity_verified(
+                    &account.id,
+                    &IdentitiesTarget::Conversation(&conversation.id),
+                    "TRUSTED_UNVERIFIED",
+                )
+                .unwrap()
+        );
+        assert_eq!(verified_bit(&service, &conversation.id), Some(false));
     }
 
     /// The safety-number read projection (contract revision 1.68, §4.61):
@@ -34955,6 +39788,65 @@ mod tests {
             counters[crate::perf_metrics::keys::ACCOUNT_TRANSIENT_UNATTRIBUTED],
             2
         );
+    }
+
+    /// SIGNAL-GATE-TRACE-PLAN §2: the connector forwarding arms emit exactly
+    /// one fixed-shape line per storage-pull / initial-sync / contact-sync
+    /// forward or drop, and no line carries the signal number.
+    #[test]
+    fn gate_trace_covers_forward_and_drop_faces() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let output = captured_gate_trace(|| {
+            service
+                .forward_storage_pull("+15555550100", "fetchLatest", true, false)
+                .unwrap();
+            service
+                .forward_storage_pull("+15555550999", "fetchLatest", true, false)
+                .unwrap();
+            service
+                .forward_initial_sync_complete("+15555550100", true, true)
+                .unwrap();
+            service
+                .forward_initial_sync_complete("+15555550999", true, true)
+                .unwrap();
+            let account_row = service
+                .store_ref()
+                .account_by_id(&account.id)
+                .unwrap()
+                .expect("account row");
+            service
+                .apply_sync_contacts(&account_row, &[], true)
+                .unwrap();
+            service
+                .apply_sync_contacts(&account_row, &[], false)
+                .unwrap();
+            let unbound = control_receive(
+                "+15555550999",
+                "+15555550999",
+                ControlReceive::SyncContacts {
+                    contacts: Vec::new(),
+                    complete: true,
+                },
+            );
+            service
+                .ingest_receive(unbound, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap();
+        });
+        let expected = [
+            "[gate-trace] hop=conn event=storage-pull account=0cbf0194 face=ok detail=forwarded trigger=fetchLatest contactsOk=true groupsOk=false",
+            "[gate-trace] hop=conn event=storage-pull account=ebe4f53b face=fail detail=account-unresolved",
+            "[gate-trace] hop=conn event=initial-sync account=0cbf0194 face=ok detail=forwarded manifestOk=true profilesOk=true",
+            "[gate-trace] hop=conn event=initial-sync account=ebe4f53b face=fail detail=account-unresolved",
+            "[gate-trace] hop=conn event=contact-sync account=0cbf0194 face=ok detail=forwarded records=0 complete=true",
+            "[gate-trace] hop=conn event=contact-sync account=0cbf0194 face=- detail=partial records=0 complete=false",
+            "[gate-trace] hop=conn event=contact-sync account=ebe4f53b face=fail detail=account-unresolved unbound",
+        ];
+        for line in expected {
+            assert!(output.contains(line), "missing {line:?} in {output}");
+        }
+        assert!(!output.contains("+15555550100"), "{output}");
+        assert!(!output.contains("+15555550999"), "{output}");
     }
 
     /// The story receive projection is a verbatim pipe (contract 1.91,
@@ -39854,7 +44746,10 @@ mod tests {
             let mut receive = control_receive(
                 "+15555550100",
                 "+15555550100",
-                ControlReceive::SyncContacts { contacts },
+                ControlReceive::SyncContacts {
+                    contacts,
+                    complete: false,
+                },
             );
             receive.source = None;
             receive
@@ -39907,6 +44802,20 @@ mod tests {
                 .as_deref(),
             Some("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
         );
+        // Official completion-only final blob still emits the completion
+        // event even when it carries no records.
+        let account_row = service
+            .store_ref()
+            .account_by_id(&account.id)
+            .unwrap()
+            .expect("account row");
+        let completion = service
+            .apply_sync_contacts(&account_row, &[], true)
+            .unwrap();
+        assert!(matches!(
+            completion.as_slice(),
+            [HostSideEvent::ContactSyncCompleted { account_id }] if account_id == &account.id
+        ));
         // The aci-only sibling writes nothing: its peer key *is* the ACI,
         // the self-row the §4.37 ladder skips.
         assert!(
@@ -42845,6 +47754,7 @@ mod tests {
                     number: Some(peer_number.into()),
                     name: Some("Sync Peer".into()),
                 }],
+                false,
             )
             .unwrap();
 
@@ -43747,6 +48657,9 @@ mod tests {
         let second = b"second entry!".to_vec();
         let entries = vec![
             MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: base64_encode(&first),
                 size_bytes: first.len() as u64,
                 filename: Some("a.txt".into()),
@@ -43755,6 +48668,9 @@ mod tests {
                 gif: false,
             },
             MessagesSendAttachmentEntry {
+                // 契约 1.294 §4.284：声明尺寸（本用例不声明，旧形状零变化）。
+                width: None,
+                height: None,
                 data_base64: base64_encode(&second),
                 size_bytes: second.len() as u64,
                 filename: Some("b.txt".into()),
