@@ -85,12 +85,15 @@ reap_group() {
 }
 
 run_gate() {
-  local gate="$1"
+  local gate="$1"; shift
   local -a cargo_args=()
   case "$gate" in
     fmt)    cargo_args=(fmt --check) ;;
     clippy) cargo_args=(clippy --all-targets --all-features -- -D warnings) ;;
-    test)   cargo_args=(test) ;;
+    # 额外参数透传（CI 在 Linux 上只跑 `test --lib`：集成测试依赖的 python
+    # fixture 在 runner 上起不来，追踪 issue #7）。原先这里写死 `test`，
+    # 调用方传的 --lib 被静默丢掉。
+    test)   cargo_args=(test "$@") ;;
     build)  cargo_args=(build --release) ;;
   esac
   printf '[gate] >>> cargo %s\n' "${cargo_args[*]}"
