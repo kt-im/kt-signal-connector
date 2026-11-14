@@ -60,7 +60,10 @@ fn spawn_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
         .arg("--state-dir")
         .arg(root.join("state"))
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        // tracing_subscriber::fmt() 默认写 **stdout**，stdout:null 会把 connector
+        // 的全部日志（含引擎启动失败的原因）直接丢掉——排查 Linux 上
+        // runtime 恒 stopped 时，stderr 干净但真正的证据在此之前就被吃了。
+        .stdout(Stdio::inherit())
         // stderr 直通而不是 piped：piped 且没人读时，缓冲写满会把子进程堵死，
         // 而且引擎起不来的原因（python fixture 的 traceback / spawn 失败）全
         // 沉在管道里——Linux job 上 runtime 一直 stopped 就是这个盲区。
