@@ -99,6 +99,46 @@ async fn read_timeout_and_send_timeout_have_distinct_outcomes() {
     engine.shutdown().await.unwrap();
 }
 
+/// Contract 1.285 (§4.269): the engine's -32000 (EngineTimeoutException)
+/// dispatch face is class-split. A READ-ONLY call cannot have written
+/// anything and keeps the structured `EngineRequestTimeout` face with the
+/// engine's promised data (the supervisor answers ENGINE_TIMEOUT); the same
+/// answer on a MUTATING call may already have been written and folds to the
+/// existing `UnknownOutcome` (SEND_OUTCOME_UNKNOWN, row unknown, no retry).
+#[tokio::test]
+async fn engine_dispatch_timeout_is_class_split_between_read_and_mutating() {
+    let (temp, engine, _receives) = engine(Duration::from_secs(3)).await;
+    std::fs::write(
+        temp.path()
+            .join("signal-data/.fixture-version-engine-timeout"),
+        b"",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path()
+            .join("signal-data/.fixture-send-engine-timeout-armed"),
+        b"",
+    )
+    .unwrap();
+
+    match engine.call("version", json!({}), CallClass::ReadOnly).await {
+        Err(EngineError::EngineRequestTimeout { data }) => {
+            let data = data.expect("the read-only face keeps the engine payload");
+            assert_eq!(data["reason"], json!("REQUEST_TIMEOUT"));
+            assert_eq!(data["retryable"], json!(false));
+            assert_eq!(data["timeoutMs"], json!(60000));
+        }
+        other => panic!("read-only timeout must keep the structured face, got {other:?}"),
+    }
+
+    assert_eq!(
+        engine.call("send", json!({}), CallClass::Mutating).await,
+        Err(EngineError::UnknownOutcome),
+        "a cancelled mutating dispatch may have been written: unknown outcome"
+    );
+    engine.shutdown().await.unwrap();
+}
+
 /// Polls the engine event stream until the actor reports a response whose id
 /// no pending entry claims (`pending.remove` miss in `handle_upstream_line`)
 /// — the deterministic barrier proving a late answer landed and was dropped
@@ -138,7 +178,7 @@ async fn read_only_late_response_is_dropped_not_misattributed() {
         )
         .await
         .unwrap();
-    assert_eq!(warmup, json!({ "method": "version" }));
+    assert_eq!(warmup["name"], json!("kt-signal-engine"));
 
     assert_eq!(
         engine
@@ -156,7 +196,7 @@ async fn read_only_late_response_is_dropped_not_misattributed() {
         .call("version", json!({}), CallClass::ReadOnly)
         .await
         .unwrap();
-    assert_eq!(result, json!({ "method": "version" }));
+    assert_eq!(result["name"], json!("kt-signal-engine"));
     engine.shutdown().await.unwrap();
 }
 
@@ -201,7 +241,7 @@ async fn crash_exits_and_a_new_engine_can_start() {
         .call("version", json!({}), CallClass::ReadOnly)
         .await
         .unwrap();
-    assert_eq!(result, json!({ "method": "version" }));
+    assert_eq!(result["name"], json!("kt-signal-engine"));
     restarted.shutdown().await.unwrap();
 }
 

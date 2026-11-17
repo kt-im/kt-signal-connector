@@ -16,66 +16,82 @@ use crate::engine::{
     NormalizedReceive, QueuedReceive, ReceiveIngress, WATCHDOG_LIVENESS_BACKOFF_CAP, event_channel,
     receive_channel,
 };
+use crate::event_publisher::EventPublisher;
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::link::now_ms;
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
-    AccountDeviceCapabilities, AccountUsername, AccountsDeviceCapabilitiesParams,
-    AccountsGetDevicesParams, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
-    AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUnlinkDeviceParams,
-    AccountsUpdateConfigurationParams, AttachmentSendTarget, AvatarDownload, BlockedConversations,
-    CallLinkSyncs, CallsSendGroupCallUpdateParams, CallsSendSignalParams, ChatFolderSyncs,
-    ChatFoldersListParams, ChatFoldersSetRecordsParams, CommonGroupsDetails, ConnectorService,
-    ContactsSyncOutcome, ConversationState, ConversationsGetAvatarParams,
-    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
-    ConversationsReportSpamParams, ConversationsReportSpamResult, ConversationsSetBlockedParams,
-    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
-    ConversationsSetPinnedParams, ConversationsSetStateParams, DeviceList,
-    GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails,
-    GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword, GroupInviteLinkPreview,
-    GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams,
-    GroupsCreateParams, GroupsCreateResult, GroupsInviteLinkPasswordParams,
-    GroupsJoinViaLinkParams, GroupsMigrateParams, GroupsMigrateResult, GroupsParseInviteLinkParams,
-    GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
-    GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams,
-    IdentitiesVerifyIntent, IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome,
-    ImportGroupsSummary, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
-    MAX_STORY_RECIPIENTS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
-    MergeContactsSummary, MessageRequestOutcome, MessageRequestParams,
-    MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams, MessagesReportSpamParams,
-    MessagesSendContactParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
-    MessagesSendPollVoteParams, MessagesSendStickerParams, MessagesSendStoryParams,
-    NotificationProfileSyncs, NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
-    PeerTarget, PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
-    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
-    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
-    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
-    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams, StoriesDisabled,
-    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
-    StoriesSetDisabledParams, StoryDistributionListSyncs, StoryDistributionListsListParams,
-    StoryDistributionListsSetRecordsParams, StorySendGroupFace, StorySendRecipientResult,
-    StorySendResult, StorySendSuccess, UsernameLookupEntry, UsernameLookupParams,
-    UsernameLookupResult, account_device_capabilities_from_engine, account_limit_error,
-    blocked_conversations_result, call_link_syncs_result, chat_folder_syncs_result,
-    conversation_state_from_engine, device_list_from_engine, group_create_result_from_engine,
-    group_invite_join_status_from_engine, group_invite_link_parse_from_engine,
-    group_invite_link_password_from_engine, group_invite_link_preview_from_engine,
-    group_migrate_result_from_engine, identity_from_engine, import_groups_summary_from_engine,
-    merge_contacts_summary_from_engine, notification_profile_syncs_result,
-    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
-    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
-    story_distribution_lists_result, validate_account_delete_operation_id,
+    AccountDeviceCapabilities, AccountSyncState, AccountUsername, AccountsDeviceCapabilitiesParams,
+    AccountsGetDevicesParams, AccountsGetSyncStateParams, AccountsGetUsernameParams,
+    AccountsSetExpireTimerParams, AccountsSetProfileParams, AccountsSetUsernameParams,
+    AccountsUnlinkDeviceParams, AccountsUpdateConfigurationParams, AttachmentSendTarget,
+    AvatarDownload, BlockedConversations, CallLinkSyncs, CallsSendGroupCallUpdateParams,
+    CallsSendSignalParams, ChatFolderSyncs, ChatFoldersListParams, ChatFoldersSetRecordsParams,
+    CommonGroupsDetails, ConnectorService, ContactsSyncOutcome, ConversationState,
+    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
+    ConversationsGetStateParams, ConversationsReportSpamParams, ConversationsReportSpamResult,
+    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
+    ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, ConversationsSetStateParams,
+    DeviceList, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES,
+    GroupDetails, GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword,
+    GroupInviteLinkPreview, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
+    GroupsCancelJoinRequestParams, GroupsCreateParams, GroupsCreateResult,
+    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
+    GroupsMigrateResult, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
+    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
+    HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
+    IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary, MAX_AVATAR_DATA_URI_CHARS,
+    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView,
+    MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary, MessageRequestOutcome,
+    MessageRequestParams, MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams,
+    MessagesReportSpamParams, MessagesSendContactParams, MessagesSendPollCreateParams,
+    MessagesSendPollTerminateParams, MessagesSendPollVoteParams, MessagesSendStickerParams,
+    MessagesSendStoryParams, NotificationProfileSyncs, NotificationProfilesListParams,
+    NotificationProfilesSetRecordsParams, PeerTarget, PhoneLookupEntry, PhoneLookupParams,
+    PhoneLookupResult, PinnedConversations, PreparedHistoryDownload, PreparedSend,
+    ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams,
+    SendTextStyleParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
+    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
+    StickerPackSetSyncParams, StickerPackSyncs, StorageGetCallLinksParams, StorageIngestParams,
+    StorageSetCallLinkParams, StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams,
+    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListSyncs,
+    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, StorySendGroupFace,
+    StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
+    UsernameLookupParams, UsernameLookupResult, account_device_capabilities_from_engine,
+    account_limit_error, blocked_conversations_result, call_link_syncs_result,
+    chat_folder_syncs_result, conversation_state_from_engine, device_list_from_engine,
+    group_create_result_from_engine, group_invite_join_status_from_engine,
+    group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
+    group_invite_link_preview_from_engine, group_migrate_result_from_engine, identities_addressing,
+    identities_verify_intent, identity_from_engine, identity_verify_stamp_word,
+    import_groups_summary_from_engine, merge_contacts_summary_from_engine,
+    notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
+    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
+    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
+    story_distribution_lists_result, sync_state_from_engine, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
     MessageRecord, Page, Store, StoreError, SyncedContact,
 };
 
-// Match link QR lifetime so a slow phone confirmation can still complete.
-const LINK_FINISH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Phone-approval wait for `finishLink`. Pinned above both deadlines it must
+/// never pre-empt: the engine's own finish dispatch budget (360 s) and the
+/// desktop's link wait (330 s). A connector that answered first would turn a
+/// link the engine may still commit into a client-side failure — and re-running
+/// `finishLink` claims a second device slot. When this budget does expire the
+/// answer is therefore the link-class unknown outcome (the desktop's adopt
+/// path), never a retryable `UPSTREAM_TIMEOUT`.
+const LINK_FINISH_TIMEOUT: Duration = Duration::from_secs(370);
+/// BUG-8: a `link.finish` whose number still has a `started` local-data
+/// delete waits this long (3 × 5 s) for it to settle before committing.
+/// Committing over the delete would erase the fresh link, refusing at once
+/// would leave the phone-approved device registered with no desktop account
+/// (the phantom-device field shape) — a bounded wait is the only answer that
+/// keeps a genuinely concurrent delete honest and still lets the link land.
+const LINK_FINISH_DELETE_SETTLE_ATTEMPTS: u32 = 3;
+const LINK_FINISH_DELETE_SETTLE_INTERVAL: Duration = Duration::from_secs(5);
 const RECEIVE_STORE_RETRY_MIN: Duration = Duration::from_millis(100);
 const RECEIVE_STORE_RETRY_MAX: Duration = Duration::from_secs(5);
 const WATCHDOG_PING_TIMEOUT: Duration = Duration::from_secs(15);
@@ -422,6 +438,47 @@ fn arm_pending_restart(pending: &mut Option<PendingRestart>, candidate: PendingR
     true
 }
 
+/// One `listAccounts` answer projected for the store sync: each entry's
+/// number, its optional own-ACI (contract 1.142 §4.138: the engine reports
+/// the account's identity beside the number; the connector never invents one
+/// from the opaque local row id), and the optional own-profile capabilities
+/// bit (contract 1.194 §4.194: only the backfill bit the desktop gate
+/// consumes rides; absent/ill-typed = absent, never folded to false).
+///
+/// A non-array answer projects to no rows: an engine that answers the wrong
+/// shape is "could not report an account", never an empty-but-valid list.
+fn project_engine_account_rows(
+    result: &Value,
+) -> Vec<(
+    String,
+    Option<String>,
+    Option<crate::store::AccountCapabilities>,
+)> {
+    result
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let number = item.get("number")?.as_str()?;
+                    let capabilities = item
+                        .get("capabilities")
+                        .and_then(|caps| caps.get("attachmentBackfill"))
+                        .and_then(Value::as_bool)
+                        .map(|attachment_backfill| crate::store::AccountCapabilities {
+                            attachment_backfill,
+                        });
+                    Some((
+                        number.to_string(),
+                        item.get("aci").and_then(Value::as_str).map(str::to_string),
+                        capabilities,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 /// The engine's own account list as a number set, or `None` when the engine
 /// could not answer (or answered a shape that is not an array). Unverified
 /// is deliberately NOT the same as "no accounts": the caller must never
@@ -518,6 +575,39 @@ fn link_cancelled_error() -> ServiceError {
     ))
 }
 
+/// O1: dispose of an engine the contract handshake refused (or could not
+/// verify). The child is killed directly — a wedged engine (the probe-timeout
+/// case) would otherwise hold the graceful-shutdown budget for nothing, and a
+/// mismatched one has no state worth a graceful exit.
+async fn refuse_started_engine(engine: &EngineHandle, error: &EngineError) {
+    if let Err(kill_error) = engine.force_kill().await {
+        tracing::warn!(
+            error_class = ?kill_error.kind(),
+            "engine refused by the contract handshake could not be killed directly"
+        );
+    }
+    tracing::warn!(
+        error_class = error.class(),
+        "engine refused by the contract handshake; killed before any account work"
+    );
+}
+
+/// The engine's method-not-found class (contract 1.286, §4.272): JSON-RPC
+/// `-32601`, or the pinned engine's embedded `MethodNotFound` cause literal.
+/// `link.rotate` folds it into the host's NOT_SUPPORTED instead of leaking an
+/// upstream protocol error for a capability the engine simply does not carry.
+fn engine_method_missing(error: &EngineError) -> bool {
+    match error {
+        EngineError::Upstream {
+            code: Some(-32601), ..
+        } => true,
+        EngineError::Upstream {
+            cause: Some(cause), ..
+        } => matches!(cause.as_str(), "(MethodNotFound)" | "(MethodNotFoundError)"),
+        _ => false,
+    }
+}
+
 /// The one in-flight `link.finish` wait of this group (per-group wait lane,
 /// implementation-plan §6.1). The watch channel is the cancellation signal:
 /// `link.cancel` flips it and the finish call stops waiting at once without
@@ -544,7 +634,25 @@ pub struct RuntimeSupervisor {
     /// Successful engine restarts since process start (watchdog recoveries).
     /// Exposed through the pool's per-account status face; never persisted.
     restart_count: Arc<AtomicU64>,
+    /// Contract 1.275/1.292: the terminal unlink latch of a **per-account**
+    /// engine slot. The account holder unlinked this device upstream (the
+    /// engine classified the 401 and the account-unlink watcher persisted
+    /// `device_unlinked`): the credential is permanently dead, so the slot's
+    /// engine is stopped, no watchdog restart may re-spawn it, and no wake or
+    /// `runtime.start` may start it. Only a fresh link clears it.
+    ///
+    /// A legacy group supervisor never latches: its engine serves every account
+    /// of the group, so stopping it for one dead credential would take the
+    /// healthy accounts down with it (`note_device_unlinked` is a no-op there).
+    device_unlinked: AtomicBool,
     engine: Mutex<Option<EngineHandle>>,
+    /// O1 engine contract handshake state: the verdict of the last engine
+    /// landing (doctor/metrics read it) plus the latched fault that refuses
+    /// every later start for the life of this process. A mismatch is never
+    /// self-healing — the same binary answers the same revision on restart —
+    /// so the latch is what keeps the watchdog and `runtime.start` from
+    /// burning the launcher's restart budget on it.
+    engine_contract: Mutex<crate::engine_contract::EngineContractState>,
     service: Arc<Mutex<ConnectorService>>,
     /// Shared store handle for the store-only paths (retention, reads) that
     /// run on the blocking pool without the service lock.
@@ -693,6 +801,23 @@ pub struct RuntimeSupervisor {
     /// the pool owns its supervisors: ownership here would be a cycle, so the
     /// pool clears it when it stops.
     sweep_owner: StdMutex<Option<Arc<crate::registry::SweepOwner>>>,
+    /// Contract 1.291 (§4.277 C): the store gate this supervisor consults
+    /// before it spawns an engine on a path the pool did not open itself -
+    /// the watchdog's crash restart, and any future start face. Installed by
+    /// the per-account pool; a legacy group supervisor has none and answers
+    /// exactly as it always has.
+    start_gate: StdMutex<Option<Arc<dyn EngineStartGate>>>,
+}
+
+/// A pre-spawn admission check owned by the engine pool (contract 1.291,
+/// §4.277 C). The gate is what stops a **crash restart** from opening a store
+/// the store migrator still owns: the watchdog recovers an engine without the
+/// pool asking, so the decision has to live at the spawn, not at the caller.
+///
+/// `Ok(())` = spawn now. `Err(code)` = not now, with a closed literal naming
+/// the lifecycle state for the caller's log and the host face.
+pub trait EngineStartGate: Send + Sync {
+    fn admit_engine_start(&self) -> futures_util::future::BoxFuture<'_, Result<(), &'static str>>;
 }
 
 /// What the watchdog's orphan-engine pass watches: one scope per process (the
@@ -819,6 +944,7 @@ impl RuntimeSupervisor {
         let receive_worker = tokio::spawn(receive_persistence_loop(
             receive_rx,
             service.clone(),
+            Arc::clone(&store),
             host_events.clone(),
             group_id.clone(),
             media.as_ref().map(|media| media.governor().clone()),
@@ -835,6 +961,7 @@ impl RuntimeSupervisor {
         let account_unlink_worker = tokio::spawn(engine_event_watch_loop(
             events.subscribe(),
             service.clone(),
+            Arc::clone(&store),
             host_events.clone(),
             background_sync_tx,
         ));
@@ -843,7 +970,9 @@ impl RuntimeSupervisor {
             group_id,
             preferred_account_id,
             restart_count: Arc::new(AtomicU64::new(0)),
+            device_unlinked: AtomicBool::new(false),
             engine: Mutex::new(None),
+            engine_contract: Mutex::new(crate::engine_contract::EngineContractState::default()),
             service,
             store,
             media,
@@ -882,6 +1011,7 @@ impl RuntimeSupervisor {
             receipt_failures: StdMutex::new(HashMap::new()),
             group_resync_stamps: StdMutex::new(HashMap::new()),
             orphan_sweep: StdMutex::new(None),
+            start_gate: StdMutex::new(None),
             sweep_owner: StdMutex::new(None),
         }
     }
@@ -918,6 +1048,128 @@ impl RuntimeSupervisor {
         self.restart_count.load(Ordering::Relaxed)
     }
 
+    /// Whether this slot sits in the terminal "the account holder unlinked
+    /// this device" state (contract 1.275/1.292). Always `false` for a legacy
+    /// group supervisor: the group engine is shared, so one dead account's
+    /// terminal state is not a slot state there.
+    pub fn is_device_unlinked(&self) -> bool {
+        self.preferred_account_id.is_some() && self.device_unlinked.load(Ordering::Acquire)
+    }
+
+    /// Latch the terminal unlink without touching the engine: every start face
+    /// answers `ACCOUNT_UNLINKED` (retryable=false) from here on. Returns true
+    /// when this call latched it. A legacy group supervisor is never latched.
+    pub fn note_device_unlinked(&self) -> bool {
+        if self.preferred_account_id.is_none() {
+            return false;
+        }
+        let fresh = !self.device_unlinked.swap(true, Ordering::AcqRel);
+        if fresh {
+            tracing::warn!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                "account device was unlinked upstream; this slot is parked until a re-link"
+            );
+        }
+        fresh
+    }
+
+    /// The terminal handling of an observed unlink: latch the state and stop
+    /// the engine process. Idempotent by construction (the shutdown is a no-op
+    /// with no engine), so every caller that discovers the terminal state -
+    /// the account.changed lane, the watchdog, a wake - enforces the same
+    /// invariant: no engine outlives a dead credential. Returns `true` when the
+    /// slot is terminal, `false` for a legacy group supervisor, which is never
+    /// retired.
+    pub async fn retire_device_unlinked(&self) -> bool {
+        if self.preferred_account_id.is_none() {
+            return false;
+        }
+        self.note_device_unlinked();
+        // The engine process must not outlive the dead credential: nothing it
+        // could still do is attributable to a linked device, and leaving it
+        // resident is exactly the "engine and slot hang forever" shape. With no
+        // engine there is nothing to stop (and nothing to log): the latch alone
+        // keeps every later start refused.
+        if self.engine.lock().await.is_none() {
+            return true;
+        }
+        match self.shutdown_within(None).await {
+            Ok(()) => tracing::warn!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                "account engine stopped: the device was unlinked upstream and cannot be revived by a restart"
+            ),
+            Err(error) => tracing::warn!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                error_class = error.class(),
+                "account engine did not stop cleanly after the terminal unlink"
+            ),
+        }
+        true
+    }
+
+    /// Clear the terminal unlink latch: a fresh link (or its commit) is the one
+    /// answer that may replace a terminal unlink (contract 1.275). The engine
+    /// stays cold; the ordinary wake path starts it again.
+    pub fn clear_device_unlinked(self: &Arc<Self>) {
+        if !self.device_unlinked.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        tracing::info!(
+            account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+            group_id = %self.group_id,
+            "terminal device unlink cleared: a fresh link owns this slot again"
+        );
+        // The watchdog owns the restart lane; a terminal retire parked it, so a
+        // slot that may serve traffic again gets its liveness loop back.
+        self.spawn_watchdog();
+    }
+
+    /// Abort this slot's watchdog task (idempotent). The terminal unlink parks
+    /// the restart lane from another task; `clear_device_unlinked` respawns it.
+    pub fn stop_watchdog(&self) {
+        if let Ok(mut slot) = self.watchdog.lock()
+            && let Some(handle) = slot.take()
+        {
+            handle.abort();
+        }
+    }
+
+    /// The engine-start refusal for a terminal unlink. Consulted by every start
+    /// face **before** any other gate, so a device the holder already unlinked
+    /// never spawns an engine that can only answer 401.
+    fn terminal_unlink_guard(&self) -> Result<(), EngineError> {
+        let Some(account_id) = self.preferred_account_id.as_deref() else {
+            return Ok(());
+        };
+        if !self.account_is_device_unlinked(account_id) {
+            return Ok(());
+        }
+        self.note_device_unlinked();
+        tracing::warn!(
+            account_id = %account_id,
+            group_id = %self.group_id,
+            "engine start refused: the account holder unlinked this device; the slot needs a re-link"
+        );
+        Err(EngineError::Unauthorized)
+    }
+
+    /// Whether the shared store's row for `account_id` carries the terminal
+    /// `device_unlinked` state. The store is the authority across connector
+    /// restarts (the in-memory latch is not): a fresh process rediscovers the
+    /// slot cold and must answer the same terminal refusal.
+    pub(crate) fn account_is_device_unlinked(&self, account_id: &str) -> bool {
+        self.is_device_unlinked()
+            || self
+                .store
+                .account_summary(account_id)
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.state == "device_unlinked")
+    }
+
     /// The media namespace root this supervisor writes under, when the media
     /// path is armed. Per-account slots point at the connector root
     /// (`<signal-data>`) so media stays outside the engine data directory;
@@ -934,6 +1186,14 @@ impl RuntimeSupervisor {
     /// lookups and account counts over the single shared store.
     pub(crate) fn service(&self) -> &Arc<Mutex<ConnectorService>> {
         &self.service
+    }
+
+    /// The shared store handle (contract revision 1.282, §4.266): the
+    /// registry keeps one for the process-wide store health face, so the
+    /// doctor and the metrics line can read schema version, integrity, file
+    /// sizes and snapshot state without going through a group engine.
+    pub(crate) fn store(&self) -> Arc<Store> {
+        Arc::clone(&self.store)
     }
 
     /// Whether the media-download capability is genuinely armed for this
@@ -1112,11 +1372,25 @@ impl RuntimeSupervisor {
             let deleted: usize = groups.iter().map(|group| group.message_ids.len()).sum();
             let full_batch = deleted >= EXPIRE_SWEEP_BATCH as usize;
             for group in groups {
-                let _ = self.host_events.send(HostSideEvent::MessageExpired {
+                let account_id = group.account_id.clone();
+                let event = HostSideEvent::MessageExpired {
                     account_id: group.account_id,
                     conversation_id: group.conversation_id,
                     message_ids: group.message_ids,
-                });
+                };
+                let epoch = self
+                    .store
+                    .account_engine_epoch(&account_id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let publisher =
+                    EventPublisher::new(Arc::clone(&self.store), self.host_events.clone());
+                if let Err(error) =
+                    publisher.publish(epoch, Some(&account_id), "message.expired", event)
+                {
+                    tracing::warn!(?error, "durable event publish failed");
+                }
             }
             if !full_batch {
                 return Ok(());
@@ -1657,10 +1931,14 @@ impl RuntimeSupervisor {
     /// settles are guarded (`WHERE status='unknown'`), so a re-run — a
     /// watchdog-recovered engine, a later start — converges to no-ops over
     /// already-settled rows and never stomps a concurrently rearmed retry.
-    fn spawn_unknown_outcome_reconcile(&self) {
-        let Ok(engine_slot) = self.engine.try_lock() else {
-            return;
-        };
+    async fn spawn_unknown_outcome_reconcile(&self) {
+        // O1 note: this used `try_lock`, so an engine mutex that happened to
+        // be held at landing time (the contacts-resync pass grabs it in the
+        // same instant) silently skipped the ONLY reconciliation arming until
+        // the next engine landing. Awaiting the lock costs nothing here — the
+        // caller has already released its own guard — and keeps the pass from
+        // being a scheduling race.
+        let engine_slot = self.engine.lock().await;
         let Some(engine) = engine_slot
             .as_ref()
             .filter(|engine| !engine.is_terminal())
@@ -2445,6 +2723,7 @@ impl RuntimeSupervisor {
             .any_signal_account_number_in_group(&self.group_id)
             .ok()
             .flatten();
+        let contract = self.engine_contract_state().await;
         let slot = self.engine.lock().await;
         let live = slot.as_ref().filter(|engine| !engine.is_terminal());
         crate::doctor::DoctorGroupFace {
@@ -2460,11 +2739,76 @@ impl RuntimeSupervisor {
                 }),
             engine: live.cloned(),
             probe_account,
+            contract,
         }
     }
 
+    /// Install the pool's admission gate (contract 1.291, §4.277 C). Every
+    /// `start` on a path the pool did not open itself - above all the watchdog's
+    /// crash restart - then asks this gate before spawning an engine.
+    pub fn set_start_gate(&self, gate: Arc<dyn EngineStartGate>) {
+        *self
+            .start_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
+    }
+
+    fn start_gate(&self) -> Option<Arc<dyn EngineStartGate>> {
+        self.start_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Refuse this spawn when the pool's gate does, and say why in the log
+    /// channel with the closed literal (never a path, never key material).
+    async fn admit_start(&self) -> Result<(), EngineError> {
+        let Some(gate) = self.start_gate() else {
+            return Ok(());
+        };
+        match gate.admit_engine_start().await {
+            Ok(()) => Ok(()),
+            Err(code) => {
+                tracing::warn!(
+                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                    group_id = %self.group_id,
+                    store_gate = code,
+                    "engine start deferred by the store gate; this account keeps no engine until the pass lands"
+                );
+                Err(EngineError::StoreDeferred { code })
+            }
+        }
+    }
+
+    /// Start this slot's engine, consulting the pool's store gate first. The
+    /// terminal unlink is judged **before** every other gate (contract 1.275):
+    /// a store migration is never run for a device that cannot be served.
     pub async fn start(&self) -> Result<EngineStatus, EngineError> {
+        self.terminal_unlink_guard()?;
+        self.admit_start().await?;
+        self.start_after_store_gate().await
+    }
+
+    /// Start this slot's engine for a caller that has **just cleared the store
+    /// gate itself** (the pool's migration pass, and the pool's own gated
+    /// paths). Using this from anywhere else would re-open the bypass the gate
+    /// exists to close, so it is deliberately a separate, named entry point.
+    pub async fn start_after_store_gate(&self) -> Result<EngineStatus, EngineError> {
+        // A caller that cleared the store gate itself (the pool's wake and
+        // migration pass) still may not revive a credential the account holder
+        // already unlinked: the slot is terminal until a fresh link lands.
+        self.terminal_unlink_guard()?;
         let mut slot = self.engine.lock().await;
+        if let Some(fault) = self.latched_contract_fault().await {
+            tracing::warn!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                engine_version = fault.engine_version.as_deref().unwrap_or("unknown"),
+                contract_reason = fault.reason.as_str(),
+                "engine start refused: the contract mismatch is latched for this process"
+            );
+            return Err(EngineError::ContractMismatch(fault));
+        }
         if let Some(engine) = slot.as_ref()
             && !engine.is_terminal()
         {
@@ -2476,6 +2820,13 @@ impl RuntimeSupervisor {
             self.receive_ingress.clone(),
         )
         .await?;
+        // O1: the handshake is the gate in front of every account-shaped
+        // side effect. A refused engine is killed here and never lands in the
+        // slot, so no resync/import/reconcile pass can run against it.
+        if let Err(error) = self.admit_engine(&engine).await {
+            refuse_started_engine(&engine, &error).await;
+            return Err(error);
+        }
         let status = engine.status();
         *slot = Some(engine);
         drop(slot);
@@ -2485,7 +2836,7 @@ impl RuntimeSupervisor {
             // §4.179: the engine landed — reconcile this group's unsettled
             // unknown-outcome rows against the engine's own dispatch ledger
             // (best-effort, idempotent, warn-only).
-            self.spawn_unknown_outcome_reconcile();
+            self.spawn_unknown_outcome_reconcile().await;
             // §4.190 ⑥: the engine landed — fetch each account's
             // configuration and mirror the readReceipts gate flag
             // (best-effort, idempotent, warn-only).
@@ -2565,6 +2916,103 @@ impl RuntimeSupervisor {
             .ok_or(EngineError::NotRunning)
     }
 
+    /// The latched O1 contract fault, if this slot has refused an engine.
+    pub(crate) async fn latched_contract_fault(
+        &self,
+    ) -> Option<crate::engine_contract::EngineContractFault> {
+        self.engine_contract.lock().await.fault.clone()
+    }
+
+    /// The whole handshake state (doctor/metrics): last served verdict or the
+    /// latched fault.
+    pub(crate) async fn engine_contract_state(
+        &self,
+    ) -> crate::engine_contract::EngineContractState {
+        self.engine_contract.lock().await.clone()
+    }
+
+    /// O1: run the contract handshake for a freshly spawned engine and record
+    /// its verdict. The caller owns the engine and must refuse it on error:
+    /// nothing account-shaped may run against an engine this gate did not
+    /// admit.
+    ///
+    /// Unconditional by design: there is no environment switch that skips the
+    /// gate. A production env bypass is a drift hole (the one deployment that
+    /// sets it serves an unverified engine forever), so debugging goes through
+    /// the fake engine's own fixture parameters instead.
+    async fn admit_engine(&self, engine: &EngineHandle) -> Result<(), EngineError> {
+        match crate::engine_contract::verify(engine).await {
+            Ok(report) => {
+                crate::metrics::record_engine_contract(&report);
+                if report.status == crate::engine_contract::CONTRACT_STATUS_LEGACY {
+                    tracing::warn!(
+                        account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                        group_id = %self.group_id,
+                        engine_name = %report.engine_name,
+                        engine_version = %report.engine_version,
+                        "engine contract handshake: the engine states no contract revision; served in legacy mode"
+                    );
+                } else {
+                    tracing::info!(
+                        account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                        group_id = %self.group_id,
+                        engine_name = %report.engine_name,
+                        engine_version = %report.engine_version,
+                        engine_contract_revision = report
+                            .contract_revision
+                            .as_deref()
+                            .unwrap_or("-"),
+                        "engine contract handshake: revision in range"
+                    );
+                }
+                *self.engine_contract.lock().await = crate::engine_contract::EngineContractState {
+                    report: Some(report),
+                    fault: None,
+                };
+                Ok(())
+            }
+            Err(crate::engine_contract::EngineContractError::Unavailable) => {
+                // Retryable: the engine is alive enough to have been spawned
+                // but did not answer the handshake inside the budget. This is
+                // a startup failure, not a contract refusal — the watchdog may
+                // try again.
+                crate::metrics::record_engine_contract_probe_failure();
+                tracing::warn!(
+                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                    group_id = %self.group_id,
+                    budget_ms = crate::engine_contract::ENGINE_CONTRACT_PROBE_TIMEOUT
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                    "engine contract handshake did not complete; the start stays retryable"
+                );
+                Err(EngineError::StartFailed)
+            }
+            Err(crate::engine_contract::EngineContractError::Mismatch(fault)) => {
+                crate::metrics::record_engine_contract_mismatch(&fault);
+                // The launcher's only byte-stable channel: the same fixed line
+                // shape the store's fatal classes use. Emitted once, at the
+                // moment the fault is latched.
+                let line = fault.fatal_line();
+                tracing::error!(
+                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                    group_id = %self.group_id,
+                    engine_name = fault.engine_name.as_deref().unwrap_or("unknown"),
+                    engine_version = fault.engine_version.as_deref().unwrap_or("unknown"),
+                    engine_contract_revision = fault.contract_revision.as_deref().unwrap_or("-"),
+                    contract_reason = fault.reason.as_str(),
+                    supported = crate::engine_contract::SUPPORTED_ENGINE_CONTRACT_RANGE,
+                    "engine contract mismatch; the engine is not served and the fault is latched"
+                );
+                eprintln!("{line}");
+                *self.engine_contract.lock().await = crate::engine_contract::EngineContractState {
+                    report: None,
+                    fault: Some(fault.clone()),
+                };
+                Err(EngineError::ContractMismatch(fault))
+            }
+        }
+    }
+
     pub async fn list_accounts(&self) -> Result<Vec<AccountSummary>, ServiceError> {
         // Prefer live signal-cli numbers of THIS group's engine. On engine error fall
         // back to this group's store rows so a flaky listAccounts after link does not
@@ -2578,7 +3026,7 @@ impl RuntimeSupervisor {
                     .lock()
                     .await
                     .list_accounts_in_group(&self.group_id)?;
-                return Ok(self.slot_accounts(rows));
+                return Ok(self.stale_slot_accounts(rows));
             }
         };
         // Contract 1.142 (§4.138): each entry may carry the engine's own-ACI
@@ -2589,40 +3037,14 @@ impl RuntimeSupervisor {
             .call("listAccounts", json!({}), CallClass::ReadOnly)
             .await
         {
-            Ok(result) => result
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| {
-                            let number = item.get("number")?.as_str()?;
-                            // Contract 1.194 (§4.194): the engine's own-profile
-                            // capabilities projection. Only the backfill bit the
-                            // desktop gate consumes rides; absent/ill-typed =
-                            // absent (honest unknown, never folded to false).
-                            let capabilities = item
-                                .get("capabilities")
-                                .and_then(|caps| caps.get("attachmentBackfill"))
-                                .and_then(Value::as_bool)
-                                .map(|attachment_backfill| crate::store::AccountCapabilities {
-                                    attachment_backfill,
-                                });
-                            Some((
-                                number.to_string(),
-                                item.get("aci").and_then(Value::as_str).map(str::to_string),
-                                capabilities,
-                            ))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
+            Ok(result) => project_engine_account_rows(&result),
             Err(_) => {
                 let rows = self
                     .service
                     .lock()
                     .await
                     .list_accounts_in_group(&self.group_id)?;
-                return Ok(self.slot_accounts(rows));
+                return Ok(self.stale_slot_accounts(rows));
             }
         };
         if numbers.is_empty() {
@@ -2640,13 +3062,62 @@ impl RuntimeSupervisor {
                 &self.group_id,
                 self.preferred_account_id.as_deref(),
             )?;
-        let accounts = self.slot_accounts(accounts);
+        let accounts = self.live_slot_accounts(accounts);
         // Contract 1.170 (§4.170): the ACI was just (re)written for these
         // accounts — fold each number-keyed memo shell into the canonical
         // ACI-keyed row and announce it.
         self.backfill_memo_identities(&accounts).await;
         let _ = engine;
         Ok(accounts)
+    }
+
+    /// BUG-1 softening: one bounded, read-only `listAccounts` probe the pool
+    /// runs **before** a terminal link reclaim, so a link the engine really
+    /// committed is promoted instead of quarantined.
+    ///
+    /// Why the engine's account list is the right face: `finishLink` inserts
+    /// the account into the engine registry only after the provisioning flow
+    /// wrote its registration and the commit itself succeeded. So an answer
+    /// that lists this slot's number is durable proof that the phone approval
+    /// landed engine-side — exactly the state the connector's own store has
+    /// no row for (its finish budget expired first).
+    ///
+    /// Disciplines:
+    /// - **one RPC, bounded**: the caller passes the budget; a wedged engine
+    ///   answers nothing and the probe expires like any other read-only call
+    ///   (the pool's pre-softening reclaim then runs unchanged);
+    /// - **no store fallback**: unlike [`Self::list_accounts`], an engine
+    ///   failure is *not* answered from local rows. The local row is the very
+    ///   evidence this probe exists to obtain, so falling back would prove
+    ///   nothing and could promote an abandoned slot;
+    /// - **materialize only this slot's row**: the engine answer goes through
+    ///   the same sync the routine list path uses (engine number + ACI +
+    ///   capabilities), and only a row carrying this slot's preallocated id is
+    ///   returned — a number that already belongs to another local account
+    ///   answers `None` here and keeps the reclaim (the finish commit would
+    ///   have answered ACCOUNT_ALREADY_LINKED for it).
+    pub async fn adopt_engine_completed_link(&self, budget: Duration) -> Option<AccountSummary> {
+        let preferred = self.preferred_account_id.clone()?;
+        let engine = self.running_engine().await.ok()?;
+        let result = engine
+            .call_with_timeout("listAccounts", json!({}), CallClass::ReadOnly, budget)
+            .await
+            .ok()?;
+        let numbers = project_engine_account_rows(&result);
+        if numbers.is_empty() {
+            return None;
+        }
+        let rows = self
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers_with_capabilities_and_id(
+                &numbers,
+                &self.group_id,
+                Some(preferred.as_str()),
+            )
+            .ok()?;
+        rows.into_iter().find(|row| row.id == preferred)
     }
 
     /// Whether this slot currently owns a non-expired link session. The
@@ -2666,7 +3137,7 @@ impl RuntimeSupervisor {
             .lock()
             .await
             .list_accounts_in_group(&self.group_id)?;
-        Ok(self.slot_accounts(rows))
+        Ok(self.stale_slot_accounts(rows))
     }
 
     /// A legacy group supervisor returns every row of its group (the pre-pool
@@ -2682,6 +3153,29 @@ impl RuntimeSupervisor {
                 .collect(),
             None => accounts,
         }
+    }
+
+    /// Live inventory projection: non-terminal rows carry inventory evidence;
+    /// a terminal row rides only when its stored origin is an upstream/engine
+    /// answer. Legacy rows with no origin are downgraded to cache/unknown.
+    fn live_slot_accounts(&self, accounts: Vec<AccountSummary>) -> Vec<AccountSummary> {
+        let mut accounts = self.slot_accounts(accounts);
+        for account in &mut accounts {
+            apply_live_account_evidence(account);
+        }
+        accounts
+    }
+
+    /// Store-only projection when the engine cannot answer: every row is
+    /// cache evidence, and a persisted terminal unlink is downgraded to
+    /// `unknown` until a live engine/upstream answer proves it. This is the
+    /// guard that stops "engine down" from rendering as "phone unlinked".
+    fn stale_slot_accounts(&self, accounts: Vec<AccountSummary>) -> Vec<AccountSummary> {
+        let mut accounts = self.slot_accounts(accounts);
+        for account in &mut accounts {
+            apply_stale_account_evidence(account);
+        }
+        accounts
     }
 
     /// Contract 1.170 (§4.170): fold each freshly-ACI'd account's number-keyed
@@ -2753,6 +3247,18 @@ impl RuntimeSupervisor {
     }
 
     pub async fn start_link(&self, device_name: String) -> Result<Value, ServiceError> {
+        self.start_link_with_attempt(device_name, None).await
+    }
+
+    /// The pooled entry: the registry mints the connector attempt id before
+    /// provisioning the slot, so the slot lease and the host-facing
+    /// `linkAttemptId` are the same owner. `None` keeps the legacy
+    /// service-minted id exactly as before.
+    pub async fn start_link_with_attempt(
+        &self,
+        device_name: String,
+        connector_attempt_id: Option<String>,
+    ) -> Result<Value, ServiceError> {
         self.service.lock().await.ensure_link_available()?;
         // Per-engine account ceiling (optimization-plan §6.4 M3.3): refuse
         // before the engine mints a QR, so no one scans a code that can never
@@ -2780,11 +3286,22 @@ impl RuntimeSupervisor {
                 ))
             })?
             .to_string();
-        let mut result = self
-            .service
-            .lock()
-            .await
-            .begin_link(device_name, device_link_uri)?;
+        // Contract 1.286 (§4.272): an engine that minted a rotate key states
+        // it on the startLink answer. Its absence is the capability verdict —
+        // `link.rotate` then answers NOT_SUPPORTED and this single slot is
+        // the whole attempt, exactly like the pre-rotate wire.
+        let engine_attempt_id = result
+            .get("linkAttemptId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|attempt| !attempt.is_empty())
+            .map(str::to_string);
+        let mut result = self.service.lock().await.begin_link_with_identities(
+            device_name,
+            device_link_uri,
+            engine_attempt_id,
+            connector_attempt_id,
+        )?;
         // The wire result echoes the selected group (implementation-plan §4.4);
         // this supervisor IS the selected group.
         result["proxyGroup"] = json!(self.group_id);
@@ -2796,11 +3313,169 @@ impl RuntimeSupervisor {
         Ok(result)
     }
 
+    /// `link.rotate` (contract 1.286, §4.272): mint a fresh provisioning
+    /// session — a new slot — for the same link attempt on the engine's own
+    /// rotate face. The attempt's oldest live slot is retired when a third code
+    /// would go live, so at most two codes are ever scannable at once.
+    ///
+    /// Degradation is explicit rather than incidental. An engine that predates
+    /// the rotate face never states a rotate key on its `startLink` answer, so
+    /// the attempt has none and the connector answers NOT_SUPPORTED without
+    /// touching the engine — the single slot keeps working exactly like the
+    /// pre-rotate wire. An engine that *does* state a key but answers the
+    /// method as unknown (JSON-RPC -32601 / the `MethodNotFound` cause class)
+    /// folds into the same NOT_SUPPORTED answer.
+    pub async fn rotate_link(&self, link_attempt_id: String) -> Result<Value, ServiceError> {
+        // Session judgment first: an unknown, committed, or expired attempt is
+        // a definite answer that does not depend on engine liveness.
+        let engine_attempt_id = self.service.lock().await.begin_rotate(&link_attempt_id)?;
+        let Some(engine_attempt_id) = engine_attempt_id else {
+            tracing::info!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                "link rotate refused: the engine states no rotate key"
+            );
+            return Err(Self::link_rotate_not_supported_error());
+        };
+        let engine = self.running_engine().await?;
+        let upstream = engine
+            .call(
+                "rotateLink",
+                json!({ "linkAttemptId": engine_attempt_id }),
+                CallClass::ReadOnly,
+            )
+            .await;
+        let payload = match upstream {
+            Ok(payload) => payload,
+            Err(error) if engine_method_missing(&error) => {
+                tracing::info!(
+                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                    group_id = %self.group_id,
+                    "link rotate refused: the engine does not carry the method"
+                );
+                return Err(Self::link_rotate_not_supported_error());
+            }
+            Err(error) => return Err(ServiceError::Engine(error)),
+        };
+        let device_link_uri = payload
+            .get("deviceLinkUri")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty())
+            .ok_or_else(|| {
+                ServiceError::Api(ApiError::new(
+                    "UPSTREAM_PROTOCOL_ERROR",
+                    "rotateLink response missing deviceLinkUri",
+                    true,
+                ))
+            })?
+            .to_string();
+        let outcome = self.service.lock().await.attach_rotated_slot(
+            &link_attempt_id,
+            device_link_uri,
+            now_ms(),
+        )?;
+        if let Some(retired) = outcome.retired {
+            tracing::info!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                retired_slot = retired,
+                "link slot retired by rotation"
+            );
+        }
+        tracing::info!(
+            account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+            group_id = %self.group_id,
+            slot = outcome.slot,
+            "link slot rotated"
+        );
+        // The new slot's own session id rides the answer beside the contract's
+        // {deviceLinkUri, slot, slots}: link.finish/link.cancel address a slot
+        // by its linkSessionId, and the contract's slots entries carry only the
+        // code and the number.
+        Ok(json!({
+            "linkAttemptId": outcome.link_attempt_id,
+            "linkSessionId": outcome.link_session_id,
+            "deviceLinkUri": outcome.device_link_uri,
+            "slot": outcome.slot,
+            "slots": outcome.slots,
+            "expiresAt": outcome.expires_at_ms,
+            "proxyGroup": self.group_id,
+        }))
+    }
+
+    /// The rotate degradation answer: this engine cannot mint a second code
+    /// for an attempt. Not retryable — the remedy is a fresh `link.start`.
+    fn link_rotate_not_supported_error() -> ServiceError {
+        ServiceError::Api(ApiError::new(
+            "NOT_SUPPORTED",
+            "the engine does not support link rotation; start a new link instead",
+            false,
+        ))
+    }
+
+    /// The answer a budget-expired `finishLink` gets: the link-class unknown
+    /// outcome, never a definite retryable timeout. The call is mutating and
+    /// was in flight when the budget expired, so the phone may already have
+    /// approved the device and the engine may have committed the link; the
+    /// remedy is the caller's adopt path (`accounts.list`), not a re-run.
+    fn link_finish_timeout_error() -> ServiceError {
+        ServiceError::Api(ApiError::new(
+            "LINK_OUTCOME_UNKNOWN",
+            "finishLink exceeded the link budget; the phone may have approved the device, \
+             so adopt from the account list instead of retrying",
+            false,
+        ))
+    }
+
+    /// BUG-8: a fresh link and a local-data delete of the **same number** may
+    /// overlap (the user deleted a session while the QR was on screen). The
+    /// commit gate refuses that link (ACCOUNT_DELETE_IN_PROGRESS), and by then
+    /// the engine has already registered the phone's device — the phone shows
+    /// a connected device, the desktop shows an error and holds nothing.
+    ///
+    /// This waits, bounded (3 × 5 s), for the delete to settle and answers the
+    /// state that is still unfinished when the budget runs out (`None` =
+    /// settled). Only `started` is worth waiting for: `unknown` cannot settle
+    /// without an explicit delete retry, so the honest answer is immediate.
+    async fn await_account_delete_settled(&self, number: &str) -> Option<String> {
+        let mut waited = false;
+        for attempt in 1..=LINK_FINISH_DELETE_SETTLE_ATTEMPTS {
+            let state = match self.store.unfinished_account_delete_state(number) {
+                Ok(state) => state,
+                // A store hiccup is not a delete in flight: do not invent a
+                // wait, and let the commit surface the store error itself.
+                Err(_) => return None,
+            };
+            match state {
+                None => {
+                    if waited {
+                        tracing::info!(
+                            "a concurrent local-data delete settled before the link commit"
+                        );
+                    }
+                    return None;
+                }
+                Some(state) if state != "started" => return Some(state),
+                Some(_) if attempt == LINK_FINISH_DELETE_SETTLE_ATTEMPTS => {
+                    return Some("started".to_string());
+                }
+                Some(_) => {
+                    waited = true;
+                    tokio::time::sleep(LINK_FINISH_DELETE_SETTLE_INTERVAL).await;
+                }
+            }
+        }
+        Some("started".to_string())
+    }
+
     pub async fn finish_link(
         &self,
         link_session_id: String,
     ) -> Result<AccountSummary, ServiceError> {
-        let engine = self.running_engine().await?;
+        // [link-stage] BUG-5 取证：connector 侧同一时钟从 link.finish 受理起算，
+        // 与 registry 的 slot-promote 行同窗口（仅日志，零行为变更）。
+        let link_stage_started = std::time::Instant::now();
         let cancel = {
             let mut active = self.active_link_finish.lock().await;
             if active.is_some() {
@@ -2817,6 +3492,37 @@ impl RuntimeSupervisor {
             });
             cancel_rx
         };
+        // Lost-finish replay (contract 1.276 §4.260, widened by 1.286 §4.272):
+        // an attempt that already committed answers the same account from any
+        // of its codes instead of asking the phone again or minting a second
+        // binding. Rotation never commits, so this arm also covers a rotate
+        // that retired the code the host is retrying with. The lane taken
+        // above is released before the answer leaves.
+        match self
+            .service
+            .lock()
+            .await
+            .replay_link_commit(&link_session_id)
+        {
+            Ok(Some(account)) => {
+                self.clear_link_finish(&link_session_id).await;
+                tracing::info!(
+                    account_id = %account.id,
+                    "link finish replayed the committed attempt"
+                );
+                return Ok(account);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.clear_link_finish(&link_session_id).await;
+                return Err(error);
+            }
+        }
+        // Session state is judged before the engine is resolved (QR B1): a
+        // lost/expired/unknown session is a definite answer that does not
+        // depend on engine liveness, so a terminal or missing engine must not
+        // downgrade it to RUNTIME_NOT_RUNNING. Every pre-dispatch refusal
+        // below clears the finish lane it just took.
         let credentials = self
             .service
             .lock()
@@ -2829,19 +3535,74 @@ impl RuntimeSupervisor {
                 return Err(error);
             }
         };
-
-        // Per-engine account ceiling (M3.3): refuse before dispatching the
-        // mutating finishLink, so the phone is never asked to approve a link
-        // the connector would then have to reject at commit time. Session
-        // errors (LINK_NOT_FOUND/LINK_EXPIRED) keep precedence.
-        if self
+        // Per-engine account ceiling (M3.3): refuse before the engine is
+        // resolved and before the mutating finishLink is dispatched, so the
+        // phone is never asked to approve a link the connector would then
+        // have to reject at commit time. Session errors (LINK_LOST/
+        // LINK_NOT_FOUND/LINK_EXPIRED) keep precedence.
+        // Bind the store answer before matching: a match scrutinee's
+        // temporary guard would stay alive through the arms, and the refusal
+        // arm takes the service lock again (a same-mutex deadlock).
+        let ceiling = self
             .service
             .lock()
             .await
-            .group_at_account_ceiling(&self.group_id)?
+            .group_at_account_ceiling(&self.group_id);
+        match ceiling {
+            Ok(true) => {
+                // The refused QR can never commit while the group stays full,
+                // so the session is spent: dropping it keeps
+                // has_pending_link false (the watchdog is not suppressed for
+                // its TTL) and lets the next link.start mint a fresh QR
+                // instead of answering LINK_IN_PROGRESS. It is dropped while
+                // this lane still excludes a concurrent finish, so no one can
+                // peek the session between the drop and the lane release.
+                self.service
+                    .lock()
+                    .await
+                    .discard_link_session(&link_session_id);
+                // Clear the lane before the refusal leaves, exactly like the
+                // peek and pin arms: a lane left taken would answer every
+                // later finish with LINK_IN_PROGRESS and keep the watchdog
+                // suppressed for good.
+                self.clear_link_finish(&link_session_id).await;
+                return Err(account_limit_error(&self.group_id));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.clear_link_finish(&link_session_id).await;
+                return Err(error);
+            }
+        }
+
+        // A live engine is only needed to dispatch finishLink, so it is
+        // resolved after the session judgment (a terminal/missing engine must
+        // not downgrade a lost session's definite LINK_LOST) and after the
+        // store-only ceiling refusal. This arm clears its own lane too: the
+        // finish never started, so nothing may stay suppressed.
+        let engine = match self.running_engine().await {
+            Ok(engine) => engine,
+            Err(error) => {
+                self.clear_link_finish(&link_session_id).await;
+                return Err(error.into());
+            }
+        };
+
+        // The finish budget outlives the advertised QR lifetime
+        // (`LINK_SESSION_TTL`): an approval that lands while `finishLink` is
+        // in flight must still be commitable, or the engine links a device
+        // that the commit then refuses with LINK_EXPIRED. The pin extends only
+        // the in-memory session deadline; the QR's advertised `expiresAt`
+        // stays what it was. It runs only once every pre-dispatch refusal is
+        // past, so a refusal never stretches a dead QR's deadline.
+        if let Err(error) = self
+            .service
+            .lock()
+            .await
+            .pin_link_for_finish(&link_session_id, LINK_FINISH_TIMEOUT)
         {
             self.clear_link_finish(&link_session_id).await;
-            return Err(account_limit_error(&self.group_id));
+            return Err(error);
         }
 
         let upstream = engine
@@ -2869,13 +3630,13 @@ impl RuntimeSupervisor {
             // any late engine-side link surfaces through the next
             // accounts.list sync as a real link (the phone approved it).
             Ok(None) => return Err(link_cancelled_error()),
-            Err(EngineError::Timeout) => {
-                return Err(ServiceError::Api(ApiError::new(
-                    "UPSTREAM_TIMEOUT",
-                    "finishLink timed out waiting for phone approval; retry after scanning",
-                    true,
-                )));
-            }
+            // The budget expired with the mutating call still in flight: the
+            // phone may have approved the device and the engine may have
+            // committed the link. A definite timeout would invite a blind
+            // re-run (a second device slot), so the honest answer is the
+            // link-class unknown outcome — the desktop reconciles it through
+            // the account list (adopt).
+            Err(EngineError::Timeout) => return Err(Self::link_finish_timeout_error()),
             // finishLink is Mutating, so this means the call was in flight when
             // the engine died: the phone may already have linked the device.
             // Retrying would claim a second device slot, so the host has to
@@ -2887,8 +3648,41 @@ impl RuntimeSupervisor {
                     false,
                 )));
             }
+            // QR B1 (issue #951): the engine's provisioning channel is dead.
+            // The finish lane was already cleared above (clear_link_finish),
+            // so mark the service session lost and keep it addressable: the
+            // next link.start replaces it, has_pending_link stops suppressing
+            // the watchdog, and any later finish for this id answers the
+            // definite LINK_LOST rather than LINK_NOT_FOUND.
+            Err(EngineError::UpstreamCode {
+                code: "LINK_LOST",
+                data,
+            }) => {
+                let marked = self.service.lock().await.mark_link_lost(&link_session_id);
+                if !marked {
+                    tracing::warn!(
+                        account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                        group_id = %self.group_id,
+                        "engine reported LINK_LOST for a session this service no longer owns"
+                    );
+                }
+                return Err(ServiceError::Engine(EngineError::UpstreamCode {
+                    code: "LINK_LOST",
+                    data,
+                }));
+            }
             Err(error) => return Err(ServiceError::Engine(error)),
         };
+        // [link-stage] 引擎 finishLink 返回 = link 已在引擎侧注册完成。手机确认
+        // 与 provisioning 的等待都包含在本段内；该行与桌面 scan-confirmed 行的
+        // 时间差就是这段等待（仅日志，零行为变更）。
+        crate::link_stage::line(
+            "link-register",
+            link_stage_started.elapsed(),
+            &link_session_id,
+            self.preferred_account_id.as_deref(),
+            "engine finishLink returned",
+        );
         let number = result
             .get("number")
             .and_then(Value::as_str)
@@ -2900,6 +3694,17 @@ impl RuntimeSupervisor {
                 ))
             })?;
         let aci = result.get("aci").and_then(Value::as_str);
+        // BUG-8: the engine registered this device a moment ago; a delete of
+        // the same number that is still with us must settle before the commit
+        // or the link is refused into the phantom-device shape (phone has the
+        // device, desktop has nothing). The commit gate still owns the final
+        // word — this only removes the avoidable race.
+        if let Some(state) = self.await_account_delete_settled(number).await {
+            tracing::warn!(
+                state = %state,
+                "the link commit still sees an unfinished local-data delete for this number"
+            );
+        }
         let mut account = {
             let mut service = self.service.lock().await;
             service.complete_link_session_with_id(
@@ -3001,7 +3806,26 @@ impl RuntimeSupervisor {
     /// direct child kill), so a watchdog restart cannot hang here even when the
     /// old engine's actor is parked on receive backpressure.
     async fn restart_engine(&self) -> Result<(), EngineError> {
+        // Contract 1.275: a terminal unlink is not a crash. No restart can
+        // revive a credential the account holder revoked, so the watchdog lane
+        // stops here instead of re-spawning an engine whose only answer is 401.
+        self.terminal_unlink_guard()?;
+        // Contract 1.291 (§4.277 C): the watchdog recovers an engine without
+        // the pool asking, so this is where a crash restart could open a store
+        // the migrator still owns. Ask the gate **before** the old handle is
+        // taken, so a refusal never costs a live engine.
+        self.admit_start().await?;
         let mut slot = self.engine.lock().await;
+        if let Some(fault) = self.latched_contract_fault().await {
+            tracing::warn!(
+                account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                group_id = %self.group_id,
+                engine_version = fault.engine_version.as_deref().unwrap_or("unknown"),
+                contract_reason = fault.reason.as_str(),
+                "engine restart refused: the contract mismatch is latched for this process"
+            );
+            return Err(EngineError::ContractMismatch(fault));
+        }
         if let Some(engine) = slot.take() {
             engine.shutdown().await?;
         }
@@ -3011,6 +3835,13 @@ impl RuntimeSupervisor {
             self.receive_ingress.clone(),
         )
         .await?;
+        // O1: a watchdog recovery re-earns the handshake verdict — the engine
+        // binary may have been replaced between restarts, and a mismatch here
+        // latches exactly like a fresh start does.
+        if let Err(error) = self.admit_engine(&engine).await {
+            refuse_started_engine(&engine, &error).await;
+            return Err(error);
+        }
         let status = engine.status();
         self.restart_count.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
@@ -3031,7 +3862,7 @@ impl RuntimeSupervisor {
             // window that leaves unknown-outcome rows behind, so limiting
             // the pass to `start()` would strand them until the next manual
             // start. Best-effort, idempotent, warn-only.
-            self.spawn_unknown_outcome_reconcile();
+            self.spawn_unknown_outcome_reconcile().await;
         }
         // §4.190 ⑥: a fresh engine (watchdog recovery included) re-fetches
         // the accounts' configuration — the readReceipts gate flag converges
@@ -3282,6 +4113,16 @@ impl RuntimeSupervisor {
                     }
                 }
                 _ = ticker.tick() => {
+                    // Contract 1.275: a terminal unlink is not a liveness fault
+                    // and nothing about it is retryable. The slot is parked
+                    // (engine stopped, every start face answers ACCOUNT_UNLINKED)
+                    // until a fresh link clears it, so this tick judges nothing
+                    // and must not arm a restart of a dead credential.
+                    if self.is_device_unlinked() {
+                        pending = None;
+                        ping_failures = 0;
+                        continue;
+                    }
                     // Receive-path survival evidence cancels a pending
                     // restart: an envelope actually delivered over the
                     // engine's receive lane proves the WebSocket is alive,
@@ -3357,6 +4198,27 @@ impl RuntimeSupervisor {
                                 ping_failures = 0;
                                 stderr_rx = None;
                                 stderr_pid = None;
+                            }
+                            Err(EngineError::ContractMismatch(fault)) => {
+                                // O1: not retryable by construction. Clear the
+                                // backstop instead of re-arming it — the latch
+                                // already refuses every later attempt.
+                                pending = None;
+                                tracing::error!(
+                                    reason = deferred.reason,
+                                    source = %deferred.source,
+                                    account_id = self
+                                        .preferred_account_id
+                                        .as_deref()
+                                        .unwrap_or("-"),
+                                    group_id = %self.group_id,
+                                    engine_version = fault
+                                        .engine_version
+                                        .as_deref()
+                                        .unwrap_or("unknown"),
+                                    contract_reason = fault.reason.as_str(),
+                                    "watchdog recovery refused: engine contract mismatch is not self-healing"
+                                );
                             }
                             Err(error) => {
                                 // Keep the backstop armed: dropping it here
@@ -3490,6 +4352,18 @@ impl RuntimeSupervisor {
                             // the account. Counting this as a ping failure
                             // would only churn bounded restarts forever.
                             ping_failures = 0;
+                            // Contract 1.275: the credential is dead, so the
+                            // slot parks itself from the ping lane as well (a
+                            // no-op for a legacy group engine). This is the
+                            // backstop for a slot whose account.changed lane
+                            // was missed (a connector restart, a lagged
+                            // receiver): without it the engine would sit
+                            // resident forever behind a dead credential.
+                            if self.preferred_account_id.is_some() {
+                                self.retire_device_unlinked().await;
+                                stderr_rx = None;
+                                stderr_pid = None;
+                            }
                         }
                         WatchdogPingOutcome::Failed
                             if !refused.is_empty() && refused.len() == targets.len() =>
@@ -3615,8 +4489,48 @@ impl RuntimeSupervisor {
         let mut excluded_accounts = 0usize;
         let mut confirmed_accounts = 0usize;
         for row in &rows {
-            if let Some(numbers) = &verified {
-                if !numbers.contains(&row.signal_account) {
+            // Contract 1.275: `device_unlinked` is a terminal verdict, never a
+            // silent `engineAbsent` exclusion. The pre-fix shape read "the
+            // engine no longer lists it" as "nothing to ping" and left the
+            // engine process and the slot resident forever. The terminal state
+            // is judged exactly where an exclusion would happen, so a healthy
+            // engine's ping path costs no extra store read: a slot whose own
+            // account is terminal is retired here (a legacy group engine keeps
+            // serving its healthy accounts, so it is only named, never stopped).
+            let absent = match &verified {
+                Some(numbers) => !numbers.contains(&row.signal_account),
+                None => verdicts.engine_absent.contains(&row.id),
+            };
+            if absent && self.account_is_device_unlinked(&row.id) {
+                if self.preferred_account_id.as_deref() == Some(row.id.as_str()) {
+                    // A per-account slot serves exactly this account: terminal
+                    // means the whole slot is terminal, so it is retired and
+                    // this tick has nothing left to probe.
+                    self.retire_device_unlinked().await;
+                    return WatchdogPingPlan::NoTarget(WatchdogPingSkip {
+                        reason: "deviceUnlinked",
+                        known_accounts: rows.len(),
+                        excluded_accounts: rows.len(),
+                        engine_verified: verified.is_some(),
+                    });
+                }
+                // Legacy group engine: one dead account never stops the engine
+                // its healthy siblings share. The exclusion is *named* here
+                // instead of hiding behind `engineAbsent`, and the row stays out
+                // of the probe set for this engine instance.
+                if verdicts.engine_absent.insert(row.id.clone()) {
+                    crate::metrics::record_watchdog_ping_target_skipped();
+                    tracing::info!(
+                        account_id = %row.id,
+                        reason = "deviceUnlinked",
+                        "watchdog ping target excluded: the account holder unlinked this device"
+                    );
+                }
+                excluded_accounts += 1;
+                continue;
+            }
+            if verified.is_some() {
+                if absent {
                     // Record once per engine instance; the exclusion itself
                     // applies on every later tick.
                     if verdicts.engine_absent.insert(row.id.clone()) {
@@ -3700,6 +4614,42 @@ impl RuntimeSupervisor {
         source: RestartSource,
         reason: &'static str,
     ) -> bool {
+        // Contract 1.275: the terminal unlink outranks every restart source. A
+        // dead credential is not a liveness fault, and the engine the watchdog
+        // would re-spawn can only answer 401 again — so the slot parks itself
+        // instead of burning the restart budget.
+        if let Some(account_id) = self.preferred_account_id.as_deref()
+            && self.account_is_device_unlinked(account_id)
+        {
+            if self.note_device_unlinked() {
+                tracing::warn!(
+                    reason,
+                    source = %source,
+                    account_id = %account_id,
+                    group_id = %self.group_id,
+                    "watchdog restart refused: the account holder unlinked this device; the slot needs a re-link"
+                );
+            }
+            // Any deferred restart of the dead credential is dropped, not
+            // re-armed: nothing about this account is retryable.
+            *pending = None;
+            // Park the slot as well: a dead or wedged handle must not stay as
+            // this slot's engine behind a credential nothing can serve.
+            let _ = self.retire_device_unlinked().await;
+            return false;
+        }
+        // O1: a latched contract mismatch is terminal for this process — no
+        // watchdog tick may re-spawn the same refused engine.
+        if let Some(fault) = self.latched_contract_fault().await {
+            tracing::warn!(
+                reason,
+                source = %source,
+                engine_version = fault.engine_version.as_deref().unwrap_or("unknown"),
+                contract_reason = fault.reason.as_str(),
+                "watchdog restart refused: the engine contract mismatch is latched"
+            );
+            return false;
+        }
         // A trigger-free gap longer than the anti-storm window starts a fresh
         // episode with the fast (immediate) path restored.
         if let Some(last_trigger) = episode.last_trigger
@@ -4586,6 +5536,33 @@ impl RuntimeSupervisor {
         status
     }
 
+    /// BUG-16 刀2b（2026-11-13 · 审计修正版：只映射引擎专用码，绝不猜
+    /// -32603）：引擎在号码寻址本地解析 miss 时答 **-32010 +
+    /// UNREGISTERED_RECIPIENT**（engine 0a98bf8）——知道自己失败原因的
+    /// 一侧给的确定性语义。本函数只把这个专用码映射成
+    /// `unregistered_recipient` retryable=false（渲染层 f50881c5 文案明确
+    /// 告知，不进自动重试队列）；**-32603 及一切其它形态（超时/传输/限
+    /// 流）原样透传**——boot_send_integrity 钉死的通用 upstream 契约
+    /// （-32603 → UPSTREAM_ERROR retryable=true 进自动重试）逐字节不变。
+    fn classify_unregistered_recipient_send_error(
+        error: &crate::engine::EngineError,
+    ) -> Option<ServiceError> {
+        if !matches!(
+            error,
+            crate::engine::EngineError::Upstream {
+                code: Some(-32010),
+                ..
+            }
+        ) {
+            return None;
+        }
+        Some(ServiceError::Api(ApiError::new(
+            "unregistered_recipient",
+            "the engine resolved no Signal identity for this number-addressed send; the peer is not reachable on Signal",
+            false,
+        )))
+    }
+
     async fn dispatch_prepared(
         &self,
         engine: &EngineHandle,
@@ -4693,6 +5670,13 @@ impl RuntimeSupervisor {
                         != crate::store::SendRetrySchedule::None
                     {
                         self.notify_outbox_drain();
+                    }
+                    // BUG-16 刀2b（修正版）：只映射引擎 -32010 专用码；
+                    // -32603 全透传。
+                    if let Some(classified) =
+                        Self::classify_unregistered_recipient_send_error(&error)
+                    {
+                        return Err(classified);
                     }
                     Err(ServiceError::Engine(error))
                 }
@@ -4881,6 +5865,9 @@ impl RuntimeSupervisor {
     /// the service lock, upstream mutating `send` call, pending row settled
     /// on confirmation / unknown outcome / failure with the same event
     /// emission and no-auto-retry discipline.
+    /// 稳定的单数附件发送面（契约 1.294 前的 13 参形状）：声明尺寸走
+    /// `send_attachment_with_dimensions`，本包装恒传 None（旧调用点与
+    /// 集成测试逐字不变）。
     #[allow(clippy::too_many_arguments)]
     pub async fn send_attachment(
         &self,
@@ -4897,6 +5884,44 @@ impl RuntimeSupervisor {
         view_once: bool,
         blur_hash: Option<String>,
         gif: bool,
+    ) -> Result<MessageRecord, ServiceError> {
+        self.send_attachment_with_dimensions(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            None,
+        )
+        .await
+    }
+
+    /// 单数附件发送面 + 声明尺寸（契约 1.294 §4.284，BUG-11 wire 批）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_attachment_with_dimensions(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: String,
+        size_bytes: u64,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
     ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
@@ -4915,7 +5940,7 @@ impl RuntimeSupervisor {
                     peer_title: peer_title.as_deref(),
                 }),
             };
-            service.prepare_send_attachment(
+            service.prepare_send_attachment_with_dimensions(
                 &account_id,
                 &attachment_target,
                 &client_request_id,
@@ -4929,6 +5954,110 @@ impl RuntimeSupervisor {
                 view_once,
                 blur_hash.as_deref(),
                 gif,
+                dimensions,
+            )?
+        };
+        self.dispatch_prepared(&engine, prepared).await
+    }
+
+    /// Retry one definitively-failed outgoing attachment in place (contract
+    /// revision 1.278, §4.262; bytes optional = 1.279, §4.263; plural rebuild =
+    /// 1.280, §4.264): the §4.12 settlement path unchanged — local rearm + face
+    /// rewrite under the service lock, one upstream mutating `send` call
+    /// carrying the caller's bytes when supplied (else the original payload group
+    /// persisted at first send, rebuilt entry by entry), then the shared
+    /// completion, which settles the SAME row id the desktop bubble renders. No
+    /// second row, no new clientRequestId.
+    /// 稳定的同行重发面（契约 1.294 前的 13 参形状）：声明尺寸走
+    /// `retry_attachment_with_dimensions`，本包装恒传 None。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retry_attachment(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: Option<String>,
+        size_bytes: Option<u64>,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+    ) -> Result<MessageRecord, ServiceError> {
+        self.retry_attachment_with_dimensions(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            None,
+        )
+        .await
+    }
+
+    /// 同行重发面 + 声明尺寸（契约 1.294 §4.284）：调用方重述优先，
+    /// 否则行 descriptor 的既有尺寸对恢复。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retry_attachment_with_dimensions(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: Option<String>,
+        size_bytes: Option<u64>,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+    ) -> Result<MessageRecord, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            let attachment_target = match &target {
+                SendTarget::Conversation(conversation_id) => {
+                    AttachmentSendTarget::Conversation(conversation_id)
+                }
+                SendTarget::Peer {
+                    kind,
+                    peer_key,
+                    peer_title,
+                } => AttachmentSendTarget::Peer(PeerTarget {
+                    kind,
+                    peer_key,
+                    peer_title: peer_title.as_deref(),
+                }),
+            };
+            service.prepare_retry_attachment_with_dimensions(
+                &account_id,
+                &attachment_target,
+                &client_request_id,
+                data_base64.as_deref(),
+                size_bytes,
+                filename.as_deref(),
+                content_type.as_deref(),
+                text.as_deref(),
+                quote_message_id.as_deref(),
+                voice_note,
+                view_once,
+                blur_hash.as_deref(),
+                gif,
+                dimensions,
             )?
         };
         self.dispatch_prepared(&engine, prepared).await
@@ -6248,6 +7377,30 @@ impl RuntimeSupervisor {
         account_device_capabilities_from_engine(&result)
     }
 
+    /// accounts.getSyncState (contract revision 1.286, §4.281): account
+    /// resolution then the pure-read engine call — the login-window sync
+    /// arm's projection `{contacts, storage, profile, sinceMs}`, gated by the
+    /// `sync_state_from_engine` shape check (closed phase vocabulary +
+    /// numeric `sinceMs`; a bad shape is a protocol defect, never a guessed
+    /// face). No mutation, no local persistence, no logging: the call is
+    /// idempotent by construction (the engine's answer is a snapshot of its
+    /// own window book), which is the §二 P-B-3 polling contract the desktop
+    /// gate's fallback rides.
+    pub async fn get_sync_state(
+        &self,
+        params: AccountsGetSyncStateParams,
+    ) -> Result<AccountSyncState, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_accounts_get_sync_state(&params.account_id)?
+        };
+        let result = engine
+            .call("getSyncState", upstream, CallClass::ReadOnly)
+            .await?;
+        sync_state_from_engine(&result)
+    }
+
     /// accounts.getDevices (contract revision 1.122, §4.103, capability
     /// device-management): account resolution then the read-only engine call —
     /// the GET v1/devices projection with the engine-side device-name
@@ -6756,20 +7909,31 @@ impl RuntimeSupervisor {
         })
     }
 
-    /// identities.get (contract revision 1.68, §4.61, capability
-    /// safety-number): resolution under the service lock, then the
-    /// read-only pinned `listIdentities` call narrowed to the resolved peer
-    /// reference. The upstream answer is the JSON array of `JsonIdentity`
-    /// records; the projection is the §4.61 ladder (empty → `identity` null,
-    /// malformed record → protocol defect).
+    /// identities.get (contract revision 1.68, §4.61; peer arm added by
+    /// contract revision 1.281, §4.265, capability safety-number): addressing
+    /// decode first (`conversationId` xor `peerKey` — a params-shape gate that
+    /// must not depend on runtime state), then resolution under the service
+    /// lock, then the read-only pinned `listIdentities` call narrowed to the
+    /// addressed peer reference. The upstream answer is the JSON array of
+    /// `JsonIdentity` records; the projection is the §4.61 ladder (empty →
+    /// `identity` null, malformed record → protocol defect). The peer arm
+    /// resolves no conversation: the account identity store is read directly
+    /// by the peer reference, so a peer with no direct thread is readable.
     pub async fn get_identity(
         &self,
         params: IdentitiesGetParams,
     ) -> Result<IdentityRead, ServiceError> {
+        // 契约 §4.265：寻址形状（恰一）先于运行时状态 fail-closed——双缺 /
+        // 同置与 peerKey 词形都在任何 engine 调用之前拒。
+        let target = identities_addressing(
+            params.conversation_id.as_deref(),
+            params.peer_key.as_deref(),
+        )
+        .map_err(ServiceError::Api)?;
         let engine = self.running_engine().await?;
         let upstream = {
             let service = self.service.lock().await;
-            service.prepare_identities_get(&params.account_id, &params.conversation_id)?
+            service.prepare_identities_get_for_target(&params.account_id, &target)?
         };
         let result = engine
             .call("listIdentities", upstream, CallClass::ReadOnly)
@@ -6777,68 +7941,57 @@ impl RuntimeSupervisor {
         identity_from_engine(&result)
     }
 
-    /// identities.verify (contract revision 1.68, §4.61, capability
-    /// safety-number): resolution under the service lock, then the mutating
-    /// mutating `trust {verifiedSafetyNumber}` call — the reaction-class
-    /// discipline verbatim (an indeterminate outcome answers
-    /// SEND_OUTCOME_UNKNOWN and is never retried: the trust write may
-    /// already have landed). The engine answers an empty result object
-    /// on success (the command writes no JSON output), so the result is the
-    /// plain `{status: "verified"}` confirmation; the upstream mismatch
-    /// UserError folds into the plain UPSTREAM_ERROR like every
-    /// account-domain method.
+    /// identities.verify (contract revision 1.68, §4.61; peer arm added by
+    /// contract revision 1.281, §4.265, capability safety-number): addressing
+    /// decode, resolution under the service lock, then the mutating
+    /// `trust` call (both arms: `verifiedSafetyNumber` or the §4.223
+    /// `state` reset) — the reaction-class discipline verbatim (an
+    /// indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never
+    /// retried: the trust write may already have landed). The engine answers
+    /// an empty result object on success (the command writes no JSON output),
+    /// so the result is the plain `{status: "verified"}` confirmation; the
+    /// upstream mismatch UserError folds into the plain UPSTREAM_ERROR like
+    /// every account-domain method. The peer arm addresses the account
+    /// identity store directly — no conversation row is resolved or required,
+    /// and the write-through stamp lands on the peer's direct row when one
+    /// exists (a peer with no row simply has no local projection to stamp).
     pub async fn verify_identity(
         &self,
         params: IdentitiesVerifyParams,
     ) -> Result<IdentityVerifyOutcome, ServiceError> {
+        // 契约 §4.265：寻址两臂先解码（同读面，形状先于运行时状态）。
+        let target = identities_addressing(
+            params.conversation_id.as_deref(),
+            params.peer_key.as_deref(),
+        )
+        .map_err(ServiceError::Api)?;
+        // 契约 §4.223：两臂恰一路由（双臂/双缺 fail-closed 同 engine）。
+        // 解码与写穿词各是 service 层的单点纯函数——supervisor 只做装配，
+        // 两臂语义与单测同源。
+        let intent =
+            identities_verify_intent(params.safety_number.as_deref(), params.state.as_deref())
+                .map_err(ServiceError::Api)?;
+        // Contract 1.260 (§4.244): the write-through stamp word — the
+        // official `#_setVerified` arm writes the protocol store AND lands
+        // the record (`DataWriter.updateConversation`), so the projection
+        // the render reads is the deterministic post-image of the write.
+        // Verified arm → TRUSTED_VERIFIED (the engine trust
+        // verifiedSafetyNumber post-image); trust-reset arm (state "default",
+        // the official DEFAULT write) → TRUSTED_UNVERIFIED (first-use trust
+        // restored, the word the next `listIdentities` read answers).
+        let stamp_word = identity_verify_stamp_word(&intent);
         let engine = self.running_engine().await?;
-        let (upstream, stamp_word) = {
+        let upstream = {
             let service = self.service.lock().await;
-            // 契约 §4.223：两臂恰一路由（双臂/双缺 fail-closed 同 engine）。
-            let intent = match (params.safety_number.as_deref(), params.state.as_deref()) {
-                (Some(code), None) => IdentitiesVerifyIntent::Verified {
-                    safety_number: code.to_string(),
-                },
-                (None, Some("default")) => IdentitiesVerifyIntent::TrustDefault,
-                _ => {
-                    return Err(ServiceError::Api(ApiError::new(
-                        "INVALID_REQUEST",
-                        "exactly one of safetyNumber or state=\"default\" is required",
-                        false,
-                    )));
-                }
-            };
-            // Contract 1.260 (§4.244): the write-through stamp word — the
-            // official `#_setVerified` arm writes the protocol store AND
-            // lands the record (`DataWriter.updateConversation`), so the
-            // projection the render reads is the deterministic post-image of
-            // the write. Verified arm → TRUSTED_VERIFIED (the engine trust
-            // verifiedSafetyNumber post-image); trust-reset arm (state
-            // "default", the official DEFAULT write) → TRUSTED_UNVERIFIED
-            // (first-use trust restored, the word the next `listIdentities`
-            // read answers).
-            let stamp_word = match intent {
-                IdentitiesVerifyIntent::Verified { .. } => "TRUSTED_VERIFIED",
-                IdentitiesVerifyIntent::TrustDefault => "TRUSTED_UNVERIFIED",
-            };
-            (
-                service.prepare_identities_verify(
-                    &params.account_id,
-                    &params.conversation_id,
-                    &intent,
-                )?,
-                stamp_word,
-            )
+            service.prepare_identities_verify_for_target(&params.account_id, &target, &intent)?
         };
         match engine.call("trust", upstream, CallClass::Mutating).await {
             Ok(_) => {
-                let _ = self
-                    .store
-                    .set_conversation_identity_verified_for_conversation(
-                        &params.account_id,
-                        &params.conversation_id,
-                        stamp_word,
-                    );
+                {
+                    let service = self.service.lock().await;
+                    let _ =
+                        service.stamp_identity_verified(&params.account_id, &target, stamp_word);
+                }
                 Ok(IdentityVerifyOutcome { status: "verified" })
             }
             Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
@@ -9931,6 +11084,13 @@ impl RuntimeSupervisor {
                 true,
             )))
         });
+        // An empty projection means the engine store was not ready yet; do
+        // not let that empty result arm the 60s throttle. The gate retries
+        // until the contact attachment has landed.
+        if matches!(&outcome, Ok(outcome) if outcome.contact_count == 0) {
+            let service = self.service.lock().await;
+            let _ = service.store_ref().clear_contacts_synced_at(account_id);
+        }
         if outcome.is_ok() {
             // 契约 1.270（§4.254 · 批 Z14）：真实落库（非 60s 节流早退）后
             // 一轮头像 backfill——首轮链接/换机/重启后的冷缓存收敛点。
@@ -9958,7 +11118,7 @@ async fn sync_contacts_with(
 ) -> Result<ContactsSyncOutcome, ServiceError> {
     let number = service.lock().await.account_signal_number(account_id)?;
     // Contacts registered on the account only (no allRecipients walk).
-    let contacts_result = engine
+    let mut contacts_result = engine
         .call(
             "listContacts",
             json!({ "account": number }),
@@ -9966,6 +11126,58 @@ async fn sync_contacts_with(
         )
         .await
         .map_err(ServiceError::Engine)?;
+    let has_unnamed = contacts_result.as_array().is_some_and(|items| {
+        !items.is_empty()
+            && items.iter().all(|item| {
+                item.get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| name.trim().is_empty())
+            })
+    });
+    if has_unnamed {
+        // A fresh/relinked account can land contacts before any profile
+        // material does. Refresh once and re-read the projection instead of
+        // leaving every row as 未知联系人 until the next link.
+        let _ = engine
+            .call(
+                "profiles.refreshContacts",
+                json!({ "account": number }),
+                CallClass::ReadOnly,
+            )
+            .await;
+        if let Ok(refreshed) = engine
+            .call(
+                "listContacts",
+                json!({ "account": number }),
+                CallClass::ReadOnly,
+            )
+            .await
+        {
+            contacts_result = refreshed;
+        }
+    }
+    let contact_items = contacts_result
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let named = contact_items
+        .iter()
+        .filter(|item| {
+            item.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty())
+        })
+        .count();
+    let profiled = contact_items
+        .iter()
+        .filter(|item| item.get("profile").is_some())
+        .count();
+    tracing::warn!(
+        contacts = contact_items.len(),
+        named,
+        profiled,
+        "contacts sync engine projection"
+    );
     let groups_result = engine
         .call(
             "listGroups",
@@ -9979,7 +11191,10 @@ async fn sync_contacts_with(
     let mut contact_count = 0_u64;
     let mut group_count = 0_u64;
     for item in contacts_result.as_array().cloned().unwrap_or_default() {
-        let peer_key = ["number", "uuid", "numberUuid"]
+        // Prefer the ACI: direct conversation rows are keyed by serviceId on
+        // the receive path. Picking the number first materialized a second
+        // number-keyed row and left the live ACI row's title masked.
+        let peer_key = ["uuid", "number", "numberUuid"]
             .iter()
             .find_map(|field| item.get(field).and_then(Value::as_str))
             .map(str::trim)
@@ -11317,11 +12532,18 @@ async fn recv_stderr_line(rx: Option<&mut broadcast::Receiver<String>>) -> Optio
 /// failure keyword; normal INFO logs must not match.
 fn is_receive_fatal_stderr(line: &str) -> bool {
     let lower = line.to_lowercase();
+    // Only terminal legacy signal-cli shapes are receive-fatal. The kt engine
+    // logs normal reconnect/handover ("websocket link is dead; closing so the
+    // receive stream reconnects", "Websocket error: tungstenite error") while
+    // its receive loop keeps retrying in-process; treating those as fatal
+    // restarts the whole engine and turns a recoverable proxy blip into a
+    // process restart storm.
     lower.contains("websocketioexception")
-        || (lower.contains("websocket")
-            && ["error", "closed", "disconnected", "failed", "exception"]
-                .iter()
-                .any(|needle| lower.contains(needle)))
+        || (lower.contains("websocketconnection") && lower.contains("closed unexpectedly"))
+        || lower.contains("websocket error while receiving")
+        || lower.contains("websocket disconnected from server")
+        || lower.contains("failed to connect websocket")
+        || lower.contains("exception in websocket reader thread")
 }
 
 /// How the watchdog's stderr consumer surfaces one engine stderr line.
@@ -11398,6 +12620,7 @@ fn run_media_governor_pass(governor: MediaGovernor) -> JoinHandle<()> {
 async fn engine_event_watch_loop(
     mut engine_events: broadcast::Receiver<EngineEvent>,
     service: Arc<Mutex<ConnectorService>>,
+    store: Arc<Store>,
     host_events: broadcast::Sender<HostSideEvent>,
     background_sync: mpsc::Sender<String>,
 ) {
@@ -11406,6 +12629,16 @@ async fn engine_event_watch_loop(
             Ok(EngineEvent::AccountUnauthorized { account }) => {
                 let marked = {
                     let guard = service.lock().await;
+                    if !guard.should_persist_account_unlink() {
+                        // A link/re-key window still owns the account: the
+                        // engine's transient 401 is provisioning noise, not a
+                        // terminal unlink. Persisting it here would outlive
+                        // the window and surface as a false "phone unlinked".
+                        tracing::info!(
+                            "device-unlinked observed during an active link; deferring the terminal write"
+                        );
+                        continue;
+                    }
                     guard.mark_account_device_unlinked(&account)
                 };
                 match marked {
@@ -11419,6 +12652,33 @@ async fn engine_event_watch_loop(
                         // never take the watcher down over a store hiccup.
                         tracing::warn!(error_class = error.class(), "device-unlinked mark failed");
                     }
+                }
+            }
+            Ok(EngineEvent::ConnectionState {
+                account,
+                state,
+                close_code,
+            }) => {
+                // C: connection axis only. 4401/invalidated must never write
+                // account state; the account remains linked until 401/
+                // DeviceDelinked arrives through AccountUnauthorized.
+                let epoch = store
+                    .account_engine_epoch(&account)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let publisher = EventPublisher::new(Arc::clone(&store), host_events.clone());
+                if let Err(error) = publisher.publish(
+                    epoch,
+                    Some(&account),
+                    "connection.stateChanged",
+                    HostSideEvent::ConnectionStateChanged {
+                        account_id: account.clone(),
+                        state,
+                        close_code,
+                    },
+                ) {
+                    tracing::warn!(?error, "durable connection.stateChanged failed");
                 }
             }
             Ok(EngineEvent::ReceiveEmptied { account }) => {
@@ -11614,6 +12874,7 @@ fn emit_forwarded(
 async fn receive_persistence_loop(
     mut receives: mpsc::Receiver<QueuedReceive>,
     service: Arc<Mutex<ConnectorService>>,
+    store: Arc<Store>,
     host_events: broadcast::Sender<HostSideEvent>,
     owner_group: String,
     media_governor: Option<MediaGovernor>,
@@ -11670,7 +12931,25 @@ async fn receive_persistence_loop(
                         events.len() as u64,
                     );
                     for event in &events {
-                        let _ = host_events.send(event.clone());
+                        if let HostSideEvent::AccountChanged(account) = event {
+                            let epoch = store
+                                .account_engine_epoch(&account.id)
+                                .ok()
+                                .flatten()
+                                .unwrap_or(0);
+                            let publisher =
+                                EventPublisher::new(Arc::clone(&store), host_events.clone());
+                            if let Err(error) = publisher.publish(
+                                epoch,
+                                Some(&account.id),
+                                "account.changed",
+                                event.clone(),
+                            ) {
+                                tracing::warn!(?error, "durable account.changed failed");
+                            }
+                        } else {
+                            let _ = host_events.send(event.clone());
+                        }
                     }
                     if storage_unavailable {
                         storage_unavailable = false;
@@ -12101,6 +13380,51 @@ fn avatar_from_engine(result: &Value) -> Result<AvatarDownload, ServiceError> {
     })
 }
 
+/// Store-only (stale) projection (contract 1.292 §4.278, widened by §4.279).
+///
+/// A terminal `device_unlinked` row whose origin is the upstream verdict is
+/// the one authority a parked slot has left: its engine is stopped by design,
+/// so every listing of that slot is a store read. Laundering the state to
+/// `unknown` here hid the death verdict from the host — the desktop keyed its
+/// dead-session-binding release and its "re-link" entry on `device_unlinked`,
+/// so the binding stayed active and the re-link answered
+/// `session_already_bound` forever (the permanent deadlock this revision
+/// fixes). Rows without an authoritative origin (pre-origin cache) keep the
+/// pre-fix downgrade: an unverified terminal is not evidence.
+fn apply_stale_account_evidence(account: &mut AccountSummary) {
+    account.stale = true;
+    if account.state == "device_unlinked" {
+        let trusted = matches!(
+            account.state_evidence.as_deref(),
+            Some("upstream") | Some("engine")
+        );
+        if trusted {
+            return;
+        }
+        account.state = "unknown";
+    }
+    account.state_evidence = Some("cache".to_owned());
+}
+
+fn apply_live_account_evidence(account: &mut AccountSummary) {
+    if account.state == "device_unlinked" {
+        let trusted = matches!(
+            account.state_evidence.as_deref(),
+            Some("upstream") | Some("engine")
+        );
+        if !trusted {
+            account.state = "unknown";
+            account.state_evidence = Some("cache".to_owned());
+            account.stale = true;
+        } else {
+            account.stale = false;
+        }
+    } else {
+        account.state_evidence = Some("inventory".to_owned());
+        account.stale = false;
+    }
+}
+
 /// Test-only re-export so the service-layer projection test can pin the
 /// avatar result face (the same pattern as the engine error allowlist).
 #[cfg(test)]
@@ -12189,7 +13513,43 @@ fn story_from_engine(result: &Value) -> Result<StorySendResult, ServiceError> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::engine::EngineError as EngineErrorVariant;
+
+    /// BUG-16 刀2b（审计修正版）：只映射引擎 -32010 专用码；
+    /// **-32603 必须透传**（boot_send_integrity 的通用 upstream 契约：
+    /// UPSTREAM_ERROR retryable=true 进自动重试——fd72b22 首版的回归正是
+    /// 这里被集成测试抓住的）。
+    #[test]
+    fn classify_unregistered_recipient_only_fires_on_dedicated_code() {
+        let dedicated = EngineErrorVariant::Upstream {
+            cause: Some("UNREGISTERED_RECIPIENT".into()),
+            code: Some(-32010),
+        };
+        let internal = EngineErrorVariant::Upstream {
+            cause: None,
+            code: Some(-32603),
+        };
+        let timeout = EngineErrorVariant::EngineRequestTimeout { data: None };
+
+        let hit = RuntimeSupervisor::classify_unregistered_recipient_send_error(&dedicated)
+            .expect("dedicated code classifies");
+        match hit {
+            ServiceError::Api(api) => {
+                assert_eq!(api.code, "unregistered_recipient");
+                assert!(!api.retryable, "must not enter the auto-retry queue");
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+        assert!(
+            RuntimeSupervisor::classify_unregistered_recipient_send_error(&internal).is_none(),
+            "-32603 must pass through untouched (boot_send_integrity contract)"
+        );
+        assert!(RuntimeSupervisor::classify_unregistered_recipient_send_error(&timeout).is_none());
+    }
+
     use super::hidden_write_back_targets;
+    use super::{AccountSummary, apply_live_account_evidence, apply_stale_account_evidence};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
@@ -12201,6 +13561,378 @@ mod tests {
     use tempfile::TempDir;
 
     use tokio::time::{Instant, sleep, timeout};
+
+    fn account_for_evidence(state: &'static str, evidence: Option<&str>) -> AccountSummary {
+        AccountSummary {
+            id: "account-1".into(),
+            display_name: None,
+            masked_address: "•••".into(),
+            state,
+            linked_at: Some(1),
+            last_message_at: None,
+            unread_count: 0,
+            proxy_group: "default".into(),
+            aci: None,
+            capabilities: None,
+            state_evidence: evidence.map(str::to_string),
+            state_observed_at: Some(1),
+            stale: false,
+            state_revision: 0,
+            engine_epoch: 0,
+        }
+    }
+
+    /// The link-finish budget is the last of three deadlines: the engine's own
+    /// finish dispatch budget is 360 s and the desktop's link wait is 330 s, so
+    /// the connector must never be the first party to give up. Answering first
+    /// would turn a link the engine may still commit into a client-side
+    /// failure, and a re-run of `finishLink` claims a second device slot.
+    #[test]
+    fn link_finish_budget_outranks_the_engine_and_desktop_deadlines() {
+        assert_eq!(super::LINK_FINISH_TIMEOUT, Duration::from_secs(370));
+        assert!(
+            super::LINK_FINISH_TIMEOUT > Duration::from_secs(360),
+            "the engine's own 360 s finish budget must expire first"
+        );
+        assert!(
+            super::LINK_FINISH_TIMEOUT > Duration::from_secs(330),
+            "the desktop's 330 s link wait must expire first"
+        );
+    }
+
+    /// A budget-expired `finishLink` is the link-class unknown outcome, never
+    /// the definite retryable `UPSTREAM_TIMEOUT`: the mutating call was in
+    /// flight, so "definitely failed" is a lie the desktop would act on by
+    /// re-running the finish.
+    #[test]
+    fn a_link_finish_timeout_answers_the_link_class_unknown_outcome() {
+        let error = super::RuntimeSupervisor::link_finish_timeout_error();
+        let api = match error {
+            crate::service::ServiceError::Api(api) => api,
+            other => panic!("a finish timeout must answer the host api face, got {other:?}"),
+        };
+        assert_eq!(api.code, "LINK_OUTCOME_UNKNOWN");
+        assert!(
+            !api.retryable,
+            "an unknown link outcome must never be retried automatically"
+        );
+        assert_ne!(api.code, "UPSTREAM_TIMEOUT");
+    }
+
+    /// M3.3 + QR B1: the per-engine account ceiling refuses `finishLink` before
+    /// the engine is touched. The refusal must clear the finish lane it took —
+    /// a leaked lane answers every later finish with LINK_IN_PROGRESS and keeps
+    /// the watchdog suppressed for good — and drop the spent session: a QR that
+    /// can never commit must not keep `has_pending_link` true for its TTL.
+    #[tokio::test]
+    async fn a_ceiling_refused_finish_clears_its_lane_and_spends_the_session() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(test_store(temp.path()));
+        for index in 0..super::MAX_ACCOUNTS_PER_ENGINE {
+            store
+                .upsert_account_from_signal(
+                    &format!("+1555555{index:04}"),
+                    Some(1),
+                    DEFAULT_PROXY_GROUP_ID,
+                )
+                .unwrap();
+        }
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            EngineConfig::new(
+                temp.path().join("unused-engine"),
+                temp.path().join("unused-signal-data"),
+            ),
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        let link_session_id = supervisor
+            .service
+            .lock()
+            .await
+            .plant_link_session_for_test("KT-Ceiling", crate::link::LINK_SESSION_TTL);
+        assert!(supervisor.has_pending_link().await);
+
+        let refused = match supervisor.finish_link(link_session_id.clone()).await {
+            Err(crate::service::ServiceError::Api(error)) => error,
+            other => panic!("a full group must refuse the finish, got {other:?}"),
+        };
+        assert_eq!(refused.code, "ACCOUNT_LIMIT_REACHED");
+        assert!(
+            !supervisor.link_flow_active().await,
+            "a refused finish must leave neither its lane nor a pending session behind"
+        );
+        assert!(
+            !supervisor.has_pending_link().await,
+            "the spent QR must not keep the watchdog suppressed"
+        );
+
+        // The next finish reaches the session judgment instead of a leaked
+        // lane, and the session answers for its (spent) state.
+        let again = match supervisor.finish_link(link_session_id).await {
+            Err(crate::service::ServiceError::Api(error)) => error,
+            other => panic!("a spent session must answer a definite code, got {other:?}"),
+        };
+        assert_eq!(again.code, "LINK_NOT_FOUND");
+        assert_ne!(again.code, "LINK_IN_PROGRESS");
+        assert!(!supervisor.link_flow_active().await);
+    }
+
+    /// QR B1: session state outranks engine liveness. A lost session's finish
+    /// must still answer the definite LINK_LOST when the engine is terminal or
+    /// missing — RUNTIME_NOT_RUNNING would report the runtime instead of the
+    /// dead QR, and the desktop would not restart the link.
+    #[tokio::test]
+    async fn a_lost_session_finish_answers_link_lost_without_a_running_engine() {
+        let temp = TempDir::new().unwrap();
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            EngineConfig::new(
+                temp.path().join("unused-engine"),
+                temp.path().join("unused-signal-data"),
+            ),
+            Arc::new(test_store(temp.path())),
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        // No start(): the slot holds no engine at all, so running_engine()
+        // answers NotRunning.
+        let link_session_id = supervisor
+            .service
+            .lock()
+            .await
+            .plant_link_session_for_test("KT-Lost", crate::link::LINK_SESSION_TTL);
+        assert!(
+            supervisor
+                .service
+                .lock()
+                .await
+                .mark_link_lost(&link_session_id)
+        );
+
+        for attempt in 0..2 {
+            let error = match supervisor.finish_link(link_session_id.clone()).await {
+                Err(crate::service::ServiceError::Api(error)) => error,
+                other => {
+                    panic!("attempt {attempt}: a lost session must answer LINK_LOST, got {other:?}")
+                }
+            };
+            assert_eq!(error.code, "LINK_LOST", "attempt {attempt}");
+            assert!(
+                error.retryable,
+                "the remedy is a fresh link.start, so LINK_LOST stays retryable"
+            );
+        }
+        assert!(
+            !supervisor.link_flow_active().await,
+            "each refusal clears the lane it took"
+        );
+    }
+
+    fn link_supervisor(temp: &TempDir) -> Arc<RuntimeSupervisor> {
+        Arc::new(RuntimeSupervisor::new(
+            EngineConfig::new(
+                temp.path().join("unused-engine"),
+                temp.path().join("unused-signal-data"),
+            ),
+            Arc::new(test_store(temp.path())),
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ))
+    }
+
+    /// Contract 1.286 (§4.272): an engine that states no rotate key is the
+    /// capability degradation — rotation answers NOT_SUPPORTED without
+    /// touching the engine (this slot holds none at all) and the single slot
+    /// stays live and finishable.
+    #[tokio::test]
+    async fn rotate_without_an_engine_key_answers_not_supported_and_keeps_the_slot() {
+        let temp = TempDir::new().unwrap();
+        let supervisor = link_supervisor(&temp);
+        let (attempt, slot) = supervisor.service.lock().await.plant_link_attempt_for_test(
+            "KT-Rotate",
+            None,
+            crate::link::LINK_SESSION_TTL,
+        );
+
+        let refused = supervisor
+            .rotate_link(attempt.clone())
+            .await
+            .expect_err("a pre-rotate engine cannot rotate");
+        let api = match refused {
+            crate::service::ServiceError::Api(error) => error,
+            other => panic!("rotation degradation must answer the host api face, got {other:?}"),
+        };
+        assert_eq!(api.code, "NOT_SUPPORTED");
+        assert!(!api.retryable, "the remedy is a fresh link.start");
+
+        // The single slot is untouched: still live, still addressable.
+        assert!(supervisor.has_pending_link().await);
+        let service = supervisor.service.lock().await;
+        assert!(service.has_link_session(&slot));
+        assert!(service.has_link_attempt(&attempt));
+
+        // An unknown attempt is its own definite answer, still engine-free.
+        drop(service);
+        let missing = supervisor
+            .rotate_link("no-such-attempt".into())
+            .await
+            .expect_err("an unknown attempt answers LINK_ATTEMPT_NOT_FOUND");
+        let api = match missing {
+            crate::service::ServiceError::Api(error) => error,
+            other => panic!("expected the host api face, got {other:?}"),
+        };
+        assert_eq!(api.code, "LINK_ATTEMPT_NOT_FOUND");
+        assert!(!api.retryable);
+    }
+
+    /// Contract 1.286 (§4.272): a rotate key with no running engine reports
+    /// the runtime, not the capability — the engine may carry the method once
+    /// it lands, so NOT_SUPPORTED would be a lie.
+    #[tokio::test]
+    async fn rotate_with_a_key_but_no_engine_reports_the_runtime() {
+        let temp = TempDir::new().unwrap();
+        let supervisor = link_supervisor(&temp);
+        let (attempt, _slot) = supervisor.service.lock().await.plant_link_attempt_for_test(
+            "KT-Rotate",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let error = supervisor
+            .rotate_link(attempt)
+            .await
+            .expect_err("no engine is running");
+        let api = error.into_api();
+        assert_eq!(api.code, "RUNTIME_NOT_RUNNING");
+        assert_ne!(api.code, "NOT_SUPPORTED");
+    }
+
+    /// Contract 1.286 (§4.272): the engine's method-not-found class folds to
+    /// NOT_SUPPORTED; every other upstream face keeps its own answer.
+    #[test]
+    fn engine_method_not_found_classifies_structurally() {
+        let upstream = |cause: Option<&str>, code: Option<i64>| EngineError::Upstream {
+            cause: cause.map(str::to_string),
+            code,
+        };
+        assert!(super::engine_method_missing(&upstream(None, Some(-32601))));
+        assert!(super::engine_method_missing(&upstream(
+            Some("(MethodNotFound)"),
+            Some(-1)
+        )));
+        assert!(super::engine_method_missing(&upstream(
+            Some("(MethodNotFoundError)"),
+            Some(-32603)
+        )));
+        assert!(!super::engine_method_missing(&upstream(
+            Some("(EngineBusy)"),
+            Some(-32000)
+        )));
+        assert!(!super::engine_method_missing(&upstream(None, Some(-32603))));
+        assert!(!super::engine_method_missing(&EngineError::Protocol));
+    }
+
+    /// Contract 1.286 (§4.272): a finish on any code of a committed attempt
+    /// replays the same account — no second engine call, no second commit —
+    /// and always releases the finish lane it took.
+    #[tokio::test]
+    async fn finishing_a_committed_attempt_replays_from_any_slot() {
+        let temp = TempDir::new().unwrap();
+        let supervisor = link_supervisor(&temp);
+        let (attempt, first) = supervisor.service.lock().await.plant_link_attempt_for_test(
+            "KT-Committed",
+            Some("engine-attempt-1"),
+            crate::link::LINK_SESSION_TTL,
+        );
+        let second = supervisor
+            .service
+            .lock()
+            .await
+            .attach_rotated_slot(&attempt, "sgnl://link?second".into(), super::now_ms())
+            .expect("the attempt rotates");
+        let committed = supervisor
+            .service
+            .lock()
+            .await
+            .complete_link_session_with_id(
+                &second.link_session_id,
+                "+15555550100",
+                DEFAULT_PROXY_GROUP_ID,
+                None,
+                None,
+            )
+            .expect("the rotated slot commits");
+
+        let replay = supervisor
+            .finish_link(first)
+            .await
+            .expect("a committed attempt replay answers the account");
+        assert_eq!(replay.id, committed.id);
+        assert!(!supervisor.link_flow_active().await, "the lane is released");
+
+        let again = supervisor
+            .finish_link(second.link_session_id.clone())
+            .await
+            .expect("the committed slot replays too");
+        assert_eq!(again.id, committed.id);
+        assert_eq!(
+            supervisor
+                .service
+                .lock()
+                .await
+                .list_accounts_in_group(DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .len(),
+            1,
+            "the attempt committed exactly once"
+        );
+    }
+
+    /// §4.279: the store-only fallback is the ONLY face a parked terminal
+    /// slot has left (its engine is stopped by design). An authoritative
+    /// upstream unlink must survive it — laundering it to `unknown` hid the
+    /// death verdict from the host, whose dead-binding release keys on
+    /// `device_unlinked`, so the re-link answered `session_already_bound`
+    /// forever. An origin-less legacy terminal keeps the pre-fix downgrade.
+    #[test]
+    fn stale_engine_fallback_keeps_only_an_authoritative_terminal_unlink() {
+        let mut trusted = account_for_evidence("device_unlinked", Some("upstream"));
+        apply_stale_account_evidence(&mut trusted);
+        assert_eq!(trusted.state, "device_unlinked");
+        assert_eq!(trusted.state_evidence.as_deref(), Some("upstream"));
+        assert!(trusted.stale, "the evidence is remembered, not live");
+
+        let mut legacy = account_for_evidence("device_unlinked", None);
+        apply_stale_account_evidence(&mut legacy);
+        assert_eq!(legacy.state, "unknown");
+        assert_eq!(legacy.state_evidence.as_deref(), Some("cache"));
+        assert!(legacy.stale);
+
+        let mut ready = account_for_evidence("ready", Some("inventory"));
+        apply_stale_account_evidence(&mut ready);
+        assert_eq!(ready.state, "ready");
+        assert_eq!(ready.state_evidence.as_deref(), Some("cache"));
+        assert!(ready.stale);
+    }
+
+    #[test]
+    fn live_inventory_trusts_only_an_authoritative_terminal_state() {
+        let mut trusted = account_for_evidence("device_unlinked", Some("upstream"));
+        apply_live_account_evidence(&mut trusted);
+        assert_eq!(trusted.state, "device_unlinked");
+        assert!(!trusted.stale);
+
+        let mut legacy = account_for_evidence("device_unlinked", None);
+        apply_live_account_evidence(&mut legacy);
+        assert_eq!(legacy.state, "unknown");
+        assert_eq!(legacy.state_evidence.as_deref(), Some("cache"));
+        assert!(legacy.stale);
+
+        let mut ready = account_for_evidence("ready", None);
+        apply_live_account_evidence(&mut ready);
+        assert_eq!(ready.state, "ready");
+        assert_eq!(ready.state_evidence.as_deref(), Some("inventory"));
+        assert!(!ready.stale);
+    }
 
     /// §4.173: the send reply's `results` array counts into success/failure
     /// totals; direct sends (no array), empty arrays, and shape-hostile
@@ -14298,11 +16030,32 @@ mod tests {
             ),
             EngineStderrClass::ReceiveFatal
         );
+        // kt engine's recoverable reconnect/handover chatter is NOT a reason
+        // to restart the process. These lines can repeat during a proxy blip;
+        // the receive loop owns retry and the liveness watchdog owns death.
+        assert_eq!(
+            classify_engine_stderr(
+                "WARN libsignal_service::websocket: websocket link is dead; closing so the receive stream reconnects cause=\"request response timeout\""
+            ),
+            EngineStderrClass::Diagnostic
+        );
+        assert_eq!(
+            classify_engine_stderr(
+                "WARN libsignal_service::websocket: websocket handover: terminating previous identified connection before dialing"
+            ),
+            EngineStderrClass::Diagnostic
+        );
+        assert_eq!(
+            classify_engine_stderr(
+                "ERROR libsignal_service::websocket: SignalWebSocket: Websocket error: tungstenite error"
+            ),
+            EngineStderrClass::Diagnostic
+        );
         // A pathological line carrying both the banner and a fatal shape is
         // fatal first: the watchdog must never be muted by the new grading.
         assert_eq!(
             classify_engine_stderr(
-                "websocket error after network path was declared: connection reset"
+                "websocketioexception after network path was declared: connection reset"
             ),
             EngineStderrClass::ReceiveFatal
         );

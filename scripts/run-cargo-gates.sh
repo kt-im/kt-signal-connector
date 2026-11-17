@@ -33,6 +33,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TIMEOUT_SECS="${GATE_TIMEOUT_SECS:-1800}"
 MODE="${1:-all}"
+# 剩余参数透传给 cargo（CI 传 `test --lib`，只跑 lib 单测：集成测试依赖的
+# python fixture 在 runner 上起不来，见 issue #7）。原先只取 $1，--lib 静默
+# 丢掉；run_gate 里虽然支持 "$@" 透传，但调用方也没传过去——两处一起修。
+shift || true
+EXTRA_ARGS=("$@")
 
 cd "$ROOT"
 
@@ -85,12 +90,15 @@ reap_group() {
 }
 
 run_gate() {
-  local gate="$1"
+  local gate="$1"; shift
   local -a cargo_args=()
   case "$gate" in
     fmt)    cargo_args=(fmt --check) ;;
     clippy) cargo_args=(clippy --all-targets --all-features -- -D warnings) ;;
-    test)   cargo_args=(test) ;;
+    # 额外参数透传（CI 在 Linux 上只跑 `test --lib`：集成测试依赖的 python
+    # fixture 在 runner 上起不来，追踪 issue #7）。原先这里写死 `test`，
+    # 调用方传的 --lib 被静默丢掉。
+    test)   cargo_args=(test "$@") ;;
     build)  cargo_args=(build --release) ;;
   esac
   printf '[gate] >>> cargo %s\n' "${cargo_args[*]}"
@@ -135,7 +143,12 @@ run_gate() {
 }
 
 for gate in "${GATES[@]}"; do
-  run_gate "$gate"
+  # bash 4.4+ 安全展开空数组；macOS 自带 3.2 用 ${arr[@]+...} 形式。
+  if (( ${#EXTRA_ARGS[@]} )); then
+    run_gate "$gate" "${EXTRA_ARGS[@]}"
+  else
+    run_gate "$gate"
+  fi
 done
 
 printf '[gate] all gates passed (%s)\n' "$MODE"

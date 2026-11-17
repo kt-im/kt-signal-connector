@@ -238,6 +238,62 @@ async fn doctor_reports_versions_data_dir_lock_errors_and_reachability() {
     assert_eq!(connector_face["apiVersion"], json!(API_VERSION));
     assert!(connector_face["pid"].is_u64());
 
+    // Contract revision 1.282 (§4.266): the store face rides every payload —
+    // the schema version next to its target, the integrity verdict of this
+    // process (a first start migrates nothing, so no gate ran), the file
+    // sizes, and the snapshot outcome. A healthy start reports no failure.
+    let store = &result["store"];
+    assert_eq!(
+        store["schemaVersion"],
+        json!(kt_signal_connector::store::SCHEMA_VERSION)
+    );
+    assert_eq!(
+        store["schemaTarget"],
+        json!(kt_signal_connector::store::SCHEMA_VERSION)
+    );
+    assert_eq!(store["integrity"], json!("notChecked"));
+    assert!(
+        store["dbBytes"].as_u64().is_some_and(|bytes| bytes > 0),
+        "the store file exists and its size is reported"
+    );
+    assert!(store["walBytes"].is_u64());
+    assert_eq!(store["snapshots"]["count"], json!(0));
+    assert_eq!(store["snapshots"]["lastResult"], json!("notNeeded"));
+    assert!(
+        store.get("lastMigrationFailure").is_none(),
+        "a healthy start has no migration failure to report"
+    );
+    // Contract revision 1.284 (§4.268): no start has refused this state
+    // directory, so the newer-schema record is absent — not a fabricated
+    // "false" object.
+    assert!(
+        store.get("schemaNewer").is_none(),
+        "a healthy start has no refused-open record"
+    );
+
+    // Contract revision 1.283 (§4.267): the event ledger's face — a fresh
+    // store seeds generation 1 at floor 0 with an empty ledger, and the token
+    // itself never rides the diagnostic payload.
+    let events = &result["events"];
+    assert_eq!(events["readable"], json!(true));
+    assert_eq!(events["tokenGeneration"], json!(1));
+    assert_eq!(events["trimmedThroughSeq"], json!(0));
+    assert_eq!(events["seqMax"], json!(0));
+    assert_eq!(events["rows"], json!(0));
+    assert_eq!(events["bytes"], json!(0));
+    assert!(
+        events.get("token").is_none(),
+        "the ledger token never reaches doctor",
+    );
+    assert_eq!(
+        events["retention"]["maxRows"],
+        json!(kt_signal_connector::store::EVENT_LOG_MAX_ROWS)
+    );
+    assert_eq!(
+        events["retention"]["maxBytes"],
+        json!(kt_signal_connector::store::EVENT_LOG_MAX_BYTES)
+    );
+
     let group = &result["groups"][0];
     assert_eq!(group["groupId"], json!("default"));
 

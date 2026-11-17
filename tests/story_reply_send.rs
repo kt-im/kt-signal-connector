@@ -7,10 +7,13 @@
 //! `DataMessage.StoryContext` alignment at SendMessage.preload.ts:567-577):
 //! the two optional keys (`storyReplyAuthor` / `storyReplyTimestamp`) ride
 //! the engine `send` frame verbatim — each only when the caller sent it,
-//! absence never becoming null. The pair discipline (both-present or
-//! both-absent, a single-sided presence refused) and the timestamp's whole
-//! value domain (zero/negative/fractional/non-integer) are the engine's
-//! fail-closed parse, never a connector gate. The fixture plays the engine
+//! absence never becoming null. The frame also carries the send lane's own
+//! `dispatchId` (the client request id, stamped on every dispatch), so the
+//! story-reply keys are pinned beside it rather than on a bare body. The
+//! pair discipline (both-present or both-absent, a single-sided presence
+//! refused) and the timestamp's whole value domain
+//! (zero/negative/fractional/non-integer) are the engine's fail-closed
+//! parse, never a connector gate. The fixture plays the engine
 //! (the stub answer pins the wire shape, the engine fake discipline); these
 //! tests pin the connector's verbatim forward and error fidelity, never real
 //! engine story-reply behavior (the real-device story reply is the engine
@@ -87,9 +90,9 @@ fn log_lines(data_dir: &Path) -> Vec<Value> {
 /// The verbatim forward pinned byte-for-byte on the three key states: both
 /// keys ride, a single-sided presence rides alone (the pair discipline is
 /// the engine's face — the connector forwards it as-is), and the keyless
-/// body stays byte-identical to the pre-1.156 shape. The raw-JSON
-/// timestamp posture rides too: a string-form stamp forwards untouched
-/// (the engine's non-integer refusal, not a connector gate).
+/// body stays the pre-1.156 shape (plus the send lane's dispatchId). The
+/// raw-JSON timestamp posture rides too: a string-form stamp forwards
+/// untouched (the engine's non-integer refusal, not a connector gate).
 #[tokio::test]
 async fn story_reply_context_rides_the_send_frame_verbatim() {
     let temp = TempDir::new().unwrap();
@@ -129,6 +132,7 @@ async fn story_reply_context_rides_the_send_frame_verbatim() {
             "recipient": [PEER],
             "storyReplyAuthor": "22222222-2222-2222-2222-222222222222",
             "storyReplyTimestamp": 1_727_000_000_000u64,
+            "dispatchId": "req-story-reply-1",
         })
     );
 
@@ -180,7 +184,8 @@ async fn story_reply_context_rides_the_send_frame_verbatim() {
     assert!(log[2].get("storyReplyAuthor").is_none());
     assert_eq!(log[2]["storyReplyTimestamp"], json!("1727000000000"));
 
-    // Neither key: the pre-1.156 wire shape, byte-identical.
+    // Neither key: the pre-1.156 body plus the dispatchId every dispatch
+    // frame carries.
     supervisor
         .send_text(
             account_id.clone(),
@@ -206,6 +211,7 @@ async fn story_reply_context_rides_the_send_frame_verbatim() {
             "account": SIGNAL_ACCOUNT,
             "message": "plain body",
             "recipient": [PEER],
+            "dispatchId": "req-story-reply-4",
         })
     );
 }

@@ -33,6 +33,26 @@ fn watchdog_supervisor_with_throttle(
     temp: &TempDir,
     min_restart_interval: Duration,
 ) -> (Arc<RuntimeSupervisor>, PathBuf) {
+    build_watchdog_supervisor(temp, min_restart_interval, None)
+}
+
+/// A fixture whose retry pace equals the window it configures. The watchdog
+/// paces a deferred restart with `watchdog_liveness_backoff_base` (ten seconds
+/// in production); `watchdog_min_restart_interval` is only the anti-storm
+/// window that resets the episode. A test written around "the throttle window
+/// passes" must wire both, or its second restart lands ten seconds out.
+fn watchdog_supervisor_with_pacing(
+    temp: &TempDir,
+    min_restart_interval: Duration,
+) -> (Arc<RuntimeSupervisor>, PathBuf) {
+    build_watchdog_supervisor(temp, min_restart_interval, Some(min_restart_interval))
+}
+
+fn build_watchdog_supervisor(
+    temp: &TempDir,
+    min_restart_interval: Duration,
+    liveness_backoff_base: Option<Duration>,
+) -> (Arc<RuntimeSupervisor>, PathBuf) {
     let store = test_store(temp.path());
     let data_dir = temp.path().join("signal-data");
     let mut config = EngineConfig::new(fixture(), data_dir.clone());
@@ -40,6 +60,9 @@ fn watchdog_supervisor_with_throttle(
     config.shutdown_grace = Duration::from_millis(100);
     config.watchdog_interval = Duration::from_millis(50);
     config.watchdog_min_restart_interval = min_restart_interval;
+    if let Some(base) = liveness_backoff_base {
+        config.watchdog_liveness_backoff_base = base;
+    }
     let supervisor = Arc::new(RuntimeSupervisor::new(
         config,
         store,
@@ -286,12 +309,14 @@ async fn watchdog_leaves_a_healthy_engine_alone() {
 
 /// A restart request landing inside the throttle window must not be dropped:
 /// the fixture keeps reporting a dead receive WebSocket, so the second trigger
-/// becomes pending and fires as soon as the window passes (pid changes again).
+/// becomes pending and fires once the retry backoff passes (pid changes again).
+/// The fixture wires the backoff base to the same window, so "the window"
+/// paces the retry and the assertion stays seconds-scale.
 #[tokio::test]
 async fn throttled_stderr_restart_is_retried_after_the_throttle_window() {
     let temp = TempDir::new().unwrap();
     let (supervisor, data_dir) =
-        watchdog_supervisor_with_throttle(&temp, Duration::from_millis(1000));
+        watchdog_supervisor_with_pacing(&temp, Duration::from_millis(1000));
     std::fs::create_dir_all(&data_dir).unwrap();
     let marker = data_dir.join(".fixture-stderr-websocket-error");
     std::fs::write(&marker, "").unwrap();
@@ -343,14 +368,18 @@ async fn ping_pending_restart_is_cleared_when_pings_recover() {
     supervisor.shutdown().await.unwrap();
 }
 
-/// Continuous failure triggers are bounded: one initial restart plus at most
-/// three pending retries per episode, then the watchdog gives up and the
-/// engine pid stays put even though stderr keeps reporting a dead WebSocket.
+/// Continuous failure triggers are paced, never executed back to back: the
+/// first restart of an episode is immediate and every later one waits a
+/// doubling backoff (`watchdog_liveness_backoff_base`: 1x, 2x, 4x, 8x …), so
+/// the four restarts observed here land a full window, two, four and then
+/// eight windows apart. The next retry therefore sits far outside the
+/// observation below — the pid stays put even though stderr keeps reporting a
+/// dead WebSocket (the capped schedule retries forever; nothing "gives up").
 #[tokio::test]
 async fn continuous_failures_exhaust_the_episode_retry_budget() {
     let temp = TempDir::new().unwrap();
     let (supervisor, data_dir) =
-        watchdog_supervisor_with_throttle(&temp, Duration::from_millis(1500));
+        watchdog_supervisor_with_pacing(&temp, Duration::from_millis(1500));
     std::fs::create_dir_all(&data_dir).unwrap();
     let marker = data_dir.join(".fixture-stderr-websocket-error");
     std::fs::write(&marker, "").unwrap();
@@ -362,16 +391,16 @@ async fn continuous_failures_exhaust_the_episode_retry_budget() {
         last = wait_for_pid_change(&supervisor, last).await;
         pids.push(last);
     }
-    // initial + 3 pending retries = 4 restarts; the budget is now exhausted.
+    // initial + 3 deferred retries = 4 restarts; the next backoff is 8x.
     assert_eq!(pids.len(), 5);
 
-    // Beyond one full throttle window after the last restart: any further
-    // pending execution would show up as a pid change.
+    // Well inside the next (8x) backoff window after the last restart: a
+    // retry executing now would show up as a pid change.
     sleep(Duration::from_millis(2500)).await;
     assert_eq!(
         supervisor.status().await.pid,
         Some(last),
-        "episode retry budget must stop further restarts"
+        "the doubling backoff must keep the next retry outside the observation window"
     );
 
     std::fs::remove_file(&marker).unwrap();

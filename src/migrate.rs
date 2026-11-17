@@ -36,11 +36,21 @@
 //!
 //! `dry_run` performs every read/validation and emits the same plan without
 //! touching the filesystem, so operators can compare the report with the
-//! applied result.
+//! applied result. It never creates a journal, a slot, or a lock file, and it
+//! never rewrites a registry (contract revision 1.288, §4.274).
+//!
+//! The report is the operator's actionable checklist, not a log: the current
+//! layout (`legacy` / `pooled` / `mixed` / `empty`), the account count, how
+//! many engines the next pooled start will keep resident versus cold-start, the
+//! exit code the applied pass is expected to produce, and the next commands to
+//! run. `scan_engine_layout` is the same read-only observation the registry
+//! uses to fail closed on a mixed layout — it is exported so the refusal and
+//! the plan cannot drift apart.
 
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -86,13 +96,209 @@ pub struct MigrationEntry {
     pub account_id: String,
     pub proxy_group: String,
     pub action: String,
+    /// Terminal intent for the row, when the action name alone is ambiguous
+    /// (e.g. a quarantined slot that still lets the connector start). Additive:
+    /// older consumers ignore the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+/// How the signal data directory is laid out right now (contract revision
+/// 1.288, §4.274). `Mixed` is the only state the connector refuses to resolve
+/// on its own: both layouts hold credential stores, and picking one would be a
+/// guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EngineLayoutKind {
+    Empty,
+    Legacy,
+    Pooled,
+    Mixed,
+}
+
+/// One `engines/<accountId>/` directory the layout scan found.
+/// `registry_accounts` is the number the engine's own single-account guard
+/// compares against (`KT_ENGINE_SINGLE_ACCOUNT`, engine `main.rs`: the
+/// registry count, not the store count); `stores_present` is how many of those
+/// accounts still have their presage store on disk, which is what "this slot
+/// holds credentials" means for layout classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotLayout {
+    pub account_id: String,
+    pub registry_accounts: usize,
+    pub stores_present: usize,
+}
+
+/// The whole data directory's layout, read without touching it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EngineLayout {
+    pub legacy_accounts: usize,
+    pub slots: Vec<SlotLayout>,
+}
+
+impl EngineLayout {
+    pub fn pooled_accounts(&self) -> usize {
+        self.slots.iter().map(|slot| slot.stores_present).sum()
+    }
+
+    /// Both layouts hold credential stores: the migration cannot tell which
+    /// copy is authoritative, so this is an operator decision
+    /// (`migrate-pool`), never a startup guess.
+    pub fn is_mixed(&self) -> bool {
+        self.legacy_accounts > 0 && self.pooled_accounts() > 0
+    }
+
+    pub fn kind(&self) -> EngineLayoutKind {
+        if self.legacy_accounts > 0 && self.pooled_accounts() > 0 {
+            EngineLayoutKind::Mixed
+        } else if self.legacy_accounts > 0 {
+            EngineLayoutKind::Legacy
+        } else if !self.slots.is_empty() {
+            // A slot directory exists even if its store is gone (an interrupted
+            // provision or a damaged copy): the directory is on the pool
+            // layout, and the migration report is where the missing store
+            // shows up as `unprovisioned`.
+            EngineLayoutKind::Pooled
+        } else {
+            EngineLayoutKind::Empty
+        }
+    }
+
+    /// The first slot whose own engine registry names more than one account.
+    /// Under `KT_ENGINE_SINGLE_ACCOUNT=1` the engine refuses to start such a
+    /// process; the connector refuses to even reach the spawn.
+    pub fn multi_account_slot(&self) -> Option<&SlotLayout> {
+        self.slots.iter().find(|slot| slot.registry_accounts > 1)
+    }
+}
+
+/// Read the data directory's layout: which accounts still sit in the legacy
+/// proxy-group directories (store present), and what every per-account engine
+/// slot's own registry names. Read-only, bounded, and only plain account-id
+/// directory names are ever adopted.
+pub fn scan_engine_layout(signal_data_dir: &Path) -> Result<EngineLayout, StoreError> {
+    Ok(EngineLayout {
+        legacy_accounts: legacy_account_count(signal_data_dir)?,
+        slots: scan_slots(&signal_data_dir.join(ENGINE_SLOT_SUBDIR))?,
+    })
+}
+
+fn legacy_account_count(root: &Path) -> Result<usize, StoreError> {
+    let mut group_dirs = vec![root.to_path_buf()];
+    match fs::read_dir(root.join("proxy-groups")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(pool_invalid_io)?;
+                if !entry.file_type().map_err(pool_invalid_io)?.is_dir() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if is_valid_group_id(&name) {
+                    group_dirs.push(entry.path());
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(pool_invalid_io(error)),
+    }
+    let mut accounts = 0;
+    for dir in group_dirs {
+        let Some(state) = read_state_lenient(&dir.join(STATE_FILE))? else {
+            continue;
+        };
+        for entry in &state.accounts {
+            let Some(relative) = entry.dir.as_deref() else {
+                continue;
+            };
+            let Ok(store_name) = validated_store_component(relative) else {
+                continue;
+            };
+            if dir
+                .join(ACCOUNTS_DIR)
+                .join(store_name)
+                .join(STORE_DB_FILE)
+                .is_file()
+            {
+                accounts += 1;
+            }
+        }
+    }
+    Ok(accounts)
+}
+
+fn scan_slots(engines_root: &Path) -> Result<Vec<SlotLayout>, StoreError> {
+    let entries = match fs::read_dir(engines_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(pool_invalid_io(error)),
+    };
+    let mut slots = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(pool_invalid_io)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !is_account_id(&name) || !entry.file_type().map_err(pool_invalid_io)?.is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        let state = read_state_lenient(&dir.join(STATE_FILE))?;
+        let mut stores_present = 0;
+        if let Some(state) = state.as_ref() {
+            for entry in &state.accounts {
+                let Some(relative) = entry.dir.as_deref() else {
+                    continue;
+                };
+                let Ok(store_name) = validated_store_component(relative) else {
+                    continue;
+                };
+                if dir
+                    .join(ACCOUNTS_DIR)
+                    .join(store_name)
+                    .join(STORE_DB_FILE)
+                    .is_file()
+                {
+                    stores_present += 1;
+                }
+            }
+        }
+        // A directory that carries neither a registry nor an accounts tree is
+        // a rolled-back provision, not layout material; the pool's orphan
+        // sweep removes it.
+        if state.is_none() && !dir.join(ACCOUNTS_DIR).is_dir() {
+            continue;
+        }
+        slots.push(SlotLayout {
+            account_id: name,
+            registry_accounts: state
+                .as_ref()
+                .map(|state| state.accounts.len())
+                .unwrap_or_default(),
+            stores_present,
+        });
+    }
+    slots.sort_by(|left, right| left.account_id.cmp(&right.account_id));
+    Ok(slots)
 }
 
 /// The migration/dry-run report (log-safe: opaque ids and group names only).
+/// Since contract revision 1.288 (§4.274) it is also the operator's
+/// actionable plan: the layout, the account count, the next pooled boot's
+/// resident/cold split, the expected exit code, and the next commands.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationReport {
     pub dry_run: bool,
+    pub layout: EngineLayoutKind,
+    pub accounts: usize,
+    pub resident_cap: usize,
+    pub resident_on_start: usize,
+    pub cold_starts: usize,
+    pub expected_exit_code: i32,
+    pub blockers: Vec<String>,
+    pub next_steps: Vec<String>,
     pub entries: Vec<MigrationEntry>,
     pub migrated: usize,
     pub already_migrated: usize,
@@ -100,7 +306,134 @@ pub struct MigrationReport {
     pub orphans_removed: usize,
 }
 
-/// Run (or dry-run) the whole pass. Returns `EnginePoolInvalid` with a
+impl MigrationReport {
+    /// A dry-run plan that cannot be applied: nothing is migrated, the exit
+    /// code says so, and the blocker is the one message the pass produced.
+    /// Used by the CLI so a refuse-to-migrate state is still an actionable
+    /// report instead of a bare error line.
+    pub fn blocked(
+        layout: EngineLayoutKind,
+        accounts: usize,
+        resident_cap: usize,
+        blocker: String,
+    ) -> Self {
+        Self {
+            dry_run: true,
+            layout,
+            accounts,
+            resident_cap,
+            resident_on_start: 0,
+            cold_starts: 0,
+            expected_exit_code: 1,
+            blockers: vec![blocker],
+            next_steps: vec![
+                "resolve the blocker above, then re-run migrate-pool --dry-run".to_string(),
+            ],
+            entries: Vec::new(),
+            migrated: 0,
+            already_migrated: 0,
+            unprovisioned: 0,
+            orphans_removed: 0,
+        }
+    }
+
+    /// A dry-run plan refused because the store was stamped by a newer
+    /// connector (contract revision 1.284, §4.268, read at the dry-run face).
+    /// The applied pass refuses the same store at `Store::open`, so this plan
+    /// carries both of that refusal's texts verbatim — the classified message
+    /// and the fixed `KT_FATAL` launcher line — and stays blocked
+    /// (`expectedExitCode=1`, process exit 1). `accounts` is 0 because the
+    /// probe refuses before it reads a row: a count invented from a schema this
+    /// build does not know would be a guess.
+    ///
+    /// No step suggests dropping `--dry-run`: the applied pass cannot succeed
+    /// against this store either, so the only move is a newer connector. The
+    /// plan also states that the probe left no marker behind — that file is the
+    /// applied refusal's record, never the dry run's.
+    pub fn blocked_newer_schema(
+        layout: EngineLayoutKind,
+        resident_cap: usize,
+        current: i64,
+        supported: i64,
+    ) -> Self {
+        let refusal = crate::store::StoreError::SchemaNewer { current, supported };
+        let mut blockers = vec![refusal.to_string()];
+        if let Some(line) = crate::store::fatal_line_for(&refusal) {
+            blockers.push(line);
+        }
+        Self {
+            dry_run: true,
+            layout,
+            accounts: 0,
+            resident_cap,
+            resident_on_start: 0,
+            cold_starts: 0,
+            expected_exit_code: 1,
+            blockers,
+            next_steps: vec![
+                format!(
+                    "upgrade the connector to a build that knows schema {current} (this binary supports {supported}); the store is never downgraded"
+                ),
+                "the store was read only: no -shm/-wal, no snapshot, and no schema-newer marker were written"
+                    .to_string(),
+                "re-run this plan with the upgraded connector; the applied pass refuses this store for the same reason"
+                    .to_string(),
+            ],
+            entries: Vec::new(),
+            migrated: 0,
+            already_migrated: 0,
+            unprovisioned: 0,
+            orphans_removed: 0,
+        }
+    }
+
+    /// Fill the plan's derived numbers once every account has an outcome.
+    fn finish(&mut self) {
+        let provisioned = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.action.as_str(),
+                    "migrated" | "alreadyMigrated" | "wouldMigrate"
+                )
+            })
+            .count();
+        let cap = self.resident_cap.max(1);
+        self.resident_on_start = provisioned.min(cap);
+        self.cold_starts = provisioned.saturating_sub(cap);
+        let would_move = self
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.action.as_str(), "migrated" | "wouldMigrate"))
+            .count();
+        self.next_steps = next_steps(self.dry_run, would_move, self.unprovisioned);
+    }
+}
+
+fn next_steps(dry_run: bool, would_move: usize, unprovisioned: usize) -> Vec<String> {
+    let mut steps = Vec::new();
+    if would_move > 0 {
+        steps.push(
+            "back up the signal-data and state directories first: the move is one-way and rollback is a restore"
+                .to_string(),
+        );
+    }
+    if dry_run && would_move > 0 {
+        steps.push("stop every connector, then re-run this command without --dry-run".to_string());
+    }
+    if unprovisioned > 0 {
+        steps.push(format!(
+            "{unprovisioned} account row(s) have no engine data; they answer ENGINE_NOT_PROVISIONED until re-linked"
+        ));
+    }
+    steps.push("start the connector with --per-account-engines (full pooling)".to_string());
+    steps
+}
+
+/// Run (or dry-run) the whole pass. `resident_cap` is the launcher's pool
+/// resident window ([crate::pool::EnginePoolPolicy::max_resident]); it only
+/// shapes the plan's cold-start count. Returns `EnginePoolInvalid` with a
 /// log-safe description on any state that cannot be proven safe; the caller
 /// must abort startup in that case ("no half-migrated serve", requirement 3).
 pub fn run(
@@ -108,8 +441,30 @@ pub fn run(
     signal_data_dir: &Path,
     state_dir: &Path,
     dry_run: bool,
+    resident_cap: usize,
 ) -> Result<MigrationReport, StoreError> {
-    let rows = store.list_all_account_rows()?;
+    run_for_rows(
+        &store.list_all_account_rows()?,
+        signal_data_dir,
+        state_dir,
+        dry_run,
+        resident_cap,
+    )
+}
+
+/// The same pass over rows the caller already holds. `migrate-pool --dry-run`
+/// enters here: its rows come from the read-only store probe
+/// ([`crate::store::probe_account_rows`]), so a plan over a `--state-dir` that
+/// does not exist yet needs no writable store at all — no directory, no
+/// `connector.sqlite3`, no WAL (contract revision 1.288, §4.274).
+pub fn run_for_rows(
+    rows: &[AccountRow],
+    signal_data_dir: &Path,
+    state_dir: &Path,
+    dry_run: bool,
+    resident_cap: usize,
+) -> Result<MigrationReport, StoreError> {
+    let layout = scan_engine_layout(signal_data_dir)?;
     let engines_root = signal_data_dir.join(ENGINE_SLOT_SUBDIR);
     let mut journal = if dry_run {
         None
@@ -117,17 +472,25 @@ pub fn run(
         Some(Journal::open(signal_data_dir).map_err(pool_invalid_io)?)
     };
     if let Some(journal) = journal.as_mut() {
-        journal.record("run", None, None, if dry_run { "dryRun" } else { "start" });
+        journal.record("run", None, None, "start");
     }
     let mut report = MigrationReport {
         dry_run,
+        layout: layout.kind(),
+        accounts: rows.len(),
+        resident_cap,
+        resident_on_start: 0,
+        cold_starts: 0,
+        expected_exit_code: 0,
+        blockers: Vec::new(),
+        next_steps: Vec::new(),
         entries: Vec::new(),
         migrated: 0,
         already_migrated: 0,
         unprovisioned: 0,
         orphans_removed: 0,
     };
-    for row in &rows {
+    for row in rows {
         let entry = migrate_account(
             row,
             signal_data_dir,
@@ -144,7 +507,7 @@ pub fn run(
         }
         report.entries.push(entry);
     }
-    reconcile_orphans(&rows, &engines_root, dry_run, journal.as_mut(), &mut report)?;
+    reconcile_orphans(rows, &engines_root, dry_run, journal.as_mut(), &mut report)?;
     if let Some(journal) = journal.as_mut() {
         journal.record(
             "done",
@@ -159,6 +522,7 @@ pub fn run(
             ),
         );
     }
+    report.finish();
     Ok(report)
 }
 
@@ -203,8 +567,20 @@ fn migrate_account(
     });
 
     if target_complete {
+        // Two live copies of one account's credentials: the target is complete
+        // and the legacy side still has its own store. Choosing the target
+        // would silently strand a readable credential copy, so this is an
+        // operator decision, never a startup guess (contract revision 1.288,
+        // §4.274 — the same ambiguity the registry refuses on a mixed layout).
+        if legacy_store_present(&legacy_dir, &legacy_entry) {
+            return Err(pool_invalid(format!(
+                "account {} has two copies of its store (legacy and engine slot); refusing to choose one",
+                row.id
+            )));
+        }
         // Crash window (c) / a previous run: the target is authoritative.
-        // Repair a source registry that still lists the moved account.
+        // Repair a source registry that still lists the moved account (the
+        // store itself is gone, so only metadata converges).
         if legacy_entry.is_some() {
             journal_record(
                 &mut journal,
@@ -232,6 +608,7 @@ fn migrate_account(
             account_id: row.id.clone(),
             proxy_group: row.proxy_group.clone(),
             action: "alreadyMigrated".to_string(),
+            outcome: None,
         });
     }
 
@@ -290,6 +667,7 @@ fn migrate_account(
             account_id: row.id.clone(),
             proxy_group: row.proxy_group.clone(),
             action: "unprovisioned".to_string(),
+            outcome: None,
         });
     };
     let Some(relative) = entry.dir.as_deref() else {
@@ -328,6 +706,7 @@ fn migrate_account(
             account_id: row.id.clone(),
             proxy_group: row.proxy_group.clone(),
             action: "wouldMigrate".to_string(),
+            outcome: None,
         });
     }
 
@@ -412,6 +791,7 @@ fn migrate_account(
         account_id: row.id.clone(),
         proxy_group: row.proxy_group.clone(),
         action: "migrated".to_string(),
+        outcome: None,
     })
 }
 
@@ -453,16 +833,53 @@ fn reconcile_orphans(
             .map_err(pool_invalid_io)?
             .is_some();
         if has_accounts || has_store {
-            return Err(pool_invalid(format!(
-                "engine slot {} has credentials but no account row; refusing to start",
-                name
-            )));
+            // 无账号行的槽不可服务；隔离而不是拒绝启动：留下字节可审计，
+            // 但不让它挡住整个连接器（放弃的 link 尝试会留下这种槽）。
+            if !dry_run {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let target = engines_root.join(format!(".quarantine-{name}-{stamp}"));
+                if let Err(error) = fs::rename(&path, &target) {
+                    return Err(pool_invalid_io(error));
+                }
+                report.entries.push(MigrationEntry {
+                    account_id: name.clone(),
+                    proxy_group: String::new(),
+                    action: "quarantine".to_string(),
+                    outcome: Some("quarantined".to_string()),
+                });
+                tracing::warn!(
+                    target: "connector.pool",
+                    // The invariant witness: a slot that holds credentials
+                    // while the store has no row for its id is a leaked
+                    // link-attempt slot. The quarantine below is the startup
+                    // backstop; the live reclaim path runs the same invariant
+                    // name through `AccountPool::reclaim_link_attempt`.
+                    invariant = crate::pool::LINK_SLOT_LEAK_INVARIANT,
+                    stage = "orphan_slot_quarantined",
+                    slot = %name,
+                    has_accounts,
+                    has_store,
+                    "engine slot has credentials but no account row; quarantined"
+                );
+                continue;
+            }
+            report.entries.push(MigrationEntry {
+                account_id: name,
+                proxy_group: String::new(),
+                action: "quarantine".to_string(),
+                outcome: Some("would-continue".to_string()),
+            });
+            continue;
         }
         if dry_run {
             report.entries.push(MigrationEntry {
                 account_id: name,
                 proxy_group: String::new(),
                 action: "wouldRemoveOrphan".to_string(),
+                outcome: None,
             });
             continue;
         }
@@ -473,6 +890,7 @@ fn reconcile_orphans(
             account_id: name,
             proxy_group: String::new(),
             action: "removedOrphan".to_string(),
+            outcome: None,
         });
     }
     Ok(())
@@ -687,7 +1105,11 @@ impl Journal {
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis())
             .unwrap_or_default();
-        let path = dir.join(format!("{stamp}-{}.jsonl", std::process::id()));
+        // 同一毫秒内两次 run() 会撞名：create_new 直接失败。序号与 pid 一起
+        // 保证唯一（journal 是追加审计面，文件名只承载唯一性）。
+        static JOURNAL_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = JOURNAL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{stamp}-{}-{seq}.jsonl", std::process::id()));
         let file = fs::OpenOptions::new()
             .create_new(true)
             .append(true)
@@ -816,7 +1238,7 @@ mod tests {
             "lk-two",
         );
 
-        let dry = run(&store, &root, &state_dir, true).unwrap();
+        let dry = run(&store, &root, &state_dir, true, 8).unwrap();
         assert_eq!(dry.migrated, 0);
         assert_eq!(dry.already_migrated, 0);
         assert_eq!(dry.entries.len(), 2);
@@ -837,7 +1259,7 @@ mod tests {
             "a dry run must not move stores"
         );
 
-        let applied = run(&store, &root, &state_dir, false).unwrap();
+        let applied = run(&store, &root, &state_dir, false, 8).unwrap();
         assert_eq!(applied.migrated, 2);
         assert_eq!(applied.already_migrated, 0);
         let actions: Vec<&str> = applied
@@ -880,7 +1302,7 @@ mod tests {
         }
 
         // Re-running is idempotent and reports the complete targets.
-        let again = run(&store, &root, &state_dir, false).unwrap();
+        let again = run(&store, &root, &state_dir, false, 8).unwrap();
         assert_eq!(again.migrated, 0);
         assert_eq!(again.already_migrated, 2);
 
@@ -938,7 +1360,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = run(&store, &root, &state_dir, false).unwrap();
+        let report = run(&store, &root, &state_dir, false, 8).unwrap();
         assert_eq!(report.migrated, 1);
         assert!(
             slot.join(ACCOUNTS_DIR)
@@ -976,7 +1398,7 @@ mod tests {
         fs::create_dir_all(&copied).unwrap();
         fs::write(copied.join(STORE_DB_FILE), b"copied").unwrap();
 
-        let error = run(&store, &root, &state_dir, false).unwrap_err();
+        let error = run(&store, &root, &state_dir, false, 8).unwrap_err();
         assert!(
             matches!(error, StoreError::EnginePoolInvalid(_)),
             "{error:?}"
@@ -1007,7 +1429,7 @@ mod tests {
             )
             .unwrap();
 
-        let report = run(&store, &root, &state_dir, false).expect("orphan row is not fatal");
+        let report = run(&store, &root, &state_dir, false, 8).expect("orphan row is not fatal");
         assert_eq!(report.unprovisioned, 1);
         assert_eq!(report.migrated, 0);
         assert!(!root.join(ENGINE_SLOT_SUBDIR).join(id).exists());
@@ -1029,7 +1451,7 @@ mod tests {
             )
             .unwrap();
         fs::write(root.join(STATE_FILE), b"{not json").unwrap();
-        let error = run(&store, &root, &state_dir, false).unwrap_err();
+        let error = run(&store, &root, &state_dir, false, 8).unwrap_err();
         assert!(
             matches!(error, StoreError::EnginePoolInvalid(_)),
             "{error:?}"
@@ -1038,9 +1460,62 @@ mod tests {
 
     /// Empty engine directories are rolled-back link leftovers and are
     /// removed; a directory that still carries credentials with no account
-    /// row aborts startup.
+    /// row is a leaked link-attempt slot and is quarantined (bytes stay
+    /// auditable, never a live slot) instead of blocking startup.
     #[test]
-    fn removes_empty_orphans_and_refuses_orphan_credentials() {
+    fn dry_run_reports_the_same_quarantine_it_would_apply() {
+        // 双向诚实（11-11 dry-run 谎报案立的规矩）：apply 会隔离后继续，
+        // dry-run 必须报同一件事，不能用 Err 把人吓退。
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("signal-data");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&root).unwrap();
+        let store = test_store(&state_dir);
+        let orphan = root.join(ENGINE_SLOT_SUBDIR).join(account_id(8));
+        fs::create_dir_all(orphan.join(ACCOUNTS_DIR).join("lk-eight")).unwrap();
+        fs::write(
+            orphan
+                .join(ACCOUNTS_DIR)
+                .join("lk-eight")
+                .join(STORE_DB_FILE),
+            b"credentials",
+        )
+        .unwrap();
+        fs::write(
+            orphan.join(STATE_FILE),
+            serde_json::to_vec_pretty(&json!({
+                "version": 2,
+                "accounts": [{"number": "+15550000008", "dir": "accounts/lk-eight"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = run(&store, &root, &state_dir, true, 8)
+            .expect("a dry run must not turn a recoverable quarantine into an error");
+        let entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.account_id == account_id(8))
+            .expect("the leaked slot appears in the dry-run plan");
+        assert_eq!(entry.action, "quarantine");
+        assert_eq!(entry.outcome.as_deref(), Some("would-continue"));
+        assert!(orphan.exists(), "a dry run never moves bytes");
+
+        let applied =
+            run(&store, &root, &state_dir, false, 8).expect("apply quarantines and continues");
+        let applied_entry = applied
+            .entries
+            .iter()
+            .find(|entry| entry.account_id == account_id(8))
+            .expect("apply reports the quarantine too");
+        assert_eq!(applied_entry.action, "quarantine");
+        assert_eq!(applied_entry.outcome.as_deref(), Some("quarantined"));
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn removes_empty_orphans_and_quarantines_orphan_credentials() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("signal-data");
         let state_dir = temp.path().join("state");
@@ -1048,7 +1523,7 @@ mod tests {
         let store = test_store(&state_dir);
         let empty = root.join(ENGINE_SLOT_SUBDIR).join(account_id(6));
         fs::create_dir_all(&empty).unwrap();
-        let report = run(&store, &root, &state_dir, false).unwrap();
+        let report = run(&store, &root, &state_dir, false, 8).unwrap();
         assert_eq!(report.orphans_removed, 1);
         assert!(!empty.exists());
 
@@ -1071,14 +1546,212 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let error = run(&store, &root, &state_dir, false).unwrap_err();
-        assert!(
-            matches!(error, StoreError::EnginePoolInvalid(_)),
-            "{error:?}"
+        let report =
+            run(&store, &root, &state_dir, false, 8).expect("a leaked slot is quarantined");
+        assert_eq!(
+            report.orphans_removed, 0,
+            "the second pass removes no empty orphan; the credential slot is quarantined"
         );
         assert!(
-            orphan.join(STATE_FILE).is_file(),
-            "credentials stay untouched"
+            !orphan.exists(),
+            "the credential-bearing slot must leave the live namespace"
         );
+        let quarantine: Vec<_> = fs::read_dir(root.join(ENGINE_SLOT_SUBDIR))
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(".quarantine-{}", account_id(7)))
+            })
+            .collect();
+        assert_eq!(quarantine.len(), 1, "exactly one quarantine entry");
+        assert!(
+            quarantine[0].path().join(STATE_FILE).is_file(),
+            "credentials stay auditable in the quarantine"
+        );
+    }
+
+    /// P1 runtime isolation (§4.274): the layout scan is the single read-only
+    /// observation behind both the startup refusal and the CLI plan.
+    #[test]
+    fn layout_scan_names_legacy_pooled_and_mixed_states() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("signal-data");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&root).unwrap();
+        let store = test_store(&state_dir);
+        assert_eq!(
+            scan_engine_layout(&root).unwrap().kind(),
+            EngineLayoutKind::Empty
+        );
+
+        seed_legacy(
+            &root,
+            &store,
+            DEFAULT_PROXY_GROUP_ID,
+            &account_id(1),
+            "+15550000021",
+            "lk-one",
+        );
+        let legacy = scan_engine_layout(&root).unwrap();
+        assert_eq!(legacy.legacy_accounts, 1);
+        assert_eq!(legacy.pooled_accounts(), 0);
+        assert_eq!(legacy.kind(), EngineLayoutKind::Legacy);
+        assert!(!legacy.is_mixed());
+
+        // A second account already lives in its own engine slot: both layouts
+        // hold credentials, which is the state the connector refuses to guess.
+        let id = account_id(2);
+        store
+            .upsert_account_from_signal_with_id(
+                "+15550000022",
+                Some(1),
+                DEFAULT_PROXY_GROUP_ID,
+                Some(&id),
+            )
+            .unwrap();
+        let slot = root.join(ENGINE_SLOT_SUBDIR).join(&id);
+        fs::create_dir_all(slot.join(ACCOUNTS_DIR).join("lk-two")).unwrap();
+        fs::write(
+            slot.join(ACCOUNTS_DIR).join("lk-two").join(STORE_DB_FILE),
+            b"pooled",
+        )
+        .unwrap();
+        fs::write(
+            slot.join(STATE_FILE),
+            serde_json::to_vec(&json!({
+                "version": 2,
+                "accounts": [{"number": "+15550000022", "dir": "accounts/lk-two"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mixed = scan_engine_layout(&root).unwrap();
+        assert_eq!(mixed.kind(), EngineLayoutKind::Mixed);
+        // The pool-only state is its own layout, credentials or not.
+        let pool_only_root = temp.path().join("pool-only");
+        let pool_only_slot = pool_only_root.join(ENGINE_SLOT_SUBDIR).join(&id);
+        fs::create_dir_all(&pool_only_slot).unwrap();
+        fs::write(
+            pool_only_slot.join(STATE_FILE),
+            serde_json::to_vec(&json!({"version": 2, "accounts": []})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan_engine_layout(&pool_only_root).unwrap().kind(),
+            EngineLayoutKind::Pooled
+        );
+        assert_eq!(mixed.pooled_accounts(), 1);
+        assert!(mixed.multi_account_slot().is_none());
+
+        // The guard reads the registry count, not the store count: a slot that
+        // names a second account without a store is still a violation.
+        fs::write(
+            slot.join(STATE_FILE),
+            serde_json::to_vec(&json!({
+                "version": 2,
+                "accounts": [
+                    {"number": "+15550000022", "dir": "accounts/lk-two"},
+                    {"number": "+15550000023", "dir": "accounts/lk-three"},
+                ],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let violation = scan_engine_layout(&root).unwrap();
+        assert_eq!(
+            violation
+                .multi_account_slot()
+                .map(|slot| slot.registry_accounts),
+            Some(2)
+        );
+    }
+
+    /// P1 runtime isolation (§4.274): the dry-run report is the operator's
+    /// checklist — layout, account count, the resident/cold split of the next
+    /// pooled boot, the expected exit code, and the next commands — and it is
+    /// produced without writing a byte under the signal data directory.
+    #[test]
+    fn the_dry_run_plan_carries_the_counts_the_next_boot_will_see() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("signal-data");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&root).unwrap();
+        let store = test_store(&state_dir);
+        for index in 1..=3u8 {
+            seed_legacy(
+                &root,
+                &store,
+                DEFAULT_PROXY_GROUP_ID,
+                &account_id(index),
+                &format!("+155500001{index:02}"),
+                &format!("lk-plan-{index}"),
+            );
+        }
+        let before = tree_snapshot(&root);
+
+        let dry = run(&store, &root, &state_dir, true, 2).unwrap();
+        assert_eq!(dry.layout, EngineLayoutKind::Legacy);
+        assert_eq!(dry.accounts, 3);
+        assert_eq!(dry.entries.len(), 3);
+        assert_eq!(dry.resident_cap, 2);
+        assert_eq!(dry.resident_on_start, 2);
+        assert_eq!(dry.cold_starts, 1);
+        assert_eq!(dry.expected_exit_code, 0);
+        assert!(dry.blockers.is_empty());
+        assert!(
+            dry.next_steps
+                .iter()
+                .any(|step| step.contains("without --dry-run")),
+            "{:?}",
+            dry.next_steps
+        );
+        assert!(
+            dry.next_steps
+                .iter()
+                .any(|step| step.contains("--per-account-engines")),
+            "{:?}",
+            dry.next_steps
+        );
+        assert_eq!(tree_snapshot(&root), before, "a dry run writes nothing");
+        assert!(
+            !root.join(MIGRATION_DIR).exists(),
+            "no journal for a dry run"
+        );
+
+        let applied = run(&store, &root, &state_dir, false, 2).unwrap();
+        assert_eq!(applied.layout, EngineLayoutKind::Legacy);
+        assert_eq!(applied.migrated, 3);
+        assert_eq!(applied.resident_on_start, 2);
+        assert_eq!(applied.cold_starts, 1);
+        assert_eq!(applied.expected_exit_code, 0);
+    }
+
+    /// Every byte the connector could create in the signal data directory:
+    /// a dry run must leave this list identical.
+    fn tree_snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+        let mut entries = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    entries.push((relative, None));
+                    stack.push(path);
+                } else {
+                    entries.push((relative, Some(fs::read(&path).unwrap())));
+                }
+            }
+        }
+        entries.sort();
+        entries
     }
 }

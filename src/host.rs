@@ -29,9 +29,10 @@ use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
     AccountDeleteLocalDataParams, AccountsDeviceCapabilitiesParams, AccountsGetDevicesParams,
-    AccountsGetUsernameParams, AccountsSetExpireTimerParams, AccountsSetProfileParams,
-    AccountsSetUsernameParams, AccountsUnlinkDeviceParams, AccountsUpdateConfigurationParams,
-    BackupsCloudStatusParams, BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
+    AccountsGetSyncStateParams, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
+    AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUnlinkDeviceParams,
+    AccountsUpdateConfigurationParams, BackupsCloudStatusParams,
+    BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
     BackupsExportFileReadChunkParams, BackupsExportParams, BackupsExportPlaintextParams,
     BackupsExportStatusParams, BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams,
     BackupsRestoreFromCloudParams, BackupsUploadStatusParams, BackupsUploadToCloudParams,
@@ -43,32 +44,33 @@ use crate::service::{
     ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
     ConversationsGetStateParams, ConversationsListParams, ConversationsReportSpamParams,
     ConversationsSaveDraftParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetPinnedParams, ConversationsSetStateParams, GroupsApproveJoinRequestsParams,
-    GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams, GroupsCommonParams,
-    GroupsCreateParams, GroupsGetParams, GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams,
-    GroupsMigrateParams, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
-    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadParams, HistoryImportCancelParams, HistoryImportRetryParams,
-    HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
-    LinkSessionParams, LinkStartParams, MessageGetByClientRequestIdParams,
-    MessageGetReceiptsParams, MessageGetTextParams, MessageRequestParams,
-    MessagesAdjacentMediaParams, MessagesAroundParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams,
-    MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams, MessagesEditParams,
-    MessagesListAttachmentDimensionsParams, MessagesListParams, MessagesMarkReadParams,
-    MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams, MessagesRemoteDeleteParams,
-    MessagesReportSpamParams, MessagesRetryTextParams, MessagesSearchParams,
-    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendContactParams,
-    MessagesSendPinMessageParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
-    MessagesSendPollVoteParams, MessagesSendReactionParams, MessagesSendStickerParams,
-    MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
-    MessagesSendViewOnceOpenParams, MessagesSetAttachmentDimensionsParams, MessagesSyncReadParams,
-    MessagesSyncViewedParams, NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
-    PhoneLookupParams, PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams,
-    StickerPackImageParams, StickerPackManifestParams, StickerPackSetSyncParams,
-    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams,
-    StoriesDeleteForEveryoneParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
-    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListsListParams,
+    ConversationsSetPinnedParams, ConversationsSetStateParams, EventsListParams,
+    GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams,
+    GroupsCommonParams, GroupsCreateParams, GroupsGetParams, GroupsInviteLinkPasswordParams,
+    GroupsJoinViaLinkParams, GroupsMigrateParams, GroupsParseInviteLinkParams,
+    GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
+    GroupsUpdateParams, HistoryAttachmentDownloadParams, HistoryImportCancelParams,
+    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams,
+    IdentitiesVerifyParams, LinkRotateParams, LinkSessionParams, LinkStartParams,
+    MessageGetByClientRequestIdParams, MessageGetReceiptsParams, MessageGetTextParams,
+    MessageRequestParams, MessagesAdjacentMediaParams, MessagesAroundParams,
+    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    MessagesAttachmentsReadChunkParams, MessagesDeleteForMeMessagesParams,
+    MessagesDeleteForMeParams, MessagesEditParams, MessagesListAttachmentDimensionsParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
+    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
+    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
+    MessagesSendAttachmentParams, MessagesSendContactParams, MessagesSendPinMessageParams,
+    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
+    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendStoryParams,
+    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    MessagesSetAttachmentDimensionsParams, MessagesSyncReadParams, MessagesSyncViewedParams,
+    NotificationProfilesListParams, NotificationProfilesSetRecordsParams, PhoneLookupParams,
+    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
+    StickerPackManifestParams, StickerPackSetSyncParams, StorageGetCallLinksParams,
+    StorageIngestParams, StorageSetCallLinkParams, StoriesDeleteForEveryoneParams,
+    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
+    StoriesSetDisabledParams, StoryDistributionListsListParams,
     StoryDistributionListsSetRecordsParams, UsernameLookupParams,
 };
 use crate::store::{MAX_ADJACENT_MEDIA_LIMIT, MAX_PAGE_LIMIT};
@@ -112,6 +114,8 @@ const CONTROL_CONCURRENCY: usize = 1;
 const LINK_WAIT_CONCURRENCY: usize = 1;
 const READ_CONCURRENCY: usize = 4;
 const SEND_CONCURRENCY: usize = 2;
+/// BUG-15（续）：媒体车道并发 1（与 per-account 媒体互斥同义）。
+const MEDIA_CONCURRENCY: usize = 1;
 
 /// 全局兜底 = 每账号容量 × 典型账号数（ADR 0005）。它只防资源失控
 /// （N 个账号同时打满各自 lane 时给进程一个硬上界），不参与公平性：
@@ -122,6 +126,7 @@ const TYPICAL_ACCOUNT_COUNT: usize = 4;
 const GLOBAL_CONTROL_CONCURRENCY: usize = CONTROL_CONCURRENCY * TYPICAL_ACCOUNT_COUNT;
 const GLOBAL_READ_CONCURRENCY: usize = READ_CONCURRENCY * TYPICAL_ACCOUNT_COUNT;
 const GLOBAL_SEND_CONCURRENCY: usize = SEND_CONCURRENCY * TYPICAL_ACCOUNT_COUNT;
+const GLOBAL_MEDIA_CONCURRENCY: usize = MEDIA_CONCURRENCY * TYPICAL_ACCOUNT_COUNT;
 /// Forensic floor and answer deadline for an admitted host dispatch
 /// (§4.166 forensic line, §4.168 bounded answer): every bounded dispatch
 /// budget has run out long before this — engine calls are timeout-capped at
@@ -241,6 +246,9 @@ struct HostDispatchPermit {
     /// 相互独立。
     _link_lane: Option<OwnedSemaphorePermit>,
     _account: Option<OwnedMutexGuard<()>>,
+    /// BUG-15：附件下载/删除屏障用的 per-account 媒体互斥（与 send
+    /// 互斥分离，下载不再阻塞发送）。
+    _media_account: Option<OwnedMutexGuard<()>>,
     _deleting: Option<DeletingAccountGuard>,
 }
 
@@ -274,11 +282,18 @@ struct HostDispatchLimits {
     global_control: Arc<Semaphore>,
     global_read: Arc<Semaphore>,
     global_send: Arc<Semaphore>,
+    /// BUG-15（续）：媒体车道全局兜底。
+    global_media: Arc<Semaphore>,
     /// per-account lane：账号 + lane → 信号量。Weak-handle 纪律与
     /// `send_accounts` / `link_lanes` 相同：permit 自身持有 Arc，最后
     /// 一个 permit 释放后条目在下次 acquire 时回收。
     account_lanes: Mutex<HashMap<AccountLaneKey, Weak<Semaphore>>>,
     send_accounts: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    /// BUG-15：媒体传输（attachments.download）独占的 per-account 互斥。
+    /// 下载动辄数秒，若与发送共用 send_accounts，会把同账号的 sendText /
+    /// syncRead / markRead 全部串行堵在后面（真机实测 4.2–9.3 秒发送延迟，
+    /// 证据见 send_latency_probe wait_ms）。删除仍要同时 drain 这两把锁。
+    media_accounts: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     /// One bounded lane per proxy group for `link.finish` (ADR 0001 R3).
     /// Same weak-handle discipline as `send_accounts`.
     link_lanes: Mutex<HashMap<String, Weak<Semaphore>>>,
@@ -338,6 +353,7 @@ const fn lane_capacity(lane: methods::Lane) -> usize {
         methods::Lane::Control => CONTROL_CONCURRENCY,
         methods::Lane::Read => READ_CONCURRENCY,
         methods::Lane::Send => SEND_CONCURRENCY,
+        methods::Lane::Media => MEDIA_CONCURRENCY,
     }
 }
 
@@ -362,8 +378,10 @@ impl HostDispatchLimits {
             global_control: Arc::new(Semaphore::new(GLOBAL_CONTROL_CONCURRENCY)),
             global_read: Arc::new(Semaphore::new(GLOBAL_READ_CONCURRENCY)),
             global_send: Arc::new(Semaphore::new(GLOBAL_SEND_CONCURRENCY)),
+            global_media: Arc::new(Semaphore::new(GLOBAL_MEDIA_CONCURRENCY)),
             account_lanes: Mutex::new(HashMap::new()),
             send_accounts: Mutex::new(HashMap::new()),
+            media_accounts: Mutex::new(HashMap::new()),
             link_lanes: Mutex::new(HashMap::new()),
             deleting_accounts: Arc::new(StdMutex::new(HashMap::new())),
         }
@@ -376,6 +394,7 @@ impl HostDispatchLimits {
             methods::Lane::Control => self.global_control.clone(),
             methods::Lane::Read => self.global_read.clone(),
             methods::Lane::Send => self.global_send.clone(),
+            methods::Lane::Media => self.global_media.clone(),
         }
     }
 
@@ -395,6 +414,22 @@ impl HostDispatchLimits {
             let lane = Arc::new(Semaphore::new(lane_capacity(kind)));
             lanes.insert(key, Arc::downgrade(&lane));
             lane
+        }
+    }
+
+    /// BUG-15：取 per-account 互斥（Weak 表，permit 自持 Arc）。
+    async fn account_mutex(
+        map: &Mutex<HashMap<String, Weak<Mutex<()>>>>,
+        key: String,
+    ) -> Arc<Mutex<()>> {
+        let mut accounts = map.lock().await;
+        accounts.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = accounts.get(&key).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            accounts.insert(key, Arc::downgrade(&lock));
+            lock
         }
     }
 
@@ -453,21 +488,29 @@ impl HostDispatchLimits {
                 }
                 None
             };
-            let account_lock = {
-                let mut accounts = self.send_accounts.lock().await;
-                accounts.retain(|_, lock| lock.strong_count() > 0);
-                if let Some(lock) = accounts.get(&account_key).and_then(Weak::upgrade) {
-                    lock
-                } else {
-                    let lock = Arc::new(Mutex::new(()));
-                    accounts.insert(account_key, Arc::downgrade(&lock));
-                    lock
-                }
+            // BUG-15：附件下载走独立媒体锁——它常达秒级，不能把同账号的
+            // 发送/已读写全部堵在 send_accounts 后面（真机实测 4.2–9.3 秒）。
+            // 删除仍按「send 锁 → 媒体锁」顺序同时 drain 两把：下载与删除
+            // 绝不并发，发送不必等下载。
+            let is_media_download =
+                method == "attachments.download" || method == "history.attachmentDownload";
+            let primary_map = if is_media_download {
+                &self.media_accounts
+            } else {
+                &self.send_accounts
             };
-            // 顺序固定：账号锁 → per-account lane → 全局兜底。先账号后
-            // 配额的旧理由仍然成立：一个忙账号不能一边攥着 permit 一边
-            // 等自己的账号锁。
+            let account_lock = Self::account_mutex(primary_map, account_key.clone()).await;
+            // 顺序固定：账号锁 → 媒体锁（仅删除）→ per-account lane → 全局兜底。
+            // 先账号后配额的旧理由仍然成立：一个忙账号不能一边攥着 permit
+            // 一边等自己的账号锁。
             let account = account_lock.lock_owned().await;
+            let media = if method == "accounts.deleteLocalData" {
+                let media_lock =
+                    Self::account_mutex(&self.media_accounts, account_key.clone()).await;
+                Some(media_lock.lock_owned().await)
+            } else {
+                None
+            };
             let kind = methods::lane(method);
             let account_lane = acquire_lane(
                 self.account_lane(account_id, kind).await,
@@ -484,6 +527,7 @@ impl HostDispatchLimits {
                 _global_lane: Some(global_lane),
                 _link_lane: None,
                 _account: Some(account),
+                _media_account: media,
                 _deleting: deleting,
             });
         }
@@ -528,6 +572,7 @@ impl HostDispatchLimits {
                 _global_lane: None,
                 _link_lane: Some(permit),
                 _account: None,
+                _media_account: None,
                 _deleting: None,
             });
         }
@@ -548,6 +593,7 @@ impl HostDispatchLimits {
             _global_lane: Some(global_lane),
             _link_lane: None,
             _account: None,
+            _media_account: None,
             _deleting: None,
         })
     }
@@ -1310,6 +1356,15 @@ fn spawn_metrics_log(runtime: std::sync::Weak<ProxyGroupRuntime>) {
             ticker.tick().await;
             metrics::log_snapshot();
             if let Some(runtime) = runtime.upgrade() {
+                // Contract revision 1.282 (§4.266): the store's own health —
+                // schema version, gate verdict, file sizes, snapshot outcome —
+                // rides the same periodic line, so an upgrade that rolled back
+                // is visible in logs without a doctor call.
+                metrics::log_store_health(&runtime.store().health());
+                // Contract revision 1.283 (§4.267): the ledger's own series —
+                // a floor that stopped advancing, or a ledger pinned at its
+                // byte ceiling, has to be visible without a doctor call.
+                metrics::log_event_log_health(&runtime.store().event_log_health());
                 let status = runtime.status().await;
                 let samples: Vec<_> = status
                     .proxy_groups
@@ -1317,6 +1372,11 @@ fn spawn_metrics_log(runtime: std::sync::Weak<ProxyGroupRuntime>) {
                     .map(|group| (group.group_id, group.rss_bytes))
                     .collect();
                 metrics::log_engine_rss(&samples);
+                // O1: the handshake face beside the RSS sample — per engine
+                // slot: the engine's own version, the contract revision it
+                // states, and the connector's verdict.
+                let contracts = runtime.engine_contract_samples().await;
+                metrics::log_engine_contract(&contracts);
             }
         }
     });
@@ -1523,7 +1583,26 @@ async fn dispatch_within_stall_budget(
 }
 
 async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> HostResponse {
-    let request_id = request.request_id;
+    let request_id = request.request_id.clone();
+    // Single terminal-account gate for every send-family mutating method.
+    // The MRM group-send path uses a cached sender key and never calls
+    // new_message_sender, so per-method auth checks miss it; this choke point
+    // is authoritative for all current and future account-scoped mutations.
+    // deleteLocalData is deliberately exempt: unlinking must remain deletable.
+    if methods::is_account_scoped_mutating(&request.method)
+        && request.method != "accounts.deleteLocalData"
+        && let Some(account_id) = request_account_id(&request)
+        && let Ok(Some("device_unlinked")) = runtime.account_state(&account_id).await
+    {
+        return HostResponse::failure(
+            request_id,
+            ApiError::new(
+                "ACCOUNT_UNLINKED",
+                "device was unlinked by the account holder",
+                false,
+            ),
+        );
+    }
     match request.method.as_str() {
         "runtime.status" if empty_params(&request.params) => HostResponse::success(
             request_id,
@@ -1542,6 +1621,38 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                 serde_json::to_value(status).unwrap_or(Value::Null),
             ),
             Err(failure) => HostResponse::failure(request_id, map_stop_failure(failure)),
+        },
+        // D4 所有权执行面(阶段1 批1-5c):Main 所有权表裁决的 connector 执行
+        // 臂。槽级操作——孤儿槽不走账号行解析(那会恰好拒掉清理对象);幂等,
+        // `already-settled` 是合法答案不是错误。隔离移 `.quarantine-*`(字节
+        // 保留可审计);休眠停引擎留目录(冷槽,下次请求自动唤醒)。
+        "ownership.quarantineSlot" => match ownership_slot_params(&request.params) {
+            Ok((account_id, reason)) => {
+                let removed = runtime
+                    .ownership_quarantine_slot(&account_id, &reason)
+                    .await;
+                HostResponse::success(
+                    request_id,
+                    serde_json::json!({
+                        "accountId": account_id,
+                        "outcome": if removed { "quarantined" } else { "already-settled" },
+                    }),
+                )
+            }
+            Err(probe) => HostResponse::failure(request_id, probe),
+        },
+        "ownership.hibernateSlot" => match ownership_slot_params(&request.params) {
+            Ok((account_id, _reason)) => {
+                let removed = runtime.ownership_hibernate_slot(&account_id).await;
+                HostResponse::success(
+                    request_id,
+                    serde_json::json!({
+                        "accountId": account_id,
+                        "outcome": if removed { "hibernated" } else { "already-settled" },
+                    }),
+                )
+            }
+            Err(probe) => HostResponse::failure(request_id, probe),
         },
         "runtime.status" | "runtime.start" | "runtime.stop" => HostResponse::failure(
             request_id,
@@ -1567,6 +1678,25 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                 "this method requires empty params",
             ),
         ),
+        // events.list (contract 1.283, §4.267): the durable change ledger's
+        // read face. The caller presents {afterSeq?, token?, limit?} and gets
+        // back one token-stamped page plus the reset verdict; a reset carries
+        // no events and points at the floor. Params are a strict struct, so an
+        // unknown key, a negative cursor or an out-of-range limit fails closed
+        // here instead of being silently dropped.
+        "events.list" => match serde_json::from_value::<EventsListParams>(request.params) {
+            Ok(params) => match runtime.events_page(params).await {
+                Ok(page) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(page).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                reject_probe("events.list", "params", "invalid events.list params"),
+            ),
+        },
         "accounts.list" if empty_params(&request.params) => match runtime.list_accounts().await {
             Ok(accounts) => HostResponse::success(
                 request_id,
@@ -1706,6 +1836,31 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                 ),
             }
         }
+        // accounts.getSyncState (contract revision 1.286, §4.281): the
+        // login-window sync projection's read face — a pure pass-through of
+        // the engine's {contacts, storage, profile, sinceMs} behind the shape
+        // gate, answering the desktop gate's polling fallback (SIGNAL-STAGE1
+        // §二 P-B-3). Read lane, no mutation, no local persistence: a repeated
+        // call answers the same face by construction.
+        "accounts.getSyncState" => {
+            match serde_json::from_value::<AccountsGetSyncStateParams>(request.params) {
+                Ok(params) => match runtime.get_sync_state(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "accounts.getSyncState",
+                        "params",
+                        "invalid accounts.getSyncState params",
+                    ),
+                ),
+            }
+        }
         // Device-plane faces (contract revision 1.122, §4.103): the read
         // projects the bounded device list verbatim (the engine's bare
         // `account` identity never crosses — the answer strips it); the write
@@ -1808,6 +1963,23 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
             Err(_) => HostResponse::failure(
                 request_id,
                 reject_probe("link.finish", "params", "invalid link.finish params"),
+            ),
+        },
+        // Rotating link attempt (contract 1.286, §4.272): the engine mints a
+        // fresh provisioning session for the same attempt on its own
+        // `rotateLink` face. The connector records the new code as a new slot
+        // (at most two live; a third retires the oldest) and keeps the commit
+        // attempt-scoped. An engine without the face answers NOT_SUPPORTED and
+        // the single slot keeps working — never an upstream protocol error
+        // leaking to the host.
+        "link.rotate" => match serde_json::from_value::<LinkRotateParams>(request.params) {
+            Ok(params) => match runtime.rotate_link(params.link_attempt_id).await {
+                Ok(result) => HostResponse::success(request_id, result),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                reject_probe("link.rotate", "params", "invalid link.rotate params"),
             ),
         },
         "link.cancel" => match serde_json::from_value::<LinkSessionParams>(request.params) {
@@ -2763,15 +2935,22 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                     // `gif` instead); the singular form requires exactly the
                     // §4.12 pair (dataBase64+sizeBytes). All rejections are
                     // deterministic and happen before any pending row exists.
+                    // 契约 1.294 §4.284（BUG-11 wire 批）：width/height 是单数
+                    // 形态的声明尺寸键，与 §4.127 blurHash 同族——数组旁出现即
+                    // 单数/复数混形，INVALID_REQUEST。
                     if params.attachments.is_some()
-                        && (params.voice_note || params.view_once || params.gif)
+                        && (params.voice_note
+                            || params.view_once
+                            || params.gif
+                            || params.width.is_some()
+                            || params.height.is_some())
                     {
                         return HostResponse::failure(
                             request_id,
                             reject_probe(
                                 "messages.attachments.send",
-                                "attachments,voiceNote,viewOnce,gif",
-                                "voiceNote, viewOnce and gif apply to the singular attachment form only",
+                                "attachments,voiceNote,viewOnce,gif,width,height",
+                                "voiceNote, viewOnce, gif, width and height apply to the singular attachment form only",
                             ),
                         );
                     }
@@ -2820,8 +2999,20 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                                 blur_hash,
                             }),
                         ) => {
+                            // 契约 1.294 §4.284：声明尺寸的形状闸在 host（与
+                            // blurHash/voiceNote 同层）——双参同进退、正整数、
+                            // ≤ 16384；坏形状在写任何 pending 行之前被判。
+                            let dimensions = match crate::service::validate_attachment_dimensions(
+                                params.width,
+                                params.height,
+                            ) {
+                                Ok(dimensions) => dimensions,
+                                Err(error) => {
+                                    return HostResponse::failure(request_id, error.into_api());
+                                }
+                            };
                             match runtime
-                                .send_attachment(
+                                .send_attachment_with_dimensions(
                                     params.account_id,
                                     target,
                                     params.client_request_id,
@@ -2835,6 +3026,7 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                                     params.view_once,
                                     blur_hash,
                                     params.gif,
+                                    dimensions,
                                 )
                                 .await
                             {
@@ -2875,6 +3067,118 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                         "messages.attachments.send",
                         "params",
                         "invalid messages.attachments.send params",
+                    ),
+                ),
+            }
+        }
+        // §4.262 (contract revision 1.278) + §4.263 (contract 1.279) + §4.264
+        // (contract 1.280): the in-place attachment retry — the SAME row
+        // re-sent, never a new message beside it, in the shape the original
+        // used. Params shape takes the singular messages.attachments.send form
+        // (same addressing rules); the plural §4.59 array is rejected outright
+        // rather than silently taking its first entry (the row itself decides
+        // whether the retry re-sends one attachment or its whole persisted
+        // group). dataBase64/sizeBytes are optional together — omitted, the
+        // connector reuses the original payload group persisted at first send
+        // (refresh-safe, plural included); supplied, they serve a singular row
+        // and replace its index-0 payload.
+        "messages.attachments.retry" => {
+            match serde_json::from_value::<MessagesSendAttachmentParams>(request.params) {
+                Ok(params) => {
+                    let target = match (
+                        params.conversation_id,
+                        params.kind,
+                        params.peer_key,
+                        params.peer_title,
+                    ) {
+                        (Some(conversation_id), None, None, None) => {
+                            Ok(SendTarget::Conversation(conversation_id))
+                        }
+                        (None, Some(kind), Some(peer_key), peer_title) => Ok(SendTarget::Peer {
+                            kind,
+                            peer_key,
+                            peer_title,
+                        }),
+                        _ => Err(reject_probe(
+                            "messages.attachments.retry",
+                            "conversationId,kind,peerKey",
+                            "exactly one of conversationId or kind+peerKey must be provided",
+                        )),
+                    };
+                    match target {
+                        Ok(target) => {
+                            if params.attachments.is_some() {
+                                HostResponse::failure(
+                                    request_id,
+                                    reject_probe(
+                                        "messages.attachments.retry",
+                                        "attachments",
+                                        "the retry face takes the singular attachment form and never the attachments array",
+                                    ),
+                                )
+                            } else if params.data_base64.is_some() != params.size_bytes.is_some() {
+                                HostResponse::failure(
+                                    request_id,
+                                    reject_probe(
+                                        "messages.attachments.retry",
+                                        "dataBase64,sizeBytes",
+                                        "dataBase64 and sizeBytes must be provided together; omit both to reuse the persisted original payload",
+                                    ),
+                                )
+                            } else {
+                                // 契约 1.294 §4.284：重试面允许调用方重述尺寸
+                                // （与 blurHash 同口径；缺席时回落到行 descriptor）。
+                                let dimensions =
+                                    match crate::service::validate_attachment_dimensions(
+                                        params.width,
+                                        params.height,
+                                    ) {
+                                        Ok(dimensions) => dimensions,
+                                        Err(error) => {
+                                            return HostResponse::failure(
+                                                request_id,
+                                                error.into_api(),
+                                            );
+                                        }
+                                    };
+                                match runtime
+                                    .retry_attachment_with_dimensions(
+                                        params.account_id,
+                                        target,
+                                        params.client_request_id,
+                                        params.data_base64,
+                                        params.size_bytes,
+                                        params.filename,
+                                        params.content_type,
+                                        params.text,
+                                        params.quote_message_id,
+                                        params.voice_note,
+                                        params.view_once,
+                                        params.blur_hash,
+                                        params.gif,
+                                        dimensions,
+                                    )
+                                    .await
+                                {
+                                    Ok(message) => HostResponse::success(
+                                        request_id,
+                                        serde_json::to_value(message).unwrap_or(Value::Null),
+                                    ),
+                                    Err(error) => {
+                                        HostResponse::failure(request_id, error.into_api())
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => HostResponse::failure(request_id, error),
+                    }
+                }
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "messages.attachments.retry",
+                        "params",
+                        "invalid messages.attachments.retry params",
                     ),
                 ),
             }
@@ -4382,6 +4686,32 @@ fn empty_params(params: &Value) -> bool {
     params.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
+/// D4 所有权执行面(1-5c)参数闸:`accountId` 必填非空字符串(槽键语义由
+/// 池侧 discard 幂等兜底,这里只挡形状);`reason` 可选字符串(隔离打点用,
+/// 休眠臂忽略)。坏形状 = `reject_probe` 同款拒绝,绝不猜默认。
+fn ownership_slot_params(params: &Value) -> Result<(String, String), ApiError> {
+    let invalid = |field: &'static str, reason: &'static str| -> ApiError {
+        reject_probe("ownership.slot", field, reason)
+    };
+    let account_id = params
+        .get("accountId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| invalid("accountId", "a non-empty accountId string is required"))?
+        .to_string();
+    let reason = params
+        .get("reason")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| invalid("reason", "when present, reason must be a string"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok((account_id, reason))
+}
+
 fn map_start_failure(failure: StartFailure) -> ApiError {
     match failure {
         StartFailure::AlreadyRunning => ApiError::new(
@@ -4394,6 +4724,28 @@ fn map_start_failure(failure: StartFailure) -> ApiError {
             "engine runtime could not be started",
             true,
         ),
+        // Contract 1.291: every slot was refused by the store-migration gate.
+        // That verdict is terminal for this process - a retry cannot heal a
+        // latched block or an unarmed plaintext store - so the wire must not
+        // promise one. The store code rides `data` beside the actionable
+        // sentence the gate already produced.
+        StartFailure::StoreMigrationBlocked { code, message } => ApiError {
+            data: Some(json!({ "storeMigrationCode": code })),
+            ..ApiError::new("STORE_MIGRATION_BLOCKED", message, false)
+        },
+        // O1: the structured fatal. `retryable: false` is the class's own
+        // assertion (the supervisor latched the fault); the three facts the
+        // launcher needs to repair ride `data`, mirrored by the byte-stable
+        // KT_FATAL line the supervisor wrote to stderr.
+        StartFailure::ContractMismatch(fault) => ApiError {
+            data: Some(fault.report_data()),
+            ..ApiError::new(
+                "ENGINE_CONTRACT_MISMATCH",
+                "engine contract mismatch: the engine states no identity, or a contract \
+                 revision outside this connector's supported range",
+                false,
+            )
+        },
     }
 }
 
@@ -4421,6 +4773,18 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
         HostSideEvent::AccountChanged(account) => Ok(HostEvent::new(
             "account.changed",
             serde_json::to_value(account).unwrap_or(Value::Null),
+        )),
+        HostSideEvent::ConnectionStateChanged {
+            account_id,
+            state,
+            close_code,
+        } => Ok(HostEvent::new(
+            "connection.stateChanged",
+            json!({
+                "accountId": account_id,
+                "state": state,
+                "closeCode": close_code,
+            }),
         )),
         HostSideEvent::ConversationChanged(conversation) => Ok(HostEvent::new(
             "conversation.changed",
@@ -5227,6 +5591,10 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
                 }),
             ))
         }
+        HostSideEvent::ContactSyncCompleted { account_id } => Ok(HostEvent::new(
+            "contactSync.complete",
+            json!({ "accountId": account_id }),
+        )),
         HostSideEvent::ReceiveDecryptionError { account_id } => {
             // Contract 1.165, §4.163: the decryption-error envelope — the
             // fact alone (the receive.emptied posture). Observability only:
@@ -6880,6 +7248,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn connection_state_frame_stays_on_connection_axis() {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::ConnectionStateChanged {
+                account_id: "acct-1".into(),
+                state: "invalidated".into(),
+                close_code: Some(4401),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["event"], "connection.stateChanged");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["state"], "invalidated");
+        assert_eq!(frame["data"]["closeCode"], 4401);
+    }
+
     /// Contract 1.195 (§4.195): the official `response.longText` state rides
     /// two optional booleans on the settled frame — `longTextPending` for
     /// `Status.PENDING` (attachmentBackfill.preload.ts:257-259; the official
@@ -7423,6 +7808,16 @@ mod tests {
         assert_eq!(frame["data"]["accountId"], "acct-1");
 
         let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::ContactSyncCompleted {
+                account_id: "acct-1".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["event"], "contactSync.complete");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+
+        let frame: Value = serde_json::to_value(
             host_event_frame(HostSideEvent::PniChanged {
                 account_id: "acct-1".into(),
                 registration_id: Some(2718),
@@ -7522,5 +7917,65 @@ mod tests {
         assert!(frame["data"].get("peerId").is_none());
         assert!(frame["data"].get("callId").is_none());
         assert!(frame["data"].get("conversationId").is_none());
+    }
+
+    /// A start whose every slot is refused by the store gate is terminal:
+    /// retrying cannot heal a latched block or an unarmed plaintext store, and
+    /// the wire must carry the store code rather than a generic retry.
+    #[test]
+    fn a_store_blocked_start_is_terminal_and_carries_the_store_code() {
+        let api = map_start_failure(StartFailure::StoreMigrationBlocked {
+            code: "store_key_rejected".to_string(),
+            message: "the encrypted store cannot be opened".to_string(),
+        });
+        assert_eq!(api.code, "STORE_MIGRATION_BLOCKED");
+        assert!(!api.retryable, "a terminal store verdict must not retry");
+        assert_eq!(
+            api.data
+                .as_ref()
+                .and_then(|data| data.get("storeMigrationCode")),
+            Some(&json!("store_key_rejected"))
+        );
+        assert_eq!(api.message, "the encrypted store cannot be opened");
+    }
+    /// BUG-15：附件下载与发送共用 per-account mutex 时，一次 4–9 秒的下载
+    /// 会把同账号的 sendText 全部堵死（真机 send_latency_probe wait_ms 实证）。
+    /// 下载改走独立媒体锁后：发送不必等下载；删除仍要 drain 两把锁。
+    #[tokio::test]
+    async fn media_download_does_not_block_sends_but_delete_drains_it() {
+        let limits = HostDispatchLimits::new();
+        let download = limits
+            .acquire("attachments.download", Some("acct"), None)
+            .await
+            .expect("download permit");
+        let send = tokio::time::timeout(
+            Duration::from_millis(300),
+            limits.acquire("messages.sendText", Some("acct"), None),
+        )
+        .await;
+        assert!(
+            send.is_ok(),
+            "a send must not queue behind an attachment download (BUG-15)"
+        );
+        drop(send.expect("send resolves").expect("send permit"));
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(150),
+            limits.acquire("accounts.deleteLocalData", Some("acct"), None),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the delete barrier must still drain the media mutex before deleting"
+        );
+        drop(download);
+        let delete = tokio::time::timeout(
+            Duration::from_millis(500),
+            limits.acquire("accounts.deleteLocalData", Some("acct"), None),
+        )
+        .await;
+        assert!(
+            delete.is_ok(),
+            "the delete proceeds once the media transfer is gone"
+        );
     }
 }

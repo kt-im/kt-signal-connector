@@ -81,6 +81,27 @@ impl DataDirLock {
         let _ = std::io::Write::write_all(&mut &handle, pid_note.as_bytes());
         Ok(Self { handle })
     }
+
+    /// Dry-run-safe occupancy probe (contract revision 1.288, §4.274): the
+    /// same kernel lock, but it never creates the data directory or the lock
+    /// file and never rewrites the holder pid. A missing directory or lock
+    /// file means no connector ever occupied this path — there is nothing to
+    /// conflict with, so `None` is the honest answer. When a lock file does
+    /// exist the flock/LockFileEx semantics are exactly those of
+    /// [`Self::acquire`], so a live holder is still refused.
+    pub fn acquire_quiescent(group_id: &str, data_dir: &Path) -> io::Result<Option<Self>> {
+        if !data_dir.is_dir() {
+            return Ok(None);
+        }
+        let lock_path = data_dir.join(LOCK_FILE_NAME);
+        let handle = match std::fs::OpenOptions::new().read(true).open(&lock_path) {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        lock_exclusive(&handle).map_err(|error| occupied_error(group_id, error))?;
+        Ok(Some(Self { handle }))
+    }
 }
 
 impl Drop for DataDirLock {

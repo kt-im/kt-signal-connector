@@ -21,6 +21,20 @@
 //! - the recent error families: a bounded ring of the connector's most
 //!   recent classified errors (host dispatch failures and protocol
 //!   warnings), aggregated into counts;
+//! - the store's own health (revision 1.282, §4.266): schema version next to
+//!   its target, the last pre-migration integrity gate verdict, the database
+//!   and WAL byte sizes, the snapshot count and outcome of the last upgrade,
+//!   and the last recorded migration failure. Every value is a number or a
+//!   fixed literal; the snapshot is named by its own file name, never a path;
+//!   since revision 1.284 (§4.268) the same face carries `schemaNewer` — the
+//!   last refused open this state directory recorded because the store was
+//!   written by a newer connector, with both schema numbers. A newer store
+//!   refuses to start (the launcher gets the fixed KT_FATAL line), so this
+//!   marker is the only way a later doctor run can still say what blocked it;
+//! - the event ledger's own face (revision 1.283, §4.267): the generation
+//!   counter, the retention floor and head seq, rows and bytes, and the
+//!   retention window they are held to. Numbers only — the token is never
+//!   reported, because doctor payloads get pasted into bug reports;
 //! - network reachability, reused from the existing connectivity surfaces:
 //!   the per-group engine status plus the process-wide watchdog/receive-drop
 //!   counters — no new instrumentation there;
@@ -62,6 +76,7 @@ use serde_json::{Value, json};
 use crate::datalock::LOCK_FILE_NAME;
 use crate::engine::{CallClass, EngineError, EngineHandle, EngineState, EngineStatus, SocksProxy};
 use crate::registry::ProxyGroupRuntime;
+use crate::store::{EventLogHealth, StoreHealth};
 
 /// Bounded engine-call budget for the three doctor probes (`version`,
 /// `engine.protocolCapabilities`): a diagnostic must not sit on a wedged
@@ -95,6 +110,19 @@ const LOCK_PID_READ_BYTES: usize = 32;
 #[serde(rename_all = "camelCase")]
 pub struct DoctorReport {
     pub connector: ConnectorFace,
+    /// The store's own health face (contract revision 1.282, §4.266): the
+    /// schema version it landed on next to the target this binary migrates to,
+    /// the last pre-migration integrity gate verdict, the database and WAL
+    /// sizes, what the pre-migration snapshot pass did, and the last failed
+    /// migration this state directory recorded. Read-only, taken without the
+    /// writer lock — an upgrade that rolled back has to stay visible, not
+    /// collapse into "unavailable".
+    pub store: StoreHealth,
+    /// The event ledger's own face (contract revision 1.283, §4.267): the
+    /// generation counter, the retention floor, the head seq, how many rows and
+    /// bytes the ledger holds, and the window they are held to. The token
+    /// itself never appears — doctor payloads are pasted into bug reports.
+    pub events: EventLogHealth,
     pub groups: Vec<GroupReport>,
     pub network: NetworkFace,
     pub recent_errors: ErrorRingReport,
@@ -229,6 +257,24 @@ pub struct EngineFace {
     /// `connectorDroppedKeys`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub perf_metrics: Option<EngineMethodFace>,
+    /// O1: the engine's own `version` string (verbatim, never re-derived).
+    /// Present when this diagnostic could read it live or a previous handshake
+    /// recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    /// O1: the contract revision the engine states, verbatim. Absent for a
+    /// legacy engine (one that predates the handshake face or states no
+    /// revision) — absence stays absence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_contract_revision: Option<String>,
+    /// O1: `match` | `legacy` | `mismatch` | `unverified` (`unreachable` when
+    /// no live engine could be asked at all). The supervisor's verdict — the
+    /// gate that actually decided whether the account pipeline may run.
+    pub engine_contract_status: &'static str,
+    /// O1: the fixed classification of a refused handshake
+    /// (`version_missing` / `revision_out_of_range` / `revision_malformed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_contract_reason: Option<&'static str>,
 }
 
 /// One engine method probe's outcome: the engine's own answer passed through
@@ -340,6 +386,10 @@ pub(crate) struct DoctorGroupFace {
     /// The credentials probe target (the watchdog's any-account-of-this-group
     /// rule). Transient only — the number never enters the report.
     pub probe_account: Option<String>,
+    /// O1: the supervisor's contract handshake verdict (last served engine or
+    /// the latched refusal). The report's parsed fields prefer the live probe
+    /// answers and fall back here when the engine cannot answer now.
+    pub contract: crate::engine_contract::EngineContractState,
 }
 
 /// Assemble the whole doctor payload for the runtime: every launch-plan group
@@ -350,7 +400,7 @@ pub async fn collect(runtime: &ProxyGroupRuntime) -> DoctorReport {
         let face = supervisor.doctor_face().await;
         let data_dir = probe_data_dir(&face.data_dir);
         let lock = probe_lock(&face.data_dir);
-        let engine = engine_face(&face.status, face.engine.as_ref()).await;
+        let engine = engine_face(&face.status, face.engine.as_ref(), &face.contract).await;
         let credentials = credentials_face(
             &face.status,
             face.engine.as_ref(),
@@ -371,6 +421,8 @@ pub async fn collect(runtime: &ProxyGroupRuntime) -> DoctorReport {
             api_version: crate::API_VERSION,
             pid: std::process::id(),
         },
+        store: runtime.store().health(),
+        events: runtime.store().event_log_health(),
         groups,
         network: NetworkFace {
             watchdog_restarts_total: crate::metrics::watchdog_restarts_total(),
@@ -387,7 +439,11 @@ pub async fn collect(runtime: &ProxyGroupRuntime) -> DoctorReport {
 /// diagnostic budget. A
 /// non-running engine marks `unreachable` with the state classification and
 /// answers all three probes `present: false` with that same reason.
-async fn engine_face(status: &EngineStatus, engine: Option<&EngineHandle>) -> EngineFace {
+async fn engine_face(
+    status: &EngineStatus,
+    engine: Option<&EngineHandle>,
+    contract: &crate::engine_contract::EngineContractState,
+) -> EngineFace {
     let reachable = status.state == EngineState::Running && engine.is_some();
     // A Running status with no live handle is a mid-transition race, not a
     // start failure; it gets its own honest classification.
@@ -426,6 +482,21 @@ async fn engine_face(status: &EngineStatus, engine: Option<&EngineHandle>) -> En
                 Some(EngineMethodFace::failed(degraded_reason)),
             )
         };
+    // O1: the parsed handshake facts. The live probe answers win (this is the
+    // freshest truth); the supervisor's recorded verdict fills in when a probe
+    // could not run (engine gone, mid-transition). Neither is invented.
+    let engine_version = engine_version_from_face(version.as_ref())
+        .or_else(|| contract.engine_version().map(str::to_owned));
+    let engine_contract_revision =
+        contract_revision_from_faces(version.as_ref(), protocol_capabilities.as_ref())
+            .or_else(|| contract.contract_revision().map(str::to_owned));
+    let engine_contract_status = if contract.fault.is_some() || reachable {
+        // A latched refusal explains an unreachable engine; never hide it
+        // behind the generic literal.
+        contract.status()
+    } else {
+        "unreachable"
+    };
     EngineFace {
         state: status.state,
         pid: status.pid,
@@ -436,7 +507,35 @@ async fn engine_face(status: &EngineStatus, engine: Option<&EngineHandle>) -> En
         version,
         protocol_capabilities,
         perf_metrics,
+        engine_version,
+        engine_contract_revision,
+        engine_contract_status,
+        engine_contract_reason: contract.fault.as_ref().map(|fault| fault.reason.as_str()),
     }
+}
+
+/// O1: the engine's own version string from a version probe face.
+fn engine_version_from_face(face: Option<&EngineMethodFace>) -> Option<String> {
+    face.and_then(|face| face.face.as_ref())
+        .and_then(|answer| answer.get("version"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// O1: the stated contract revision, capabilities face first (authoritative),
+/// the version answer as the additive fallback - the same precedence the
+/// startup handshake uses.
+fn contract_revision_from_faces(
+    version: Option<&EngineMethodFace>,
+    capabilities: Option<&EngineMethodFace>,
+) -> Option<String> {
+    fn from_face(face: Option<&EngineMethodFace>) -> Option<String> {
+        face.and_then(|face| face.face.as_ref())
+            .and_then(|answer| answer.get("contractRevision"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+    from_face(capabilities).or_else(|| from_face(version))
 }
 
 /// One read-only engine method probe under the diagnostic budget.
@@ -1143,6 +1242,48 @@ mod tests {
                 api_version: crate::API_VERSION,
                 pid: std::process::id(),
             },
+            store: StoreHealth {
+                schema_version: crate::store::SCHEMA_VERSION,
+                schema_target: crate::store::SCHEMA_VERSION,
+                integrity: "ok",
+                db_bytes: 8192,
+                wal_bytes: 1024,
+                snapshots: crate::store::SnapshotHealth {
+                    count: 1,
+                    bytes: 8192,
+                    last_result: "created",
+                    last_at: Some(1_700_000_000_000),
+                },
+                last_migration_failure: Some(crate::store::MigrationFailureFace {
+                    at: 1_700_000_000_000,
+                    from: 20,
+                    to: crate::store::SCHEMA_VERSION,
+                    rollback: "restored".into(),
+                    snapshot: Some(
+                        "pre-migration-v020-to-v050-0000000001700000000000-1.sqlite3".into(),
+                    ),
+                }),
+                schema_newer: Some(crate::store::SchemaNewerFace {
+                    at: 1_700_000_000_000,
+                    current: crate::store::SCHEMA_VERSION + 1,
+                    supported: crate::store::SCHEMA_VERSION,
+                }),
+            },
+            events: EventLogHealth {
+                readable: true,
+                token_generation: 3,
+                trimmed_through_seq: 41,
+                seq_max: 64,
+                rows: 23,
+                bytes: 1864,
+                oldest_created_at: Some(1_700_000_000_000),
+                newest_created_at: Some(1_700_000_060_000),
+                retention: crate::store::EventLogRetentionHealth {
+                    max_age_ms: crate::store::EVENT_LOG_RETENTION_MS,
+                    max_rows: crate::store::EVENT_LOG_MAX_ROWS,
+                    max_bytes: crate::store::EVENT_LOG_MAX_BYTES,
+                },
+            },
             groups: vec![GroupReport {
                 group_id: "default".into(),
                 engine: EngineFace {
@@ -1161,6 +1302,10 @@ mod tests {
                     perf_metrics: Some(EngineMethodFace::failed(unreachable_reason(
                         EngineState::Faulted,
                     ))),
+                    engine_version: None,
+                    engine_contract_revision: None,
+                    engine_contract_status: "unreachable",
+                    engine_contract_reason: None,
                 },
                 data_dir: DataDirFace {
                     path: "/tmp/never-logged".into(),
@@ -1222,6 +1367,72 @@ mod tests {
             Some(crate::API_VERSION)
         );
         assert!(connector.get("pid").is_some_and(Value::is_u64));
+
+        // Contract revision 1.282 (§4.266): the store face rides every doctor
+        // payload with the upgrade facts the operator needs after a bad start.
+        let store = value.get("store").expect("store face");
+        assert_eq!(
+            store.get("schemaVersion").and_then(Value::as_i64),
+            Some(crate::store::SCHEMA_VERSION)
+        );
+        assert_eq!(
+            store.get("schemaTarget").and_then(Value::as_i64),
+            Some(crate::store::SCHEMA_VERSION)
+        );
+        assert_eq!(store.get("integrity").and_then(Value::as_str), Some("ok"));
+        assert_eq!(store.get("dbBytes").and_then(Value::as_u64), Some(8192));
+        assert_eq!(store.get("walBytes").and_then(Value::as_u64), Some(1024));
+        let snapshots = store.get("snapshots").expect("snapshot face");
+        assert_eq!(snapshots.get("count").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            snapshots.get("lastResult").and_then(Value::as_str),
+            Some("created")
+        );
+        let failure = store.get("lastMigrationFailure").expect("failure face");
+        assert_eq!(failure.get("from").and_then(Value::as_i64), Some(20));
+        assert_eq!(
+            failure.get("rollback").and_then(Value::as_str),
+            Some("restored")
+        );
+        // Contract revision 1.284 (§4.268): a refused open because the store
+        // belongs to a newer connector stays visible on the doctor's store
+        // face, with both numbers and nothing else.
+        let newer = store.get("schemaNewer").expect("schemaNewer face");
+        assert_eq!(
+            newer.get("current").and_then(Value::as_i64),
+            Some(crate::store::SCHEMA_VERSION + 1)
+        );
+        assert_eq!(
+            newer.get("supported").and_then(Value::as_i64),
+            Some(crate::store::SCHEMA_VERSION)
+        );
+        assert!(newer.get("at").and_then(Value::as_u64).is_some());
+
+        // Contract revision 1.283 (§4.267): the ledger's face rides the same
+        // payload — generation, floor, head, rows, bytes, window — and never
+        // the token itself (doctor output is pasted into bug reports).
+        let events = value.get("events").expect("events face");
+        assert_eq!(events.get("readable").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            events.get("tokenGeneration").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            events.get("trimmedThroughSeq").and_then(Value::as_i64),
+            Some(41)
+        );
+        assert_eq!(events.get("seqMax").and_then(Value::as_i64), Some(64));
+        assert_eq!(events.get("rows").and_then(Value::as_u64), Some(23));
+        assert_eq!(events.get("bytes").and_then(Value::as_u64), Some(1864));
+        assert!(
+            events.get("token").is_none(),
+            "the token never reaches doctor"
+        );
+        let retention = events.get("retention").expect("retention window");
+        assert_eq!(
+            retention.get("maxRows").and_then(Value::as_i64),
+            Some(crate::store::EVENT_LOG_MAX_ROWS)
+        );
 
         let group = &value["groups"][0];
         assert_eq!(group["groupId"], json!("default"));
@@ -1320,7 +1531,12 @@ mod tests {
             EngineState::Exited,
             EngineState::Faulted,
         ] {
-            let face = engine_face(&stopped_status(state), None).await;
+            let face = engine_face(
+                &stopped_status(state),
+                None,
+                &crate::engine_contract::EngineContractState::default(),
+            )
+            .await;
             assert!(!face.reachable, "{state:?} is not reachable");
             assert_eq!(face.unreachable_reason, Some(unreachable_reason(state)));
             let version = face.version.expect("version face always present");
@@ -1345,7 +1561,12 @@ mod tests {
             resource_pressure: false,
         };
         // No engine handle despite Running status: the honest unreachable.
-        let face = engine_face(&status, None).await;
+        let face = engine_face(
+            &status,
+            None,
+            &crate::engine_contract::EngineContractState::default(),
+        )
+        .await;
         assert!(!face.reachable);
         assert_eq!(
             face.unreachable_reason,
