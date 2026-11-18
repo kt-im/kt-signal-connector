@@ -130,7 +130,7 @@ jobs:
           obj="$OSS_PREFIX/$version/$artifact"
           echo "publishing $src -> oss://$OSS_BUCKET/$obj"
 
-          python3 -m pip install --quiet --disable-pip-version-check oss2
+          python3 -m pip install --quiet --disable-pip-version-check --break-system-packages oss2
           export SRC="$src" OSS_KEY="$obj"
           python3 - <<'PYEOF'
           import os, hashlib, oss2
