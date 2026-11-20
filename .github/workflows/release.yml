@@ -113,6 +113,7 @@ jobs:
           role-session-name: kt-signal-runtime-connector
 
       - name: Publish connector to download.ktai.im
+        shell: bash
         if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
         env:
           OSS_ACCESS_KEY_ID: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-id }}
@@ -160,6 +161,7 @@ jobs:
       # matrix 每个平台只更新 connector 记录里**自己那个 platform** 的 artifact，
       # 保留另一个平台的既有条目（两个 job 并发写同一记录，读-改-写 + 重试）。
       - name: Publish catalog entry to download.ktai.im
+        shell: bash
         if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
         env:
           OSS_ACCESS_KEY_ID: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-id }}
