@@ -178,7 +178,7 @@ jobs:
             echo "platform $TARGET not published to catalog (only windows-x64 / macos-arm64 are consumed)"; exit 0
           fi
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          python3 -m pip install --quiet --disable-pip-version-check oss2
+          python3 -m pip install --quiet --disable-pip-version-check --break-system-packages oss2
           export SRC="$src" PLATFORM="$platform" ARTIFACT="$artifact" COMPONENT_VERSION="$version"
           python3 - <<'PYEOF'
           import os, json, hashlib, time, oss2
