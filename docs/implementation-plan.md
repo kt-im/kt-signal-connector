@@ -96,6 +96,19 @@
   `width`/`height`。无两键的旧 payload 逐字节不变；两键在 data URI 既有参数面之后
   纯附加，不改任何既有键名语义。`ENGINE_CONTRACT_MAX_REVISION` 保持 1.286（引擎
   参数面零新增方法：data URI 参数是既有附件形状的附加参数）。)
+- Contract revision: 1.296 (2026-11-22; §4.287 群写面解除 refusal：`groups.update`
+  的 description/admin/ban 四族从整调 CAPABILITY_UNAVAILABLE 拒绝改为折叠转发——
+  `groupDescription` → engine `description` 写臂（与 listGroups 投影同词，§4.188
+  记录缺口就此关闭），`promoteAdmins`/`demoteAdmins`/`banMembers`/`unbanMembers`
+  → engine 同名成员族写臂（addMembers/removeMembers 命名纪律）。桌面
+  SignalConversationInfo 的升/降管理员、ban/unban、群描述编辑写穿由此走通
+  （同一单 change 广播，绝不部分应用）。memberLabel/memberLabelEmoji 对仍整调拒绝
+  （engine 无标签写臂，§4.238 边界不变）。引擎侧写臂为另一仓同批合入：本仓
+  转发先行，无臂 engine build 按其自身拒绝经 UPSTREAM_ERROR 面透出（1.188
+  announcementsOnly 同款姿态，非伪装的本地拒绝）。参数五键 schema 已声明
+  （1.45 面），本批仅重写 refusal 清单描述；`ENGINE_CONTRACT_MAX_REVISION`
+  保持 1.286。完整批记录见 §4.287（本文档末尾附录段）。Tests 1442 → 1443
+  (lib +1)。)
 - Contract revision: 1.295 (2026-11-21; §4.286 PNI 会话归并腿：conversations
   summary 行新增 additive `pni` 身份键（Storage Service ContactRecord 归一
   "PNI:<uuid>"，engine sync contacts 投影随动）；`conversations` 三身份列
@@ -22136,3 +22149,63 @@ pni/serviceId 投影）。
 1.294 逐字节一致；歧义桥材料不回填；canonical 行缺席（PNI-only 认识）→
 不折，PNI 行独立存在并尽力升格 ACI 面；号码壳折并路径（1.259）逐字节
 不变（探针兜底只在原探空后介入，号码词形/提示文案同形）。
+
+## §4.287 群写面解除 refusal：description/admin/ban 四族折叠转发（契约 1.296 · 无 wire 新键，`groups.update` 既有参数解除拒绝）
+
+**动机（桌面写穿被本地拒绝挡死）**：桌面 SignalConversationInfo.vue:2230-2233
+已实现升/降管理员与群描述编辑的 `submitGroupChange({promoteAdmins/demoteAdmins})`
+提交，ban/unban 面同理；但 connector 的 `prepare_groups_update` 对
+`description`/`admins`/`removeAdmins`/`bans`/`unbans` 五个内部键恒答
+CAPABILITY_UNAVAILABLE（§4.188 记录的 engine 无 description 写臂缺口 +
+§4.44 引擎批次边界的 admin/ban 族），桌面写穿从未到达 engine。
+
+**connector（本批，本仓）**：五个键从 refusal 列表移入转发列表——
+
+- `groupDescription` → engine `updateGroup` 的 `description` 臂（值 verbatim，
+  1-4096 字节预算在参数层既闸；与 engine `listGroups` 条目的 `description`
+  投影同词——读面 §4.188 早已就位，写面就此闭环）；
+- `promoteAdmins` → engine `promoteAdmins`；`demoteAdmins` →
+  `demoteAdmins`；`banMembers` → `banMembers`；`unbanMembers` →
+  `unbanMembers`（成员数组 verbatim；engine 成员族词表即 connector host 词
+  ——`addMembers`/`removeMembers` 同款命名纪律）；
+- 折叠与既载子集（title/member/avatar/link-access/inviteLinkPassword/
+  announcementsOnly/三 permission 词）合成**同一单 change 广播**——混合提交
+  （改名 + 升管理员 + 描述编辑）一次 engine 调用，绝不部分应用；
+- §4.44 成员界仍在折叠之前：空数组成员、>1001 条、单条 1-128 字符越界
+  照答 INVALID_REQUEST（本地校验梯先于引擎缝）。
+
+**仍在拒绝集**：`memberLabel`/`memberLabelEmoji` 对——engine `updateGroup`
+无标签写臂（§4.238 边界：标签清除由 engine 从群态按 access-control 臂合成，
+host 直写标签无面）。整调拒绝语义不变（拒绝以 host 词命名键）。
+
+**engine（另一仓同批合入）**：`updateGroup` 新增 `description` /
+`promoteAdmins` / `demoteAdmins` / `banMembers` / `unbanMembers` 写臂
+（对应官方 modify_description / promote/demote（modify_member 角色）与
+ban/unban 族 change 动作）。connector 转发先行合入：无臂 engine build 对
+未知参数按其自身拒绝回答，经 connector 的结构化 UPSTREAM_ERROR 面
+（retryable=false）透出——1.188 announcementsOnly 臂同款姿态（引擎合入后
+自动走通，无需 connector 再动）。`ENGINE_CONTRACT_MAX_REVISION` 保持 1.286
+（engine 参数面零新增方法，既有方法的附加参数）。
+
+**桌面（已就位，零改动）**：SignalConversationInfo 的升/降管理员、ban/unban、
+群描述编辑写穿此前被 CAPABILITY_UNAVAILABLE 整调拒绝（失败序号回落真值）；
+本批起经 connector 折叠真正落群更新，收敛走 receive projection（群 UPDATE
+信封 → 系统行 + conversation.changed，§4.44 纪律）。
+
+**wire**：零新键——五个参数自 1.45（§4.44）起即已在
+`groupsUpdateParams` schema 声明，本批仅解除拒绝并重写 schema 描述的
+refusal 清单（五键描述补记 1.296 折叠）。
+
+**测试**：`groups_update_admin_ban_description_arms_fold_onto_engine_face`
+（新）：五臂各自单独折叠的 payload 钉形；与 title/description 混合成单
+原子 change set；空 admin 数组与超界 ban 数组仍 INVALID_REQUEST（校验
+先于折叠）。`groups_update_and_quit_fold_onto_the_engine_face` 与
+`groups_update_announcements_only_folds_onto_engine_face`（改）：原以
+groupDescription 为拒绝样例的断言改为折叠断言，拒绝样例换成
+memberLabel/memberLabelEmoji 对（含混合携带仍整调拒绝、以 host 词命名）。
+
+**边界（诚实降级）**：engine 无五臂 → 未知参数按 engine 自身拒绝经
+UPSTREAM_ERROR 透出（确定性拒绝，盲重放同败）；memberLabel 对拒绝不变；
+`groups.approveJoinRequests`/`groups.revokeInvites` 的独立 refusal（§4.53/
+§4.57）不在本批范围。
+

@@ -5106,13 +5106,16 @@ impl ConnectorService {
     /// conversation id must resolve to a kind='group' row (direct answers
     /// INVALID_REQUEST before any upstream call). The engine carries the
     /// title/member/avatar/link-access subset plus the 1.180 resetLink fold,
-    /// the 1.188 send-messages fold, and the 1.252 access-control folds
+    /// the 1.188 send-messages fold, the 1.252 access-control folds
     /// (§4.238 — add-member / edit-details / member-label permissions onto
     /// the engine words membersPermission / attributesPermission /
     /// memberLabelPermission, the engine composing the official
-    /// modifyMemberLabels clears from its own group state); a change set
-    /// naming anything outside it (description, admin/ban families, the
-    /// member label pair) answers CAPABILITY_UNAVAILABLE naming the keys
+    /// modifyMemberLabels clears from its own group state), and the 1.296
+    /// description/admin/ban folds (§4.287 — groupDescription onto the
+    /// engine's `description` arm, promoteAdmins/demoteAdmins/
+    /// banMembers/unbanMembers onto the engine's same-named member-family
+    /// arms); the member-label write pair stays outside the engine face
+    /// and answers CAPABILITY_UNAVAILABLE naming the keys
     /// (retryable=false) after the local validation completed — the honest
     /// whole-call refusal, never a partial application. Zero local writes:
     /// group state converges through the receive projection.
@@ -5326,12 +5329,14 @@ impl ConnectorService {
         // arrays verbatim, the avatar tri-state verbatim, the link access
         // word above, (contract 1.180, §4.180) resetLink→a freshly
         // minted `inviteLinkPassword` (the official refreshGroupLink fold),
-        // and (contract 1.188, §4.188) setPermissionSendMessages→the
-        // engine's `announcementsOnly` bool. A change set carrying any key
-        // outside that subset (groupDescription, the admin and ban
-        // families, the remaining permission pair including the contract
-        // 1.221 member-label access arm, the member label pair)
-        // answers
+        // (contract 1.188, §4.188) setPermissionSendMessages→the
+        // engine's `announcementsOnly` bool, and (contract 1.296, §4.287)
+        // groupDescription→`description` plus the admin/ban member families
+        // onto the engine's promoteAdmins / demoteAdmins / banMembers /
+        // unbanMembers arms — the desktop's promote/demote/ban/unban and
+        // description-edit writes now travel the same single engine change
+        // broadcast. The member-label write pair (memberLabel /
+        // memberLabelEmoji) stays outside the engine face and answers
         // CAPABILITY_UNAVAILABLE naming the keys — the honest whole-call
         // refusal, never a partial application: the engine commits the set
         // as one change broadcast and the official client applies it
@@ -5403,18 +5408,38 @@ impl ConnectorService {
                         json!(engine_access_control_word(&value)),
                     );
                 }
-                // The refusal names the caller's schema vocabulary, not the
-                // internal upstream keys the change vec carries.
+                // Contract 1.296 (§4.287): the description write arm and the
+                // admin/ban member families ride the engine's updateGroup
+                // write arms — `description` verbatim (the same word the
+                // engine's listGroups projection reads, §4.188) and the four
+                // member arrays onto the engine's own family words
+                // promoteAdmins / demoteAdmins / banMembers / unbanMembers
+                // (the addMembers/removeMembers naming discipline — the
+                // engine's member-array words are the connector's host
+                // words). An engine build without the arms answers its own
+                // refusal through the structured UPSTREAM_ERROR face — the
+                // same posture the 1.188 announcementsOnly arm recorded.
+                "description" => {
+                    payload.insert("description".to_owned(), value);
+                }
+                "admins" => {
+                    payload.insert("promoteAdmins".to_owned(), value);
+                }
+                "removeAdmins" => {
+                    payload.insert("demoteAdmins".to_owned(), value);
+                }
+                "bans" => {
+                    payload.insert("banMembers".to_owned(), value);
+                }
+                "unbans" => {
+                    payload.insert("unbanMembers".to_owned(), value);
+                }
+                // The refusal names the caller's schema vocabulary, not an
+                // internal upstream key — and the remaining refused set
+                // (the member-label write pair) already carries the host
+                // words verbatim on the change vec.
                 _ => {
-                    let host = match key {
-                        "description" => "groupDescription",
-                        "admins" => "promoteAdmins",
-                        "removeAdmins" => "demoteAdmins",
-                        "bans" => "banMembers",
-                        "unbans" => "unbanMembers",
-                        other => other,
-                    };
-                    unsupported.push(host);
+                    unsupported.push(key);
                 }
             }
         }
@@ -50138,9 +50163,9 @@ mod tests {
                 "addFromInviteLinkAccess": "ADMINISTRATOR"
             })
         );
-        // Any key outside the engine subset refuses the whole call, naming
-        // the offenders.
-        let error = service
+        // Contract 1.296 (§4.287): the description write key folds onto the
+        // engine's `description` arm — the §4.188 recorded gap closed.
+        let payload = service
             .prepare_groups_update(&base(
                 Some("New Name".into()),
                 Some("KT ops group".into()),
@@ -50148,11 +50173,21 @@ mod tests {
                 None,
                 None,
             ))
+            .unwrap();
+        assert_eq!(payload["title"], json!("New Name"));
+        assert_eq!(payload["description"], json!("KT ops group"));
+        // The member-label write pair stays outside the engine face and
+        // refuses the whole call, naming the offenders (the host words).
+        let error = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                member_label: Some("ops".into()),
+                ..base(None, None, None, None, None)
+            })
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE"
                     && !api.retryable
-                    && api.message.contains("groupDescription")));
+                    && api.message.contains("memberLabel")));
         // Validation outranks the capability gate: the empty change set.
         let error = service
             .prepare_groups_update(&base(None, None, None, None, None))
@@ -50267,8 +50302,10 @@ mod tests {
     /// updateGroup arm, engine `8ea56f6` — the official
     /// modifyAnnouncementsOnly group change action). Both values are real
     /// write intents: only-admins is the announcements-only group,
-    /// every-member lifts it. The other refused keys keep their whole-call
-    /// CAPABILITY_UNAVAILABLE — the engine face still does not carry them.
+    /// every-member lifts it. The member-label write pair keeps its
+    /// whole-call CAPABILITY_UNAVAILABLE — the engine face still does not
+    /// carry those arms (the description key this test once used as the
+    /// refused example folds since contract 1.296).
     #[test]
     fn groups_update_announcements_only_folds_onto_engine_face() {
         let (_temp, service) = service();
@@ -50364,25 +50401,27 @@ mod tests {
             .unwrap();
         assert_eq!(mixed_access["memberLabelPermission"], json!("MEMBER"));
         assert_eq!(mixed_access["announcementsOnly"], json!(true));
-        // The description write key keeps its refusal too — the engine's
-        // updateGroup carries no description arm (the §4.188 recorded gap;
-        // the local validation ladder still runs ahead of the seam).
+        // The member-label write pair keeps its refusal — the engine's
+        // updateGroup carries no member-label write arm (the §4.238
+        // boundary; the local validation ladder still runs ahead of the
+        // seam). The description key, formerly this refusal's example,
+        // folds since contract 1.296.
         let error = service
             .prepare_groups_update(&GroupsUpdateParams {
-                group_description: Some("no engine arm yet".into()),
+                member_label: Some("no engine arm yet".into()),
                 ..params(None)
             })
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE"
                     && !api.retryable
-                    && api.message.contains("groupDescription")));
+                    && api.message.contains("memberLabel")));
         // Mixing a folded access arm with an unsupported key still refuses
         // the whole call naming the unsupported host key — never a partial
         // application (the engine commits the set as one change broadcast).
         let error = service
             .prepare_groups_update(&GroupsUpdateParams {
-                group_description: Some("no engine arm yet".into()),
+                member_label_emoji: Some("🔧".into()),
                 permission_member_label: Some("only-admins".into()),
                 ..params(None)
             })
@@ -50390,12 +50429,154 @@ mod tests {
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE"
                     && !api.retryable
-                    && api.message.contains("groupDescription")
+                    && api.message.contains("memberLabelEmoji")
                     && !api.message.contains("permissionMemberLabel")));
         // An invalid send-messages word keeps its INVALID_REQUEST (the
         // params ladder outranks the fold).
         let error = service
             .prepare_groups_update(&params(Some("nobody".into())))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+    }
+
+    /// The groups.update description/admin/ban folds (contract 1.296,
+    /// §4.287): the desktop conversation-info writes — promote/demote
+    /// admin, ban/unban member, the description edit — ride the engine's
+    /// updateGroup arms. groupDescription folds onto the engine's
+    /// `description` word (the same word its listGroups projection reads,
+    /// §4.188); the four member families fold onto the engine's
+    /// same-named promoteAdmins / demoteAdmins / banMembers / unbanMembers
+    /// arms (the addMembers/removeMembers naming discipline). The arms
+    /// compose with the carried subset into one atomic engine change set;
+    /// the §4.44 member-array bounds still outrank the fold; an engine
+    /// build without the arms answers its own refusal through the
+    /// structured UPSTREAM_ERROR face (the 1.188 posture — the connector
+    /// never disguises the engine gap as a local refusal).
+    #[test]
+    fn groups_update_admin_ban_description_arms_fold_onto_engine_face() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let params = || GroupsUpdateParams {
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            group_name: None,
+            group_description: None,
+            add_members: None,
+            remove_members: None,
+            promote_admins: None,
+            demote_admins: None,
+            ban_members: None,
+            unban_members: None,
+            link_state: None,
+            reset_link: None,
+            permission_add_member: None,
+            permission_edit_details: None,
+            permission_send_messages: None,
+            permission_member_label: None,
+            member_label: None,
+            member_label_emoji: None,
+            avatar: AvatarUpdate::Keep,
+            operation_id: None,
+        };
+        // Each arm folds alone (the desktop's single-intent writes).
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                promote_admins: Some(vec!["+15555550101".into()]),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "promoteAdmins": ["+15555550101"],
+            })
+        );
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                demote_admins: Some(vec!["+15555550102".into()]),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(payload["demoteAdmins"], json!(["+15555550102"]));
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                ban_members: Some(vec!["+15555550103".into()]),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(payload["banMembers"], json!(["+15555550103"]));
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                unban_members: Some(vec!["+15555550104".into()]),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(payload["unbanMembers"], json!(["+15555550104"]));
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                group_description: Some("KT ops group".into()),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "description": "KT ops group",
+            })
+        );
+        // The arms compose with the carried subset in one atomic engine
+        // change set — the desktop's mixed submission (rename + promote +
+        // description edit) is one change broadcast, never two calls.
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                group_name: Some("Renamed".into()),
+                group_description: Some("edited".into()),
+                promote_admins: Some(vec!["+15555550101".into(), "+15555550102".into()]),
+                ban_members: Some(vec!["+15555550103".into()]),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(payload["title"], json!("Renamed"));
+        assert_eq!(payload["description"], json!("edited"));
+        assert_eq!(
+            payload["promoteAdmins"],
+            json!(["+15555550101", "+15555550102"])
+        );
+        assert_eq!(payload["banMembers"], json!(["+15555550103"]));
+        assert_eq!(payload.as_object().expect("payload is an object").len(), 6);
+        // The §4.44 bounds still outrank the fold: an empty admin array and
+        // an over-bound ban array keep their INVALID_REQUEST (validation
+        // precedes the engine seam).
+        let error = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                promote_admins: Some(vec![]),
+                ..params()
+            })
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let error = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                ban_members: Some(
+                    (0..=MAX_GROUP_MEMBERS)
+                        .map(|index| format!("+15555050{index:03}"))
+                        .collect(),
+                ),
+                ..params()
+            })
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
     }
