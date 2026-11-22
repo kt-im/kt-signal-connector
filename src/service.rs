@@ -11767,6 +11767,19 @@ impl ConnectorService {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
+                // The number leg before the mask (official getTitle ladder:
+                // profile -> system -> e164 -> ... — a masked id is never a
+                // title). Two number sources: the envelope metadata above,
+                // and a peer that is itself an E.164 (the sent-transcript
+                // destination ladder already prefers destinationNumber) — the
+                // latter must ride verbatim, never masked. A PNI-only
+                // destination without any number still falls to the mask
+                // until the identity ladder resolves it.
+                .or_else(|| receive.source_number.clone())
+                .or_else(|| {
+                    let raw = peer.trim();
+                    (!raw.is_empty() && raw.starts_with('+')).then(|| raw.to_string())
+                })
                 .unwrap_or_else(|| mask_address(peer));
             ("direct", peer.to_string(), label)
         } else {
@@ -12106,6 +12119,12 @@ impl ConnectorService {
         {
             self.store
                 .upsert_peer_identity(&account.id, aci, &peer_key)?;
+            // 契约 1.295（§4.248）：绑定观察同步落身份列——信封落在 PNI 键行
+            // 而 sourceUuid 是裸 ACI 时，即使 ACI 键行尚不存在（折叠的
+            // canonical 缺席臂），PNI 行也立刻拿 ACI 面（serviceId 解析不
+            // 孤儿）；号码腿绑定同理补 e164 面。
+            self.store
+                .stamp_peer_identity_binding(&account.id, aci, &peer_key)?;
             if let Some(outcome) = self
                 .store
                 .merge_peer_identity(&account.id, aci, &peer_key)?
@@ -15357,7 +15376,25 @@ impl ConnectorService {
             if record.number.is_some() && record.aci != peer_key {
                 self.store
                     .upsert_peer_identity(&account.id, &record.aci, &peer_key)?;
+                self.store
+                    .stamp_peer_identity_binding(&account.id, &record.aci, &peer_key)?;
                 bindings_written.push((record.aci.clone(), peer_key.clone()));
+            }
+            // 契约 1.295（§4.248 · PNI 会话归并）：同记录携 aci+pni 即同人
+            // 证据（官方 maybeMergeContacts 三键的 pni 腿）。pni 不进
+            // peer_identities 桥（桥 PK 每账号每 ACI 一行，写 pni 会顶掉
+            // 号码腿）——材料落 conversations 身份列；绑定进折叠扫，把
+            // PNI 键会话行折进 ACI 键行。缺席/退化（等于 aci）零动作，
+            // 诚实降级（pre-1.295 行为零变化）。
+            if let Some(pni) = record
+                .pni
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && *value != record.aci)
+            {
+                self.store
+                    .stamp_peer_identity_binding(&account.id, &record.aci, pni)?;
+                bindings_written.push((record.aci.clone(), pni.to_string()));
             }
             let title = record
                 .name
@@ -23214,6 +23251,120 @@ mod tests {
     /// row (the member ACI — the author's protocol identity), and the
     /// backfill request for that landed group row names it verbatim. The
     /// row's `sender_id` ingest hash never appears in the prepared frame,
+    /// 标题回退的号码腿（对齐官方 getTitle 梯：e164 在掩码/unknown 之前）：
+    /// peer_name 缺席但信封带号码 → 标题落号码；对端本身是 E.164（sent
+    /// 转录 destination 阶梯的产物）→ 原样透出，绝不掩码；只有无号码的
+    /// 服务 id（PNI/裸 ACI）才落掩码占位，等身份梯解析后升级。
+    #[test]
+    fn direct_receive_titles_by_number_before_mask() {
+        let (_temp, mut service) = service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let base = |source: &str, source_number: Option<&str>, ts: u64| NormalizedReceive {
+            required_protocol_version: None,
+            timestamp: Some(ts),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some(source.into()),
+            source_uuid: None,
+            peer_name: None,
+            source_number: source_number.map(str::to_string),
+            group_id: None,
+            text: Some("hi".into()),
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+        };
+
+        // 1) ACI 键 + 信封带号码：标题 = 号码，不再掩码。
+        service
+            .ingest_receive(
+                base(
+                    "22222222-2222-4222-8222-222222222222",
+                    Some("+15555550101"),
+                    1_000,
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let aci_row = service
+            .store_ref()
+            .conversation_by_peer(
+                &account.id,
+                "direct",
+                "22222222-2222-4222-8222-222222222222",
+            )
+            .unwrap()
+            .expect("aci row");
+        assert_eq!(
+            service
+                .store_ref()
+                .conversation_title(&aci_row.id)
+                .expect("title read")
+                .unwrap_or_default(),
+            "+15555550101"
+        );
+
+        // 2) peer 本身是 E.164：原样，绝不掩码。
+        service
+            .ingest_receive(
+                base("+15555550109", None, 2_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let e164_row = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", "+15555550109")
+            .unwrap()
+            .expect("e164 row");
+        let e164_title = service
+            .store_ref()
+            .conversation_title(&e164_row.id)
+            .expect("title read")
+            .unwrap_or_default();
+        assert_eq!(e164_title, "+15555550109");
+        assert!(!e164_title.contains("***"));
+
+        // 3) PNI 服务 id 且无号码：掩码占位（身份梯解析后升级的语义不变）。
+        service
+            .ingest_receive(
+                base("PNI:33333333-3333-4333-8333-333333333333", None, 3_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let pni_row = service
+            .store_ref()
+            .conversation_by_peer(
+                &account.id,
+                "direct",
+                "PNI:33333333-3333-4333-8333-333333333333",
+            )
+            .unwrap()
+            .expect("pni row");
+        let pni_title = service
+            .store_ref()
+            .conversation_title(&pni_row.id)
+            .expect("title read")
+            .unwrap_or_default();
+        assert!(
+            pni_title.contains("***"),
+            "pni placeholder stays masked: {pni_title}"
+        );
+    }
+
     /// and the direct receive captures its peer identity the same way.
     #[test]
     fn group_receive_captures_the_member_aci_and_the_backfill_names_it() {
@@ -23233,6 +23384,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: Some(member_aci.to_string()),
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: Some("ZmFrZS1ncm91cA==".into()),
             text: Some("photo".into()),
             text_bytes: None,
@@ -25272,6 +25424,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: Some("Peer".into()),
+                    source_number: None,
                     group_id: None,
                     text: Some(full_text.clone()),
                     text_bytes: None,
@@ -25348,6 +25501,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some(oversized),
                     text_bytes: None,
@@ -28596,6 +28750,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("same text is not identity".into()),
             text_bytes: Some(25),
@@ -28739,6 +28894,7 @@ mod tests {
             source: Some(source.into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-one".into()),
             text: Some(text.into()),
             text_bytes: Some(text.len() as u32),
@@ -28815,6 +28971,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("林菲菲".into()),
+            source_number: None,
             group_id: Some("group-one".into()),
             text: Some("你好".into()),
             text_bytes: Some(6),
@@ -28924,6 +29081,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: Some("Peer".into()),
+                    source_number: None,
                     group_id: Some("group-one".into()),
                     text: Some("@you".into()),
                     text_bytes: Some(4),
@@ -29081,6 +29239,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: Some("hi".into()),
             text_bytes: Some(2),
@@ -29112,6 +29271,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: Some("group-one".into()),
             text: Some("hi".into()),
             text_bytes: Some(2),
@@ -29235,6 +29395,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("unstable identity".into()),
             text_bytes: Some(17),
@@ -29649,6 +29810,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("quoted text".into()),
                     text_bytes: Some(11),
@@ -29872,6 +30034,7 @@ mod tests {
                     source: Some("+15555550105".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: Some("group-one".into()),
                     text: Some("group text".into()),
                     text_bytes: Some(10),
@@ -30181,6 +30344,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("peer text".into()),
                     text_bytes: Some(9),
@@ -30310,6 +30474,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("peer text".into()),
                     text_bytes: Some(9),
@@ -30453,6 +30618,7 @@ mod tests {
                     source: Some("+15555550105".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: Some("group-one".into()),
                     text: Some("group text".into()),
                     text_bytes: Some(10),
@@ -31106,6 +31272,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("peer pin target".into()),
                     text_bytes: Some(15),
@@ -31260,6 +31427,7 @@ mod tests {
                     source: Some("+15555550105".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: Some("group-one".into()),
                     text: Some("group text".into()),
                     text_bytes: Some(10),
@@ -31448,6 +31616,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("peer pin target".into()),
                     text_bytes: Some(15),
@@ -32062,6 +32231,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: Some("Peer".into()),
+                    source_number: None,
                     group_id: None,
                     text: Some("hello".into()),
                     text_bytes: None,
@@ -35067,6 +35237,7 @@ mod tests {
             source: Some(MEMBER_E164.into()),
             source_uuid: Some(MEMBER_ACI.into()),
             peer_name: None,
+            source_number: None,
             group_id: Some(GROUP_MASTER.into()),
             text: Some("archived".into()),
             text_bytes: Some(8),
@@ -37189,6 +37360,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -37261,6 +37433,7 @@ mod tests {
                 source: source.map(str::to_string),
                 source_uuid: None,
                 peer_name: None,
+                source_number: None,
                 group_id: None,
                 text: None,
                 text_bytes: None,
@@ -38973,6 +39146,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -39003,6 +39177,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: Some("nice story".to_string()),
             text_bytes: Some(10),
@@ -39535,6 +39710,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("Z3JvdXAtYXV0aA".into()),
             text: Some("late group original".into()),
             text_bytes: Some(19),
@@ -39870,6 +40046,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -41248,6 +41425,7 @@ mod tests {
             source: Some(source.into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -42283,6 +42461,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: Some("hi".into()),
             text_bytes: None,
@@ -44758,6 +44937,8 @@ mod tests {
             crate::engine::SyncContactRecord {
                 aci: aci.to_string(),
                 number: number.map(str::to_string),
+                // 契约 1.295：该测试族不携 PNI 材料（缺席臂）。
+                pni: None,
                 name: name.map(str::to_string),
             }
         };
@@ -45144,6 +45325,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("to be deleted".into()),
             text_bytes: Some(13),
@@ -45213,6 +45395,7 @@ mod tests {
                 source: Some(source.into()),
                 source_uuid: None,
                 peer_name: None,
+                source_number: None,
                 group_id: Some("Z3JvdXAtYXV0aA".into()),
                 text: Some(format!("from {source}")),
                 text_bytes: None,
@@ -45338,6 +45521,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("stays".into()),
             text_bytes: Some(5),
@@ -45414,6 +45598,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("before edit".into()),
             text_bytes: Some(11),
@@ -45521,6 +45706,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -45681,6 +45867,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -45752,6 +45939,7 @@ mod tests {
             source: None,
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -45850,6 +46038,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -45940,6 +46129,7 @@ mod tests {
             source: None,
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -46038,6 +46228,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -46122,6 +46313,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("plain text".into()),
             text_bytes: Some(10),
@@ -46206,6 +46398,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("late original".into()),
             text_bytes: Some(13),
@@ -46296,6 +46489,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("original body".into()),
             text_bytes: Some(13),
@@ -46383,6 +46577,7 @@ mod tests {
                 source: Some(source.into()),
                 source_uuid: None,
                 peer_name: None,
+                source_number: None,
                 group_id: Some("Z3JvdXAtYnVmZmVy".into()),
                 text: Some(format!("from {source}")),
                 text_bytes: None,
@@ -46613,6 +46808,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("incoming stays".into()),
                     text_bytes: Some(14),
@@ -47130,6 +47326,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("transcript body".into()),
                     text_bytes: Some(15),
@@ -47196,6 +47393,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("v0".into()),
             text_bytes: Some(2),
@@ -47344,6 +47542,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("peer says".into()),
             text_bytes: Some(9),
@@ -47392,6 +47591,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("replying with a file".into()),
             text_bytes: Some(20),
@@ -47519,6 +47719,7 @@ mod tests {
                 source: source.map(str::to_string),
                 source_uuid: source_uuid.map(str::to_string),
                 peer_name: peer_name.map(str::to_string),
+                source_number: None,
                 group_id: None,
                 text: Some(text.into()),
                 text_bytes: Some(text.len() as u32),
@@ -47702,6 +47903,7 @@ mod tests {
                 source: source.map(str::to_string),
                 source_uuid: source_uuid.map(str::to_string),
                 peer_name: peer_name.map(str::to_string),
+                source_number: None,
                 group_id: None,
                 text: Some(text.into()),
                 text_bytes: Some(text.len() as u32),
@@ -47753,6 +47955,7 @@ mod tests {
                     aci: PEER_ACI.into(),
                     number: Some(peer_number.into()),
                     name: Some("Sync Peer".into()),
+                    pni: None,
                 }],
                 false,
             )
@@ -47825,6 +48028,448 @@ mod tests {
         assert_eq!(folded.title, "333***33");
     }
 
+    /// 契约 1.295（§4.248 · PNI 会话归并），同步 seam：`apply_sync_contacts`
+    /// 的绑定扫折并 PNI 键会话行——同记录携 aci+pni 即同人证据（官方
+    /// maybeMergeContacts 三键的 pni 腿）。消息/未读承载、无重复行、A5 提示
+    /// 行的官方无号码臂（PNI 不是号码，提示以壳行标题称呼、number 键缺席），
+    /// 台账行落 (account, PNI 键)；重放同批零二次折并（幂等）。
+    #[test]
+    fn sync_contacts_folds_the_discovered_pni_row_into_the_aci_row() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        const PEER_ACI: &str = "44444444-4444-4444-8444-444444444444";
+        const PEER_PNI: &str = "PNI:55555555-5555-4555-8555-555555555555";
+        let receive = |source: Option<&str>,
+                       source_uuid: Option<&str>,
+                       text: &str,
+                       peer_name: Option<&str>,
+                       ts: u64| {
+            NormalizedReceive {
+                required_protocol_version: None,
+                timestamp: Some(ts),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: source.map(str::to_string),
+                source_uuid: source_uuid.map(str::to_string),
+                peer_name: peer_name.map(str::to_string),
+                source_number: None,
+                group_id: None,
+                text: Some(text.into()),
+                text_bytes: Some(text.len() as u32),
+                text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                control: None,
+                server_guid: None,
+                reporting_token: None,
+                server_timestamp: None,
+            }
+        };
+        // ACI 键在用行（sealed-sender 世界：engine 只投影 sourceUuid）。
+        service
+            .ingest_receive(
+                receive(Some(PEER_ACI), Some(PEER_ACI), "live hello", None, 1_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        // PNI 键行（engine 把 PNI 目的地投影为 PNI: 前缀键），带真名标题。
+        service
+            .ingest_receive(
+                receive(Some(PEER_PNI), None, "pni hello", Some("Pni Peer"), 2_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let pni_row = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", PEER_PNI)
+            .unwrap()
+            .expect("the PNI-keyed row exists pre-fold");
+        let live = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", PEER_ACI)
+            .unwrap()
+            .expect("the ACI-keyed row exists pre-fold");
+        assert_ne!(pni_row.id, live.id);
+        // 折前：PNI 行的未读由收路递增。
+        let pre = service
+            .store_ref()
+            .conversation_summary(&account.id, &pni_row.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pre.unread_count, 1);
+
+        let account_row = service
+            .store_ref()
+            .account_by_id(&account.id)
+            .unwrap()
+            .expect("the synced account row");
+        let record = crate::engine::SyncContactRecord {
+            aci: PEER_ACI.into(),
+            number: None,
+            pni: Some(PEER_PNI.into()),
+            name: Some("Sync Pni Peer".into()),
+        };
+        let events = service
+            .apply_sync_contacts(&account_row, std::slice::from_ref(&record), false)
+            .unwrap();
+
+        let merged = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationMerged {
+                    from_conversation_id,
+                    to_conversation,
+                    ..
+                } => Some((from_conversation_id, to_conversation)),
+                _ => None,
+            })
+            .expect("the PNI row folds into the ACI row");
+        assert_eq!(merged.0, &pni_row.id);
+        assert_eq!(merged.1.id, live.id);
+        // A5 提示行：双侧都有消息、壳行标题有用 → 铸行；PNI 不是号码
+        //（官方 getNumber 无号码臂）——number 键缺席，标题键承载显示材料。
+        let notice = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) if record.direction == "system" => {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("the notice rides its own upserted frame");
+        let merge_face = notice
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.conversation_merge.as_ref())
+            .expect("the notice carries the conversationMerge face");
+        assert_eq!(
+            merge_face.obsolete_conversation_title.as_deref(),
+            Some("Pni Peer")
+        );
+        assert_eq!(merge_face.obsolete_conversation_number, None);
+
+        let store = service.store_ref();
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", PEER_PNI)
+                .unwrap()
+                .is_none(),
+            "the PNI-keyed row is retired"
+        );
+        // 承载：两行种子 + 折并提示行，无重复（pni hello 恰一次）。
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![live.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+        let pni_texts: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE body = 'pni hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pni_texts, 1, "no duplicate rows survive the fold");
+        // 未读承载：读水位重算，未读徽章守恒（两条 incoming，提示行不计）。
+        let folded = store
+            .conversation_summary(&account.id, &live.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(folded.unread_count, 2);
+        // 备注键锚点：幸存行以 ACI 暴露 serviceId（桌面 signalRemarkKeyFor），
+        // pni 成为会话属性字段（官方 updatePni 词形，additive 键）。
+        assert_eq!(folded.service_id.as_deref(), Some(PEER_ACI));
+        assert_eq!(folded.pni.as_deref(), Some(PEER_PNI));
+        // 台账：PNI 键折叠快照在册（回滚面）。
+        let ledger: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_identity_merges
+                  WHERE account_id=?1 AND obsolete_peer_key=?2",
+                params![account.id, PEER_PNI],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ledger, 1);
+
+        // 幂等重放：同批证据再来，不再并第二次（无 merge/notice 帧，行集不变）。
+        let replay = service
+            .apply_sync_contacts(&account_row, std::slice::from_ref(&record), false)
+            .unwrap();
+        assert!(
+            replay
+                .iter()
+                .all(|event| !matches!(event, HostSideEvent::ConversationMerged { .. })),
+            "repeated evidence never merges twice"
+        );
+        assert!(
+            replay
+                .iter()
+                .all(|event| !matches!(event, HostSideEvent::MessageUpserted(record) if record.direction == "system")),
+        );
+        let count_after: i64 = service
+            .store_ref()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![live.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after, 3, "replay folds nothing a second time");
+    }
+
+    /// 契约 1.295（§4.248），收路 seam：信封落在 PNI 键行而 sourceUuid 是
+    /// 裸 ACI——绑定臂当场折并（1.259 同路径同帧），落地行重挂 canonical
+    /// 会话 id；绑定盖章先行，PNI 行即使折叠 canonical 缺席也拿 ACI 面。
+    #[test]
+    fn ingest_receive_folds_the_discovered_pni_row_and_reroutes_the_landed_row() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        const PEER_ACI: &str = "66666666-6666-4666-8666-666666666666";
+        const PEER_PNI: &str = "PNI:77777777-7777-4777-8777-777777777777";
+        let receive = |source: Option<&str>, source_uuid: Option<&str>, text: &str, ts: u64| {
+            NormalizedReceive {
+                required_protocol_version: None,
+                timestamp: Some(ts),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: source.map(str::to_string),
+                source_uuid: source_uuid.map(str::to_string),
+                peer_name: Some("Pni Peer".into()),
+                source_number: None,
+                group_id: None,
+                text: Some(text.into()),
+                text_bytes: Some(text.len() as u32),
+                text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                control: None,
+                server_guid: None,
+                reporting_token: None,
+                server_timestamp: None,
+            }
+        };
+        service
+            .ingest_receive(
+                receive(Some(PEER_PNI), None, "pni hello", 1_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        service
+            .ingest_receive(
+                receive(Some(PEER_ACI), Some(PEER_ACI), "live hello", 2_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let pni_row = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", PEER_PNI)
+            .unwrap()
+            .expect("the PNI-keyed row exists pre-fold");
+        let live = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", PEER_ACI)
+            .unwrap()
+            .expect("the ACI-keyed row exists pre-fold");
+
+        let events = service
+            .ingest_receive(
+                receive(Some(PEER_PNI), Some(PEER_ACI), "fold hello", 3_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+
+        let landed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record)
+                    if record.text.as_deref() == Some("fold hello") =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("the landed row upserts");
+        assert_eq!(
+            landed.conversation_id, live.id,
+            "the landed row re-keys with its conversation",
+        );
+        let merged = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationMerged {
+                    from_conversation_id,
+                    ..
+                } => Some(from_conversation_id.clone()),
+                _ => None,
+            })
+            .expect("the merged frame rides");
+        assert_eq!(merged, pni_row.id);
+        let store = service.store_ref();
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", PEER_PNI)
+                .unwrap()
+                .is_none()
+        );
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![live.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // 两行种子 + 折并落地行 + 提示行（壳标题 "Pni Peer" 有用，双侧有消息）。
+        assert_eq!(count, 4);
+    }
+
+    /// 契约 1.295（§4.248），诚实降级臂：引擎未投影 pni（字段缺席/退化），
+    /// 双行证据永不出现——不折并、无 merge 帧、两行原样并存。
+    #[test]
+    fn sync_contacts_without_pni_material_leaves_the_double_row_untouched() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        const PEER_ACI: &str = "88888888-8888-4888-8888-888888888888";
+        const PEER_PNI: &str = "PNI:99999999-9999-4999-8999-999999999999";
+        let receive =
+            |source: Option<&str>, source_uuid: Option<&str>, text: &str| NormalizedReceive {
+                required_protocol_version: None,
+                timestamp: Some(1_000),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: source.map(str::to_string),
+                source_uuid: source_uuid.map(str::to_string),
+                peer_name: None,
+                source_number: None,
+                group_id: None,
+                text: Some(text.into()),
+                text_bytes: Some(text.len() as u32),
+                text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                control: None,
+                server_guid: None,
+                reporting_token: None,
+                server_timestamp: None,
+            };
+        service
+            .ingest_receive(
+                receive(Some(PEER_ACI), Some(PEER_ACI), "live hello"),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        service
+            .ingest_receive(
+                receive(Some(PEER_PNI), None, "pni hello"),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let account_row = service
+            .store_ref()
+            .account_by_id(&account.id)
+            .unwrap()
+            .expect("the synced account row");
+        // pni 缺席（引擎未投影）+ 号码也缺席：零绑定、零折并。
+        let events = service
+            .apply_sync_contacts(
+                &account_row,
+                &[crate::engine::SyncContactRecord {
+                    aci: PEER_ACI.into(),
+                    number: None,
+                    pni: None,
+                    name: Some("No Pni Peer".into()),
+                }],
+                false,
+            )
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, HostSideEvent::ConversationMerged { .. })),
+            "no pni material, no fold"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, HostSideEvent::MessageUpserted(record) if record.direction == "system")),
+        );
+        let store = service.store_ref();
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", PEER_PNI)
+                .unwrap()
+                .is_some(),
+            "the PNI-keyed row stays (honest degradation)"
+        );
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", PEER_ACI)
+                .unwrap()
+                .is_some()
+        );
+        // 退化 pni == aci 同判：材料不构成同人证据。
+        let degenerate = service
+            .apply_sync_contacts(
+                &account_row,
+                &[crate::engine::SyncContactRecord {
+                    aci: PEER_ACI.into(),
+                    number: None,
+                    pni: Some(PEER_ACI.into()),
+                    name: Some("Degenerate".into()),
+                }],
+                false,
+            )
+            .unwrap();
+        assert!(
+            degenerate
+                .iter()
+                .all(|event| !matches!(event, HostSideEvent::ConversationMerged { .. }))
+        );
+    }
+
     /// The engine's P14 metadata faces (contract 1.107, §4.88) ride the
     /// message end to end: the descriptor's caption/blurHash/integrity
     /// pair/flag booleans and the rich `expireTimerVersion`/preview date
@@ -47844,6 +48489,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("with media".into()),
             text_bytes: Some(10),
@@ -47983,6 +48629,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("body".into()),
             text_bytes: Some(4),
@@ -48076,6 +48723,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("quoting you".into()),
             text_bytes: Some(11),
@@ -48155,6 +48803,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("from the phone".into()),
             text_bytes: Some(14),
@@ -49208,6 +49857,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: Some("已更新消息定时消失：86400 秒".into()),
             text_bytes: None,
@@ -50711,6 +51361,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: Some("group-id-1".into()),
             text: Some("群聊信息已更新".into()),
             text_bytes: None,
@@ -50863,6 +51514,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-id-1".into()),
             text: None,
             text_bytes: None,
@@ -51039,6 +51691,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-id-1".into()),
             text: None,
             text_bytes: None,
@@ -51255,6 +51908,7 @@ mod tests {
                     reporting_token: None,
                     server_timestamp: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: Some("dW5rbm93bi1ncm91cA==".into()),
                     text: None,
                     text_bytes: None,
@@ -51319,6 +51973,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -51524,6 +52179,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -51935,6 +52591,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -52095,6 +52752,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,

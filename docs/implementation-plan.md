@@ -96,6 +96,13 @@
   `width`/`height`。无两键的旧 payload 逐字节不变；两键在 data URI 既有参数面之后
   纯附加，不改任何既有键名语义。`ENGINE_CONTRACT_MAX_REVISION` 保持 1.286（引擎
   参数面零新增方法：data URI 参数是既有附件形状的附加参数）。)
+- Contract revision: 1.295 (2026-11-21; §4.286 PNI 会话归并腿：conversations
+  summary 行新增 additive `pni` 身份键（Storage Service ContactRecord 归一
+  "PNI:<uuid>"，engine sync contacts 投影随动）；`conversations` 三身份列
+  （无锁加列 + 幂等回填）+ `merge_peer_identity` 单事务折并（aci/e164 首钉、
+  pni 新者胜、`aci==peer_key` 零动作），壳行折叠后 merge 事件帧不变
+  （§4.135/1.259）；A5 提示行 PNI 壳走官方无号码臂（号码键缺席）。完整批
+  记录见 §4.286（本文档末尾附录段）。Tests 1441 → 1442 (lib +1)。)
 - Login-window sync projection (2026-11-12, wire additive, engine-compat —
   §4.281 `accounts.getSyncState`; no new contract revision number is claimed here: the
   engine's shared revision constant is still 1.285 and the next bump belongs to the
@@ -22031,3 +22038,101 @@ GIF 旗标/语音元数据同款「指针后置位」写 `AttachmentPointer.widt
 type、不做任何解码；文件/语音/贴纸/预览图/长文本附件不声明尺寸（无自然像素尺寸，
 官方同判）。预加载/持久面（`messages.setAttachmentDimensions`）保持不变，仍是
 "引擎没有声明时的桌面测量"兜底入口。
+
+## §4.285 直聊标题号码腿（title 回退的 E.164 级 · 契约 1.219 后续批）
+
+**症状**：手机按号码新加好友并从手机端发首条消息，桌面 linked 会话标题落
+「PNI***e2」样式的掩码串（用户读作"PIN 码"）。
+
+**根因（两级）**：ingest 标题回退链只有两级——envelope sourceName →
+mask_address(peer)。sent 转录的 destination 阶梯产物若为 PNI 服务 id
+（destinationE164 未随行），或 receive 信封只带 sourceNumber 不带
+sourceName，mask 就成了标题；而 mask_address 的设计用途是**日志脱敏**
+（ids.rs 测试名自证 without_logging_full_number），官方 getTitle 梯
+（profile → system → e164 → …）从不把掩码当标题。
+
+**修复（回退链内插号码腿，三处）**：
+
+1. NormalizedReceive 增补 source_number（receive: envelope.sourceNumber；
+   sent: destination 阶梯的 E.164 形 peer 原样），归一化捕获、有界
+   （MAX_RECEIVE_ID_CHARS），#[serde(skip)] 零 wire 变化。
+2. ingest 标题链变为：peer_name → source_number → peer 本身为 E.164
+   （+ 开头原样透出）→ mask_address（最后兜底，仅服务 id 无号码时）。
+3. title_should_upgrade 增补：**纯 E.164 标题视为占位可升级**（同掩码
+   语义）——号码是官方梯的 fallback 不是终态，contacts/profile 名到达
+   后照升（phase2 回归：ingest 落号码，同步名 "Alice Example" 随后升级）。
+
+**测试**：engine 归一化捕获（sourceNumber 逐字 + uuid 键不变）；
+service 三态（ACI+号码→号码 / E.164 peer→原样不掩码 / PNI 无号码→掩码
+保留）；server_integration phase2 回归绿。
+
+**遗留（下一批 §PNI 归并）**：PNI 键会话与 ACI 键会话的归并（对齐官方
+maybeMergeContacts 三键索引 serviceId/e164/pni）、engine
+SyncContactRecord 补 pni 投影、归并时备注键（serviceId）迁移。
+
+## §4.286 PNI 会话归并（对齐官方 maybeMergeContacts 三键 · 契约 1.295）
+
+**症状**：PNI 注册期联系人（手机按号码新加、对端 ACI 尚未广播）在桌面拆成
+两个会话——一条 ACI 键行（sealed-sender 收路建）+ 一条 `PNI:<uuid>` 键行
+（engine 把 PNI 目的地投影为前缀键）。消息历史、未读、置顶分裂两处；PNI 行
+的标识面全缺席（serviceId/e164 解析不出），桌面备注/语种锚（signalRemarkKeyFor
+= 会话 serviceId(ACI)）挂在半边或孤儿；标题落掩码串（§4.247 已修标题腿，
+行仍双份）。
+
+**根因**：connector 的会话寻址只有单键（peer_key），身份归并材料（同人多键
+证据）没有数据面——1.259（§4.243）的双行折并只认「号码壳 × ACI 行」一对，
+PNI 键行不在其发现范围；engine 的联系人同步投影（SyncContactRecord）也只
+带 aci/number，第三键 pni 从未到达 connector。
+
+**官方锚（Signal-Desktop v8.39.0-alpha.1，只读）**：
+- ConversationController.preload.ts:733 maybeMergeContacts：会话按**三键**
+  （serviceId(ACI)/e164/pni）索引，任一身份材料到达即找全部部分匹配行 →
+  归并为一条（ACI 为主键词形）；
+- models/conversations.preload.ts:2322 updatePni：PNI 合并后**只是会话属性
+  字段**——官方从不把掩码/PNI 当标题或号码展示。
+
+**实现（四件，全部 additive）**：
+
+1. **数据面**：conversations 加三列 `identity_aci/identity_e164/identity_pni`
+   （纯加列走 ensure_additive_columns 无条件幂等补齐，不靠版本号门控——
+   2026-10-20 事故纪律）+ 两个部分索引（POST_MIGRATION 层，老库列就绪后建）。
+   存量回填 `backfill_conversation_identity_columns` 每次开库无条件跑、
+   逐列 IS NULL 闸幂等：形状遍（PNI:/裸 ACI UUID/±E164）+ §4.190 身份梯遍
+   （peer_identities 桥两向补齐；同 peer_key 多 ACI 歧义不回填，宁缺勿错）。
+   新行在 ensure_conversation 插入时随建随落（同一解析器）。
+2. **归并机制**：复用 1.259 `Store::merge_peer_identity` 路径与事件帧
+   （§4.245 先例），只扩发现面——壳/canonical 探针在 peer_key 两拼法之后
+   加身份列兜底（identity_pni/identity_e164/identity_aci，官方部分匹配腿）；
+   折并时 canonical 行 COALESCE 吸收壳行三键身份面（官方 updatePni 词形：
+   归并后 PNI 只是会话属性）；台账快照记录身份面。两个触发 seam：
+   contacts 同步（apply_sync_contacts：同记录携 aci+pni 即同人证据，绑定进
+   折叠扫；pni 不进 peer_identities 桥——桥 PK 每账号每 ACI 一行，写 pni
+   会顶掉号码腿，材料住身份列）与 ingest（1.259 绑定臂原样覆盖：信封落
+   PNI 键行 + sourceUuid 裸 ACI 即折）。盖章面
+   `stamp_peer_identity_binding`：aci/e164 首次钉住、pni 新者胜（对端换号
+   重注册拿新 PNI，官方 updatePni 同语义）。
+3. **投影面**：SyncContactRecord 增 pni（engine 侧投影，trim/非空/
+   MAX_RECEIVE_ID_CHARS 有界；另一代理并行补引擎下发，本批消费面按
+   「缺席=不触发、诚实降级」实现）；summary 的 pni 腿启用（预留位转正）：
+   PNI 形键行投影自己的键，其余行从 identity_pni 投影。
+4. **备注键**：桌面 signalRemarkKeyFor = 会话 serviceId(ACI)。归并后幸存行
+   以 ACI 为键暴露 serviceId（canonical=ACI 键行）；折前 PNI 行经盖章/回填
+   拿 identity_aci → serviceId 解析为 ACI——**备注/语种锚跨折并稳定，不
+   孤儿、不双份**。
+
+**wire**：summary 增量键 pni（材料未到=缺席，pre-1.295 主机逐字节不变）；
+A5 合并提示行对 PNI 壳走官方无号码臂（obsoleteConversationNumber 缺席，
+标题键承载显示材料——PNI 绝不当号码/标题）；`conversation.merged`/
+`conversation.changed` 事件面照旧（§4.135/1.259 帧不变）。既有键语义
+零变化。
+
+**测试**：同步 seam PNI 折并（消息/未读承载、无重复行、提示行无号码臂、
+台账行、幂等重放零二次折并）；ingest seam PNI 折并（落地行重挂 canonical、
+绑定盖章先行）；无 pni 材料 + 退化（pni==aci）零行为变化（双行并存、无
+merge 帧）；存量回填幂等（形状/桥/歧义/群行/二次重开零变化 + summary
+pni/serviceId 投影）。
+
+**边界（诚实降级）**：engine 未投影 pni（字段缺席）→ 归永不触发，行为与
+1.294 逐字节一致；歧义桥材料不回填；canonical 行缺席（PNI-only 认识）→
+不折，PNI 行独立存在并尽力升格 ACI 面；号码壳折并路径（1.259）逐字节
+不变（探针兜底只在原探空后介入，号码词形/提示文案同形）。

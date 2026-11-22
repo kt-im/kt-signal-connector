@@ -15171,6 +15171,7 @@ mod tests {
                 source: Some("+15555550101".into()),
                 source_uuid: None,
                 peer_name: Some("Peer".into()),
+                source_number: None,
                 group_id: None,
                 text: Some("persist me".into()),
                 text_bytes: Some(10),
