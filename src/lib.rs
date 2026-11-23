@@ -68,7 +68,10 @@ pub const PHASE2_CAPABILITIES: &[&str] = &methods::METHOD_NAMES;
 pub fn advertised_capabilities(media_ingest: bool) -> Vec<&'static str> {
     let mut capabilities = [&methods::METHOD_NAMES[..], methods::FEATURE_CAPABILITIES].concat();
     if !media_ingest {
-        capabilities.retain(|capability| *capability != methods::ATTACHMENT_DOWNLOAD_CAPABILITY);
+        capabilities.retain(|capability| {
+            *capability != methods::ATTACHMENT_DOWNLOAD_CAPABILITY
+                && *capability != methods::ATTACHMENT_UPLOAD_STREAM_CAPABILITY
+        });
     }
     capabilities
 }

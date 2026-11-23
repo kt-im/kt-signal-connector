@@ -22245,3 +22245,25 @@ v50 原行不回填、不臆造。旧行或 pointer 缺失保持 INVALID_REQUEST
 公开形状隔离、普通/quote 寻址互斥、错误 locator、重复合并、重启下载与 viewOnce
 清理；无新 engine 方法，Engine 契约版本不变。
 
+## 4.290 大文件分块出站与 file URI（Contract 1.299）
+
+`attachments.upload.begin/write/abort` 提供 connector-owned 单文件暂存，单 chunk
+解码后 1..=262144 字节、严格顺序 offset、账号绑定、声明大小帽 100 MiB；活跃
+session 最多 8 个、15 分钟过期。`messages.attachments.sendStaged` 只在完整写入后
+进入既有 prepare/dispatch/settlement 链，旧 `messages.attachments.send` 的 Base64
+形状不变。
+
+暂存路径由 `accountId + clientRequestId + attachment[0]` 的 descriptor id 决定，
+拒绝任意调用方路径和覆盖。上行 `send` 的 attachments 条目改为内部
+`file:<percent-path>;contentType=<mime>;sizeBytes=<n>[;filename=...]` URI，整文件
+Base64 不进 JSON；Engine 校验文件形状/大小后读取并继续调用原 upload 原语。
+pending descriptor、payload 表、同 clientRequestId 幂等、失败 ids-only retry 与
+viewOnce/voice/caption/blurHash/尺寸闸全部复用旧实现。file URI retry 只读取路径与
+metadata，不解码整文件。媒体未开启时能力 `attachment-upload-stream` 不广告。
+
+TTL/abort 清理未完成文件；重启或过期后的无行无 payload 废弃文件可重开，
+已有 message/payload 的路径永不覆盖。验证覆盖顺序/跨账号/超帽 chunk、真实文件
+内容、file URI、pending descriptor、重试载荷恢复、TTL/重启恢复和旧 Base64 回归；
+真实 CDN/Windows 实机另列验收。2026-11-23 独立审计发现过期/重启孤儿文件会撞
+`create_new`，已按活跃/持久化/废弃三态修复并复审为 0 must/0 should。
+

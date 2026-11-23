@@ -6011,6 +6011,102 @@ impl RuntimeSupervisor {
         self.dispatch_prepared(&engine, prepared).await
     }
 
+    pub async fn begin_attachment_upload(
+        &self,
+        account_id: String,
+        client_request_id: String,
+        size_bytes: u64,
+    ) -> Result<crate::service::AttachmentUploadBegin, ServiceError> {
+        self.service.lock().await.begin_attachment_upload(
+            &account_id,
+            &client_request_id,
+            size_bytes,
+        )
+    }
+
+    pub async fn write_attachment_upload_chunk(
+        &self,
+        account_id: String,
+        upload_id: String,
+        offset: u64,
+        data_base64: String,
+    ) -> Result<crate::service::AttachmentUploadWrite, ServiceError> {
+        self.service.lock().await.write_attachment_upload_chunk(
+            &account_id,
+            &upload_id,
+            offset,
+            &data_base64,
+        )
+    }
+
+    pub async fn abort_attachment_upload(
+        &self,
+        account_id: String,
+        upload_id: String,
+    ) -> Result<bool, ServiceError> {
+        self.service
+            .lock()
+            .await
+            .abort_attachment_upload(&account_id, &upload_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_attachment_staged(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        upload_id: String,
+        size_bytes: u64,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<String>,
+    ) -> Result<MessageRecord, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let mut service = self.service.lock().await;
+            let attachment_target = match &target {
+                SendTarget::Conversation(conversation_id) => {
+                    AttachmentSendTarget::Conversation(conversation_id)
+                }
+                SendTarget::Peer {
+                    kind,
+                    peer_key,
+                    peer_title,
+                } => AttachmentSendTarget::Peer(PeerTarget {
+                    kind,
+                    peer_key,
+                    peer_title: peer_title.as_deref(),
+                }),
+            };
+            service.prepare_send_attachment_staged(
+                &account_id,
+                &attachment_target,
+                &client_request_id,
+                &upload_id,
+                size_bytes,
+                filename.as_deref(),
+                content_type.as_deref(),
+                text.as_deref(),
+                quote_message_id.as_deref(),
+                voice_note,
+                view_once,
+                blur_hash.as_deref(),
+                gif,
+                dimensions,
+                attachment_caption.as_deref(),
+            )?
+        };
+        self.dispatch_prepared(&engine, prepared).await
+    }
+
     /// Retry one definitively-failed outgoing attachment in place (contract
     /// revision 1.278, §4.262; bytes optional = 1.279, §4.263; plural rebuild =
     /// 1.280, §4.264): the §4.12 settlement path unchanged — local rearm + face

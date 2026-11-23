@@ -141,6 +141,10 @@
             "messages.sendText",
             "messages.retryText",
             "messages.attachments.send",
+            "messages.attachments.sendStaged",
+            "attachments.upload.begin",
+            "attachments.upload.write",
+            "attachments.upload.abort",
             "messages.attachments.retry",
             "messages.sendSticker",
             "messages.sendContact",
@@ -1341,6 +1345,74 @@
             "properties": {
               "params": {
                 "$ref": "#/$defs/messagesRetryTextParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "messages.attachments.sendStaged"
+              }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/messagesSendStagedAttachmentParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "attachments.upload.begin"
+              }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/attachmentUploadBeginParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "attachments.upload.write"
+              }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/attachmentUploadWriteParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "attachments.upload.abort"
+              }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/attachmentUploadAbortParams"
               }
             }
           }
@@ -4426,6 +4498,68 @@
           "maximum": 16384,
           "description": "Optional declared height (contract revision 1.294, §4.284 BUG-11 wire 批): the sender's measured pixel height. Pairs with width (both keys or neither, 1..16384); paired values ride the upstream data URI as ';width=<px>;height=<px>' and are recorded on the pending descriptor so the sender's own bubble renders the terminal box from the first tick."
         }
+      }
+    },
+    "attachmentUploadBeginParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "clientRequestId", "sizeBytes"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "clientRequestId": { "$ref": "#/$defs/opaqueId" },
+        "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 104857600 }
+      }
+    },
+    "attachmentUploadWriteParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "uploadId", "offset", "dataBase64"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "uploadId": { "$ref": "#/$defs/opaqueId" },
+        "offset": { "type": "integer", "minimum": 0 },
+        "dataBase64": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 349528,
+          "pattern": "^[A-Za-z0-9+/]+={0,2}$"
+        }
+      }
+    },
+    "attachmentUploadAbortParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "uploadId"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "uploadId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesSendStagedAttachmentParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "clientRequestId", "uploadId", "sizeBytes"],
+      "description": "Contract 1.299: send a fully-written connector-owned upload. Only bounded chunks cross the host; the upstream send carries a file URI, never a whole-file base64 payload.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "kind": { "type": "string", "enum": ["contact", "direct", "group"] },
+        "peerKey": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "peerTitle": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "clientRequestId": { "$ref": "#/$defs/opaqueId" },
+        "uploadId": { "$ref": "#/$defs/opaqueId" },
+        "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 104857600 },
+        "filename": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "contentType": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "quoteMessageId": { "$ref": "#/$defs/opaqueId" },
+        "voiceNote": { "type": "boolean", "default": false },
+        "viewOnce": { "type": "boolean", "default": false },
+        "blurHash": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "attachmentCaption": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "gif": { "type": "boolean", "default": false },
+        "width": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 16384 }
       }
     },
     "messagesSendAttachmentParams": {
@@ -9692,6 +9826,7 @@
             "AUTHENTICATION_FAILED",
             "METHOD_NOT_ALLOWED",
             "CAPABILITY_UNAVAILABLE",
+            "RESOURCE_EXHAUSTED",
             "RUNTIME_ALREADY_RUNNING",
             "RUNTIME_NOT_RUNNING",
             "RUNTIME_START_FAILED",

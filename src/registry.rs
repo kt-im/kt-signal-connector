@@ -2754,6 +2754,83 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    pub async fn begin_attachment_upload(
+        &self,
+        account_id: String,
+        client_request_id: String,
+        size_bytes: u64,
+    ) -> Result<crate::service::AttachmentUploadBegin, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .begin_attachment_upload(account_id, client_request_id, size_bytes)
+            .await
+    }
+
+    pub async fn write_attachment_upload_chunk(
+        &self,
+        account_id: String,
+        upload_id: String,
+        offset: u64,
+        data_base64: String,
+    ) -> Result<crate::service::AttachmentUploadWrite, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .write_attachment_upload_chunk(account_id, upload_id, offset, data_base64)
+            .await
+    }
+
+    pub async fn abort_attachment_upload(
+        &self,
+        account_id: String,
+        upload_id: String,
+    ) -> Result<bool, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .abort_attachment_upload(account_id, upload_id)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_attachment_staged(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        upload_id: String,
+        size_bytes: u64,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<String>,
+    ) -> Result<MessageRecord, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .send_attachment_staged(
+                account_id,
+                target,
+                client_request_id,
+                upload_id,
+                size_bytes,
+                filename,
+                content_type,
+                text,
+                quote_message_id,
+                voice_note,
+                view_once,
+                blur_hash,
+                gif,
+                dimensions,
+                attachment_caption,
+            )
+            .await
+    }
+
     /// Retry one definitively-failed outgoing attachment in place (contract
     /// revision 1.278, §4.262; bytes optional = 1.279, §4.263; plural rebuild =
     /// 1.280, §4.264): routed through the account's own proxy-group slot exactly

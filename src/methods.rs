@@ -114,6 +114,10 @@ pub const METHODS: &[MethodRow] = &[
     // send-lane, upstream traffic — the same class as the original send.
     ("messages.retryText", Lane::Send, true, "send"),
     ("messages.attachments.send", Lane::Send, true, "send"),
+    ("messages.attachments.sendStaged", Lane::Send, true, "send"),
+    ("attachments.upload.begin", Lane::Send, true, "send"),
+    ("attachments.upload.write", Lane::Send, true, "send"),
+    ("attachments.upload.abort", Lane::Send, true, "send"),
     // In-place attachment retry (contract 1.278, §4.262; dataBase64/sizeBytes
     // optional = 1.279, §4.263; plural payload rebuild = 1.280, §4.264):
     // mutating, send-lane upstream traffic — the same class as the original
@@ -790,6 +794,7 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// metadata-only — the honest unavailable path — instead of calling a face
 /// that answers `CAPABILITY_UNAVAILABLE` for every download.
 pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
+pub const ATTACHMENT_UPLOAD_STREAM_CAPABILITY: &str = "attachment-upload-stream";
 
 /// Feature capability tags that ride the handshake `capabilities` array
 /// beyond the method-name list (contract revision 1.34): `send-receipts`
@@ -1050,6 +1055,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "group-join-approve",
     "group-invite-revoke",
     ATTACHMENT_DOWNLOAD_CAPABILITY,
+    ATTACHMENT_UPLOAD_STREAM_CAPABILITY,
     "message-adjacent-media",
     "username",
     "message-requests",
@@ -1144,6 +1150,10 @@ mod tests {
             "accounts.unlinkDevice",
             "messages.retryText",
             "messages.attachments.send",
+            "messages.attachments.sendStaged",
+            "attachments.upload.begin",
+            "attachments.upload.write",
+            "attachments.upload.abort",
             "messages.attachments.retry",
             "messages.sendSticker",
             "messages.sendContact",
@@ -1219,6 +1229,10 @@ mod tests {
             "accounts.updateConfiguration",
             "messages.retryText",
             "messages.attachments.send",
+            "messages.attachments.sendStaged",
+            "attachments.upload.begin",
+            "attachments.upload.write",
+            "attachments.upload.abort",
             "messages.attachments.retry",
             "messages.sendSticker",
             "messages.sendContact",
@@ -1358,6 +1372,10 @@ mod tests {
             !unarmed.contains(&ATTACHMENT_DOWNLOAD_CAPABILITY),
             "an unarmed runtime must not advertise attachment-download: {unarmed:?}"
         );
+        assert!(
+            !unarmed.contains(&ATTACHMENT_UPLOAD_STREAM_CAPABILITY),
+            "an unarmed runtime must not advertise attachment-upload-stream: {unarmed:?}"
+        );
         let armed = crate::advertised_capabilities(true);
         assert!(
             armed.contains(&ATTACHMENT_DOWNLOAD_CAPABILITY),
@@ -1369,7 +1387,10 @@ mod tests {
         let without_tag: Vec<_> = armed
             .iter()
             .copied()
-            .filter(|capability| *capability != ATTACHMENT_DOWNLOAD_CAPABILITY)
+            .filter(|capability| {
+                *capability != ATTACHMENT_DOWNLOAD_CAPABILITY
+                    && *capability != ATTACHMENT_UPLOAD_STREAM_CAPABILITY
+            })
             .collect();
         assert_eq!(unarmed, without_tag);
     }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2045,6 +2046,19 @@ pub struct SyncDeletedAttachment {
 const TYPING_RATE_LIMIT_MS: u64 = 1_000;
 const TYPING_RATE_MAP_CAPACITY: usize = 256;
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentUploadBegin {
+    pub upload_id: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentUploadWrite {
+    pub written_bytes: u64,
+}
+
 /// The filesystem-and-handles half of media ingest (ADR 0004), injected into
 /// one service per proxy group when the launcher passes `--media-ingest`.
 /// `None` is the pre-1.17 shape: every media method answers
@@ -2138,6 +2152,10 @@ impl MediaIngest {
         descriptor_id: &str,
         data_uri: &str,
     ) -> Result<(), &'static str> {
+        if data_uri.starts_with("file:") {
+            let (path, _) = parse_file_attachment_uri(data_uri).map_err(|_| "file-uri")?;
+            return self.stash_outbound_attachment_file(account_id, descriptor_id, &path);
+        }
         let Some(payload) = data_uri
             .strip_prefix("data:")
             .and_then(|rest| rest.rsplit_once(','))
@@ -2155,6 +2173,29 @@ impl MediaIngest {
         let target = dir.join(&sanitized);
         let temp = dir.join(format!(".{sanitized}.{}.tmp", random_id()));
         std::fs::write(&temp, &bytes).map_err(|_| "write")?;
+        std::fs::rename(&temp, &target).map_err(|_| "rename")?;
+        Ok(())
+    }
+
+    /// File-backed sends already stage at the deterministic descriptor path.
+    /// Keep the byte source zero-copy where possible and never decode/re-encode.
+    pub fn stash_outbound_attachment_file(
+        &self,
+        account_id: &str,
+        descriptor_id: &str,
+        source: &std::path::Path,
+    ) -> Result<(), &'static str> {
+        let sanitized = sanitize_attachment_id(descriptor_id).map_err(|_| "id-shape")?;
+        let dir = self.write_dir(account_id).map_err(|_| "write-dir")?;
+        let target = dir.join(&sanitized);
+        if source == target || target.is_file() {
+            return Ok(());
+        }
+        if std::fs::hard_link(source, &target).is_ok() {
+            return Ok(());
+        }
+        let temp = dir.join(format!(".{sanitized}.{}.tmp", random_id()));
+        std::fs::copy(source, &temp).map_err(|_| "copy")?;
         std::fs::rename(&temp, &target).map_err(|_| "rename")?;
         Ok(())
     }
@@ -2332,8 +2373,17 @@ struct EarlyReceiptEntry {
     buffered_at: u64,
 }
 
+struct OutgoingAttachmentUpload {
+    account_id: String,
+    path: PathBuf,
+    expected_size: u64,
+    written: u64,
+    last_touched: u64,
+}
+
 pub struct ConnectorService {
     store: Arc<Store>,
+    upload_sessions: std::collections::HashMap<String, OutgoingAttachmentUpload>,
     link: Option<ActiveLinkSession>,
     /// Typing rate limiter: (account_id, conversation_id) → last emission.
     typing_last_emission: std::collections::HashMap<(String, String), u64>,
@@ -2385,6 +2435,7 @@ impl ConnectorService {
         }
         Self {
             store,
+            upload_sessions: std::collections::HashMap::new(),
             link: None,
             typing_last_emission: std::collections::HashMap::new(),
             early_controls: Vec::new(),
@@ -2396,6 +2447,278 @@ impl ConnectorService {
 
     pub fn store_ref(&self) -> &Store {
         &self.store
+    }
+
+    const OUTGOING_UPLOAD_TTL_MS: u64 = 15 * 60 * 1000;
+    const OUTGOING_UPLOAD_MAX_SESSIONS: usize = 8;
+    const OUTGOING_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+
+    fn expire_upload_sessions(&mut self, now: u64) {
+        let expired: Vec<String> = self
+            .upload_sessions
+            .iter()
+            .filter(|(_, session)| {
+                now.saturating_sub(session.last_touched) >= Self::OUTGOING_UPLOAD_TTL_MS
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for upload_id in expired {
+            if let Some(session) = self.upload_sessions.remove(&upload_id) {
+                // These sessions never reached sendStaged; finalized payloads
+                // remove their session synchronously and are never in this set.
+                let _ = std::fs::remove_file(session.path);
+            }
+        }
+    }
+
+    /// Begin a connector-owned, single-file upload. The final path is the
+    /// descriptor's deterministic id, so send-time local retention is a no-op
+    /// rather than a second full-file copy.
+    pub fn begin_attachment_upload(
+        &mut self,
+        account_id: &str,
+        client_request_id: &str,
+        size_bytes: u64,
+    ) -> Result<AttachmentUploadBegin, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(client_request_id, "clientRequestId")?;
+        if size_bytes == 0 || size_bytes > MAX_ATTACHMENT_BYTES as u64 {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "sizeBytes must be between 1 and the attachment budget",
+                false,
+            )));
+        }
+        let Some(media) = self.media.clone() else {
+            return Err(media_capability_error());
+        };
+        let account = self.resolve_account(account_id)?;
+        let now = now_ms();
+        self.expire_upload_sessions(now);
+        if self.upload_sessions.len() >= Self::OUTGOING_UPLOAD_MAX_SESSIONS {
+            return Err(ServiceError::Api(ApiError::new(
+                "RESOURCE_EXHAUSTED",
+                "too many active attachment uploads",
+                true,
+            )));
+        }
+        let path = media.write_dir(&account.id)?.join(stable_hash_id(&[
+            account_id,
+            client_request_id,
+            "attachment",
+            "0",
+        ]));
+        if self
+            .upload_sessions
+            .values()
+            .any(|session| session.path == path)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "clientRequestId already has an active attachment upload",
+                false,
+            )));
+        }
+        let has_message = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+            .is_some();
+        let has_payload = !self
+            .store
+            .outgoing_attachment_payloads(account_id, client_request_id)?
+            .is_empty();
+        if has_message || has_payload {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "clientRequestId already has a persisted attachment; use ids-only retry",
+                false,
+            )));
+        }
+        if path.exists() {
+            // A crashed/expired upload has no row and no payload. Only this
+            // abandoned staging file may be reclaimed; persisted bytes are
+            // never deleted or overwritten by a fresh begin.
+            std::fs::remove_file(&path).map_err(|_| ServiceError::Io)?;
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|_| ServiceError::Io)?;
+        let upload_id = random_id();
+        self.upload_sessions.insert(
+            upload_id.clone(),
+            OutgoingAttachmentUpload {
+                account_id: account_id.to_owned(),
+                path,
+                expected_size: size_bytes,
+                written: 0,
+                last_touched: now,
+            },
+        );
+        Ok(AttachmentUploadBegin {
+            upload_id,
+            size_bytes,
+        })
+    }
+
+    /// Append one canonical base64 chunk at its declared sequential offset.
+    pub fn write_attachment_upload_chunk(
+        &mut self,
+        account_id: &str,
+        upload_id: &str,
+        offset: u64,
+        data_base64: &str,
+    ) -> Result<AttachmentUploadWrite, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(upload_id, "uploadId")?;
+        if data_base64.is_empty()
+            || data_base64.len() > 4 * Self::OUTGOING_UPLOAD_CHUNK_BYTES.div_ceil(3)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload chunk exceeds the bounded base64 chunk budget",
+                false,
+            )));
+        }
+        let mut bytes = Vec::with_capacity(data_base64.len() / 4 * 3);
+        base64_decode_to_vec(data_base64, &mut bytes).map_err(|_| {
+            ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload chunk is not valid base64",
+                false,
+            ))
+        })?;
+        if bytes.is_empty() || bytes.len() > Self::OUTGOING_UPLOAD_CHUNK_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload chunk must contain 1..=262144 decoded bytes",
+                false,
+            )));
+        }
+        self.expire_upload_sessions(now_ms());
+        let session = self.upload_sessions.get_mut(upload_id).ok_or_else(|| {
+            ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "uploadId is unknown or expired",
+                false,
+            ))
+        })?;
+        if session.account_id != account_id || session.written != offset {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload chunks must be sequential and belong to the account",
+                false,
+            )));
+        }
+        let next = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(ServiceError::Io)?;
+        if next > session.expected_size {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload chunks exceed the declared sizeBytes",
+                false,
+            )));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&session.path)
+            .map_err(|_| ServiceError::Io)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| ServiceError::Io)?;
+        file.write_all(&bytes).map_err(|_| ServiceError::Io)?;
+        file.flush().map_err(|_| ServiceError::Io)?;
+        session.written = next;
+        session.last_touched = now_ms();
+        Ok(AttachmentUploadWrite {
+            written_bytes: next,
+        })
+    }
+
+    pub fn abort_attachment_upload(
+        &mut self,
+        account_id: &str,
+        upload_id: &str,
+    ) -> Result<bool, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(upload_id, "uploadId")?;
+        let Some(session) = self.upload_sessions.remove(upload_id) else {
+            return Ok(false);
+        };
+        if session.account_id != account_id {
+            self.upload_sessions.insert(upload_id.to_owned(), session);
+            return Ok(false);
+        }
+        match std::fs::remove_file(&session.path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(_) => Err(ServiceError::Io),
+        }
+    }
+
+    /// Finalize a fully-written upload through the same send preparation and
+    /// idempotent settlement path as the legacy base64 family.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_send_attachment_staged(
+        &mut self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        upload_id: &str,
+        size_bytes: u64,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
+        validate_opaque_id(upload_id, "uploadId")?;
+        self.expire_upload_sessions(now_ms());
+        let session = self.upload_sessions.get(upload_id).ok_or_else(|| {
+            ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "uploadId is unknown or expired",
+                false,
+            ))
+        })?;
+        if session.account_id != account_id
+            || session.expected_size != size_bytes
+            || session.written != size_bytes
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload is incomplete or does not match sizeBytes",
+                false,
+            )));
+        }
+        let path = session.path.clone();
+        let result = self.prepare_send_attachment_file(
+            account_id,
+            target,
+            client_request_id,
+            &path,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            dimensions,
+            attachment_caption,
+        );
+        if result.is_ok() {
+            self.upload_sessions.remove(upload_id);
+        }
+        result
     }
 
     pub fn clear_link(&mut self) {
@@ -3916,13 +4239,142 @@ impl ConnectorService {
             dimensions,
             attachment_caption,
         )?;
-        // 契约 1.279（§4.263）：首发前把这条附件的原始 data URI 落进
-        // outgoing_attachment_payloads——单附件面写 index 0（契约 1.280 起复合
-        // 主键的固定槽位）。失败/unknown 保留、成功删除，于是刷新或重启之后仍能
-        // 按同一个 clientRequestId 重试——payload 不再只活在桌面内存里。已有行
-        // 保留原 payload（ON CONFLICT DO NOTHING），幂等重放不会把首发的数据
-        // 覆盖成后来的请求。写失败即失败：不发送，否则修复会静默退化回
-        // 「刷新即丢」。
+        self.dispatch_attachment_uri(
+            &account,
+            &conversation,
+            client_request_id,
+            data_uri,
+            size_bytes,
+            filename,
+            content_type,
+            caption,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            dimensions,
+            attachment_caption,
+        )
+    }
+
+    /// File-backed singular send (contract 1.299): the path is connector-owned
+    /// staging output, never a caller-selected arbitrary path. No base64 payload
+    /// crosses the connector/engine JSON boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_send_attachment_file(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        file_path: &std::path::Path,
+        size_bytes: u64,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
+        let dimensions = validate_attachment_dimensions_pair(dimensions)?;
+        let attachment_caption = validate_attachment_caption(attachment_caption)?;
+        if view_once && attachment_caption.is_some() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "view-once attachments must not carry attachmentCaption",
+                false,
+            )));
+        }
+        let caption = validate_attachment_send_metadata(
+            client_request_id,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+        )?;
+        let Some(media) = self.media.as_ref() else {
+            return Err(media_capability_error());
+        };
+        let account = self.resolve_account(account_id)?;
+        let expected_path = media.write_dir(&account.id)?.join(stable_hash_id(&[
+            account_id,
+            client_request_id,
+            "attachment",
+            "0",
+        ]));
+        if file_path != expected_path {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "file-backed attachment must use the connector staging path",
+                false,
+            )));
+        }
+        if let Some(existing) = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+        {
+            return Ok(PreparedSend::Existing(Box::new(existing)));
+        }
+        let conversation = self.resolve_send_conversation(account_id, target)?;
+        let data_uri = build_attachment_file_uri(
+            file_path,
+            size_bytes,
+            filename,
+            content_type,
+            voice_note,
+            gif,
+            dimensions,
+            attachment_caption,
+        )?;
+        self.dispatch_attachment_uri(
+            &account,
+            &conversation,
+            client_request_id,
+            data_uri,
+            size_bytes,
+            filename,
+            content_type,
+            caption,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            dimensions,
+            attachment_caption,
+        )
+    }
+
+    /// Shared dispatch for legacy data URIs and connector-owned file URIs.
+    /// The payload is persisted before the pending row so failed sends can be
+    /// rebuilt after a renderer restart without re-reading renderer memory.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_attachment_uri(
+        &self,
+        account: &AccountRow,
+        conversation: &ConversationRow,
+        client_request_id: &str,
+        data_uri: String,
+        size_bytes: u64,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        caption: &str,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
+        let account_id = account.id.as_str();
         self.store.remember_outgoing_attachment_payload(
             account_id,
             &conversation.id,
@@ -3931,46 +4383,27 @@ impl ConnectorService {
             &data_uri,
             now_ms(),
         )?;
-        // The pending row carries the same metadata-only descriptor the
-        // renderer projects (contract 1.15 wire shape), so the desktop bubble
-        // and conversation preview exist from the first pending tick instead
-        // of collapsing into an invisible empty row. The voice flag rides the
-        // descriptor (§4.30), so the sender's own bubble renders the voice UI
-        // across restarts.
         let descriptor = NormalizedAttachment {
             locator: None,
             id: stable_hash_id(&[account_id, client_request_id, "attachment", "0"]),
             content_type: content_type.map(str::to_string),
             filename: filename.map(str::to_string),
             size: Some(size_bytes),
-            // 契约 1.294 §4.284：声明尺寸同步落 pending 行 descriptor——
-            // 发送方自己的气泡从首个 tick 就是终态盒（与 blurHash/gif 同款
-            // 「首发陈述即行面」纪律）。
             width: dimensions.map(|(width, _)| width),
             height: dimensions.map(|(_, height)| height),
             is_voice_note: voice_note,
             caption: attachment_caption.map(str::to_string),
-            // §4.127: the caller-computed placeholder, shipped verbatim —
-            // the sender's bubble renders it from the first pending tick.
             blur_hash: blur_hash.map(str::to_string),
             incremental_mac: None,
             chunk_size: None,
             is_borderless: false,
-            // §4.147: the GIF marker rides the descriptor too, so the
-            // sender's own bubble renders the GIF UI from the first pending
-            // tick (the same statement the `;gif=true` URI parameter makes
-            // upstream).
             is_gif: gif,
-            // §4.149: the connector never fabricates the waveform pair — the
-            // engine generates it upstream at send time (or ships neither on
-            // failure); the desktop's own bubble gets it from the engine
-            // transcript echo through the receive face.
             waveform: None,
             duration: None,
         };
         self.dispatch_send(
-            &account,
-            &conversation,
+            account,
+            conversation,
             caption,
             client_request_id,
             quote_message_id,
@@ -4194,6 +4627,7 @@ impl ConnectorService {
                 let descriptor = row.attachments.first();
                 vec![ResolvedAttachmentPayload {
                     data_base64: data_base64.to_string(),
+                    file_path: None,
                     size_bytes,
                     content_type: content_type
                         .map(str::to_string)
@@ -4234,11 +4668,29 @@ impl ConnectorService {
                 let mut resolved = Vec::with_capacity(stored.len());
                 for ((_, data_uri), descriptor) in stored.iter().zip(row.attachments.iter()) {
                     let parsed = parse_attachment_data_uri(data_uri)?;
+                    if let Some(path) = parsed.file_path.as_ref() {
+                        let Some(media) = self.media.as_ref() else {
+                            return Err(ServiceError::Api(ApiError::new(
+                                "RETRY_NOT_ALLOWED",
+                                "file-backed attachment media is unavailable",
+                                false,
+                            )));
+                        };
+                        let expected = media.write_dir(account_id)?.join(&descriptor.id);
+                        if path != &expected {
+                            return Err(ServiceError::Api(ApiError::new(
+                                "RETRY_NOT_ALLOWED",
+                                "file-backed attachment is outside the connector staging path",
+                                false,
+                            )));
+                        }
+                    }
                     // Descriptor faces come from the row, never from the URI: the
                     // URI's mime/filename are builder defaults, and a field the
                     // first send genuinely lacked must not be conjured back.
                     resolved.push(ResolvedAttachmentPayload {
                         data_base64: parsed.data_base64,
+                        file_path: parsed.file_path,
                         size_bytes: parsed.size_bytes,
                         content_type: descriptor.content_type.clone(),
                         filename: descriptor.filename.clone(),
@@ -4295,15 +4747,27 @@ impl ConnectorService {
         let mut descriptors = Vec::with_capacity(resolved.len());
         let mut payloads = Vec::with_capacity(resolved.len());
         for (index, entry) in resolved.iter().enumerate() {
-            let data_uri = build_attachment_data_uri_with_caption(
-                &entry.data_base64,
-                entry.filename.as_deref(),
-                entry.content_type.as_deref(),
-                entry.voice,
-                entry.gif,
-                entry.dimensions,
-                entry.attachment_caption.as_deref(),
-            )?;
+            let data_uri = match entry.file_path.as_deref() {
+                Some(path) => build_attachment_file_uri(
+                    path,
+                    entry.size_bytes,
+                    entry.filename.as_deref(),
+                    entry.content_type.as_deref(),
+                    entry.voice,
+                    entry.gif,
+                    entry.dimensions,
+                    entry.attachment_caption.as_deref(),
+                )?,
+                None => build_attachment_data_uri_with_caption(
+                    &entry.data_base64,
+                    entry.filename.as_deref(),
+                    entry.content_type.as_deref(),
+                    entry.voice,
+                    entry.gif,
+                    entry.dimensions,
+                    entry.attachment_caption.as_deref(),
+                )?,
+            };
             payloads.push((index as u32, data_uri.clone()));
             data_uris.push(json!(data_uri));
             descriptors.push(NormalizedAttachment {
@@ -18768,6 +19232,61 @@ pub struct UpstreamSendTextStyle {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentUploadBeginParams {
+    pub account_id: String,
+    pub client_request_id: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentUploadWriteParams {
+    pub account_id: String,
+    pub upload_id: String,
+    pub offset: u64,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentUploadAbortParams {
+    pub account_id: String,
+    pub upload_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendStagedAttachmentParams {
+    pub account_id: String,
+    pub conversation_id: Option<String>,
+    pub kind: Option<String>,
+    pub peer_key: Option<String>,
+    pub peer_title: Option<String>,
+    pub client_request_id: String,
+    pub upload_id: String,
+    pub size_bytes: u64,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+    pub text: Option<String>,
+    pub quote_message_id: Option<String>,
+    #[serde(default)]
+    pub voice_note: bool,
+    #[serde(default)]
+    pub view_once: bool,
+    #[serde(default)]
+    pub blur_hash: Option<String>,
+    #[serde(default)]
+    pub attachment_caption: Option<String>,
+    #[serde(default)]
+    pub gif: bool,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessagesSendAttachmentParams {
     pub account_id: String,
     pub conversation_id: Option<String>,
@@ -22519,6 +23038,8 @@ fn validate_avatar_data_uri(data_uri: &str) -> Result<String, ServiceError> {
 /// 每个条目各解出一个（契约 1.280，§4.264）。
 struct ResolvedAttachmentPayload {
     data_base64: String,
+    /// file-backed payload path for the streaming send family; None = legacy base64.
+    file_path: Option<std::path::PathBuf>,
     size_bytes: u64,
     content_type: Option<String>,
     filename: Option<String>,
@@ -22542,11 +23063,20 @@ struct ResolvedAttachmentPayload {
 struct StoredAttachmentPayload {
     data_base64: String,
     size_bytes: u64,
+    file_path: Option<std::path::PathBuf>,
 }
 
 fn parse_attachment_data_uri(data_uri: &str) -> Result<StoredAttachmentPayload, ServiceError> {
     fn invalid(detail: &'static str) -> ServiceError {
         ServiceError::Api(ApiError::new("RETRY_NOT_ALLOWED", detail, false))
+    }
+    if data_uri.starts_with("file:") {
+        let (path, size_bytes) = parse_file_attachment_uri(data_uri)?;
+        return Ok(StoredAttachmentPayload {
+            data_base64: String::new(),
+            size_bytes,
+            file_path: Some(path),
+        });
     }
     let Some(rest) = data_uri.strip_prefix("data:") else {
         return Err(invalid("the stored attachment payload is not a data URI"));
@@ -22569,7 +23099,66 @@ fn parse_attachment_data_uri(data_uri: &str) -> Result<StoredAttachmentPayload, 
     Ok(StoredAttachmentPayload {
         data_base64: payload.to_string(),
         size_bytes: decoded.len() as u64,
+        file_path: None,
     })
+}
+
+fn decode_file_uri_component(value: &str) -> Result<String, ()> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(());
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(|_| ())?;
+            decoded.push(u8::from_str_radix(hex, 16).map_err(|_| ())?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| ())
+}
+
+/// Parse only connector-generated file URIs. Metadata and byte length are
+/// checked without reading the file into memory; descriptor faces remain row-owned.
+fn parse_file_attachment_uri(data_uri: &str) -> Result<(std::path::PathBuf, u64), ServiceError> {
+    fn invalid(detail: &'static str) -> ServiceError {
+        ServiceError::Api(ApiError::new("RETRY_NOT_ALLOWED", detail, false))
+    }
+    let rest = data_uri
+        .strip_prefix("file:")
+        .ok_or_else(|| invalid("the stored attachment payload is not a file URI"))?;
+    let mut parts = rest.split(';');
+    let path = decode_file_uri_component(parts.next().ok_or_else(|| invalid("missing file path"))?)
+        .map_err(|_| invalid("invalid file URI path"))?;
+    let path_ref = std::path::Path::new(&path);
+    if !path_ref.is_absolute()
+        || path_ref
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(invalid("file URI path must be absolute and traversal-free"));
+    }
+    let size = parts
+        .find_map(|part| part.strip_prefix("sizeBytes="))
+        .ok_or_else(|| invalid("file URI is missing sizeBytes"))?
+        .parse::<u64>()
+        .map_err(|_| invalid("file URI sizeBytes is invalid"))?;
+    if size == 0 || size > MAX_ATTACHMENT_BYTES as u64 {
+        return Err(invalid("file URI sizeBytes exceeds the attachment budget"));
+    }
+    let metadata = std::fs::metadata(path_ref)
+        .map_err(|_| invalid("file-backed attachment is no longer available"))?;
+    if !metadata.is_file() || metadata.len() != size {
+        return Err(invalid(
+            "file-backed attachment size does not match its declaration",
+        ));
+    }
+    Ok((path_ref.to_path_buf(), size))
 }
 
 /// Build the RFC 2397 data URI the pinned upstream accepts
@@ -22620,6 +23209,74 @@ fn write_data_uri_percent_encoded(uri: &mut String, value: &str) {
             let _ = write!(uri, "%{byte:02X}");
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_attachment_file_uri(
+    path: &std::path::Path,
+    size_bytes: u64,
+    filename: Option<&str>,
+    content_type: Option<&str>,
+    voice: bool,
+    gif: bool,
+    dimensions: Option<(u32, u32)>,
+    attachment_caption: Option<&str>,
+) -> Result<String, ServiceError> {
+    fn invalid(detail: &'static str) -> ServiceError {
+        ServiceError::Api(ApiError::new("INVALID_REQUEST", detail, false))
+    }
+    validate_attachment_caption(attachment_caption)?;
+    validate_attachment_dimensions_pair(dimensions)?;
+    if size_bytes == 0 || size_bytes > MAX_ATTACHMENT_BYTES as u64 {
+        return Err(invalid(
+            "file-backed attachment size exceeds the attachment budget",
+        ));
+    }
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(invalid(
+            "file-backed attachment path must be absolute and traversal-free",
+        ));
+    }
+    let metadata =
+        std::fs::metadata(path).map_err(|_| invalid("file-backed attachment is unavailable"))?;
+    if !metadata.is_file() || metadata.len() != size_bytes {
+        return Err(invalid(
+            "file-backed attachment size does not match its declaration",
+        ));
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| invalid("file-backed path is not UTF-8"))?;
+    let mut uri = String::with_capacity(path.len() + 128);
+    uri.push_str("file:");
+    write_data_uri_percent_encoded(&mut uri, path);
+    uri.push_str(";contentType=");
+    write_data_uri_percent_encoded(&mut uri, content_type.unwrap_or("application/octet-stream"));
+    if voice {
+        uri.push_str(";voice=true");
+    }
+    if gif {
+        uri.push_str(";gif=true");
+    }
+    if let Some((width, height)) = dimensions {
+        use std::fmt::Write as _;
+        let _ = write!(uri, ";width={width};height={height}");
+    }
+    if let Some(caption) = attachment_caption {
+        uri.push_str(";caption=");
+        write_data_uri_percent_encoded(&mut uri, caption);
+    }
+    if let Some(filename) = filename {
+        uri.push_str(";filename=");
+        write_data_uri_percent_encoded(&mut uri, filename);
+    }
+    use std::fmt::Write as _;
+    let _ = write!(uri, ";sizeBytes={size_bytes}");
+    Ok(uri)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -32507,6 +33164,192 @@ mod tests {
     /// row (the same clientRequestId stays fresh), the prepared upstream
     /// params carry the data URI under `attachments`, and an unknown
     /// clientRequestId replay returns the same existing row (idempotency).
+    #[test]
+    fn staged_attachment_upload_writes_chunks_and_prepares_file_backed_send() {
+        let (_temp, mut service) = media_service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let client_request_id = "upload-client-1";
+        let started = service
+            .begin_attachment_upload(&account.id, client_request_id, 5)
+            .unwrap();
+        assert_eq!(started.size_bytes, 5);
+        let first = service
+            .write_attachment_upload_chunk(&account.id, &started.upload_id, 0, "aGVs")
+            .unwrap();
+        assert_eq!(first.written_bytes, 3);
+        assert!(
+            service
+                .write_attachment_upload_chunk(&account.id, &started.upload_id, 0, "bG8=")
+                .is_err()
+        );
+        let second = service
+            .write_attachment_upload_chunk(&account.id, &started.upload_id, 3, "bG8=")
+            .unwrap();
+        assert_eq!(second.written_bytes, 5);
+
+        let prepared = service
+            .prepare_send_attachment_staged(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                &started.upload_id,
+                5,
+                Some("hello.txt"),
+                Some("text/plain"),
+                Some("caption"),
+                None,
+                false,
+                false,
+                None,
+                false,
+                None,
+                Some("attachment caption"),
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = prepared else {
+            panic!("staged upload must create a dispatch")
+        };
+        let uri = params["attachments"][0].as_str().unwrap();
+        assert!(
+            uri.starts_with("file:"),
+            "file URI must avoid whole-file base64"
+        );
+        assert!(uri.contains("sizeBytes=5"));
+        assert!(!uri.contains(";base64,"));
+        let row = service
+            .store
+            .message_by_client_request(&account.id, client_request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.attachments[0].size, Some(5));
+        assert_eq!(
+            row.attachments[0].caption.as_deref(),
+            Some("attachment caption")
+        );
+        let payloads = service
+            .store
+            .outgoing_attachment_payloads(&account.id, client_request_id)
+            .unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert!(payloads[0].1.starts_with("file:"));
+        let (path, size) = parse_file_attachment_uri(&payloads[0].1).unwrap();
+        assert_eq!(size, 5);
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert!(
+            service
+                .prepare_send_attachment_staged(
+                    &account.id,
+                    &AttachmentSendTarget::Conversation(&conversation.id),
+                    client_request_id,
+                    &started.upload_id,
+                    5,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .is_err()
+        );
+        service
+            .store
+            .conn()
+            .execute("UPDATE messages SET status='failed' WHERE id=?1", [&row.id])
+            .unwrap();
+        let retry = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = retry else {
+            panic!("file-backed ids-only retry must dispatch")
+        };
+        assert!(
+            params["attachments"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("file:")
+        );
+        assert!(
+            service
+                .begin_attachment_upload(&account.id, client_request_id, 5)
+                .is_err(),
+            "persisted payload must never be overwritten by begin"
+        );
+        assert!(
+            path.exists(),
+            "persisted staging file survives rejected begin"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            service
+                .begin_attachment_upload(&account.id, client_request_id, 5)
+                .is_err(),
+            "persisted payload is protected even when its file is missing"
+        );
+        std::fs::write(&path, b"hello").unwrap();
+
+        let abandoned_id = "upload-client-abandoned";
+        let abandoned = service
+            .begin_attachment_upload(&account.id, abandoned_id, 5)
+            .unwrap();
+        service
+            .write_attachment_upload_chunk(&account.id, &abandoned.upload_id, 0, "aGVs")
+            .unwrap();
+        let abandoned_path = service
+            .upload_sessions
+            .get(&abandoned.upload_id)
+            .unwrap()
+            .path
+            .clone();
+        service.upload_sessions.clear();
+        let reopened = service
+            .begin_attachment_upload(&account.id, abandoned_id, 5)
+            .unwrap();
+        assert!(abandoned_path.is_file());
+        assert_ne!(reopened.upload_id, abandoned.upload_id);
+        assert!(reopened.upload_id != abandoned.upload_id);
+        service
+            .abort_attachment_upload(&account.id, &reopened.upload_id)
+            .unwrap();
+
+        let ttl_id = "upload-client-ttl";
+        let ttl = service
+            .begin_attachment_upload(&account.id, ttl_id, 5)
+            .unwrap();
+        let ttl_path = service
+            .upload_sessions
+            .get(&ttl.upload_id)
+            .unwrap()
+            .path
+            .clone();
+        service.expire_upload_sessions(u64::MAX);
+        assert!(!ttl_path.exists(), "TTL removes abandoned staging bytes");
+        let after_ttl = service
+            .begin_attachment_upload(&account.id, ttl_id, 5)
+            .unwrap();
+        service
+            .abort_attachment_upload(&account.id, &after_ttl.upload_id)
+            .unwrap();
+    }
+
     #[test]
     fn prepare_send_attachment_builds_data_uri_params_and_is_idempotent() {
         let (_temp, mut service) = service();
