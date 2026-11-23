@@ -390,6 +390,25 @@ mod tests {
     }
 
     #[test]
+    fn windows_release_catalog_derives_contract_metadata_from_runtime_constants() {
+        let workflow = include_str!("../.github/workflows/build-windows.yml");
+        assert!(!workflow.contains("\"min\": \"1.92\""));
+        assert!(
+            workflow.contains(
+                "rust_constant('src/engine_contract.rs', 'ENGINE_CONTRACT_MIN_REVISION')"
+            )
+        );
+        assert!(
+            workflow.contains(
+                "rust_constant('src/engine_contract.rs', 'ENGINE_CONTRACT_MAX_REVISION')"
+            )
+        );
+        assert!(workflow.contains("rust_constant('src/lib.rs', 'API_VERSION')"));
+        assert!(workflow.contains("\"min\": engine_min_revision, \"max\": engine_max_revision"));
+        assert!(workflow.contains("\"min\": desktop_api_version, \"max\": desktop_api_version"));
+    }
+
+    #[test]
     fn a_matching_revision_is_served_with_the_engines_own_strings() {
         let report = evaluate(
             &version("kt-signal-engine", "0.1.0-dev.29"),

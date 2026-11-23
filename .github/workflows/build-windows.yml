@@ -16,12 +16,12 @@ jobs:
     runs-on: windows-latest
     environment: prod
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -48,7 +48,7 @@ jobs:
           Get-Item target/release/kt-signal-connector.exe | Format-List Name,Length
           Get-FileHash target/release/kt-signal-connector.exe -Algorithm SHA256 | Format-List
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kt-signal-connector-windows-x64
           path: target/release/kt-signal-connector.exe
@@ -144,13 +144,25 @@ jobs:
           & $py -m pip install --quiet --disable-pip-version-check oss2
 
           $pyCode = @'
-          import os, json, hashlib, time, oss2
+          import os, json, hashlib, time, re, oss2
+          from pathlib import Path
           auth = oss2.StsAuth(os.environ['OSS_ACCESS_KEY_ID'], os.environ['OSS_ACCESS_KEY_SECRET'], os.environ['OSS_STS_TOKEN'])
           bucket = oss2.Bucket(auth, 'https://' + os.environ['OSS_ENDPOINT'], os.environ['OSS_BUCKET'])
           CATALOG_KEY = 'kt/signal-runtime/catalog.json'
           SRC = 'target/release/kt-signal-connector.exe'
           VERSION = os.environ['COMPONENT_VERSION']
           BASE = 'https://download.ktai.im/kt/signal-runtime/connector'
+
+          def rust_constant(path, name):
+              text = Path(path).read_text(encoding='utf-8')
+              match = re.search(rf'^\s*pub(?:\([^)]*\))?\s+const\s+{re.escape(name)}:\s*&str\s*=\s*"([^"]+)"', text, re.M)
+              if not match:
+                  raise SystemExit(f'FATAL: missing Rust string constant {name} in {path}')
+              return match.group(1)
+
+          engine_min_revision = rust_constant('src/engine_contract.rs', 'ENGINE_CONTRACT_MIN_REVISION')
+          engine_max_revision = rust_constant('src/engine_contract.rs', 'ENGINE_CONTRACT_MAX_REVISION')
+          desktop_api_version = rust_constant('src/lib.rs', 'API_VERSION')
 
           def sha256_of(p):
               with open(p, 'rb') as f:
@@ -178,9 +190,9 @@ jobs:
                       "primaryUrl": f"{BASE}/{VERSION}/kt-signal-connector-windows-x64.exe",
                   }
               },
-              # 与 engine 的契约区间：跟随已发布的 engine 记录；没有则用当前基线。
-              "engineContractRevision": {"min": "1.92", "max": "1.92"},
-              "desktopApiVersion": {"min": "1.0", "max": "1.0"},
+              # Generated from the same constants used by the runtime handshake.
+              "engineContractRevision": {"min": engine_min_revision, "max": engine_max_revision},
+              "desktopApiVersion": {"min": desktop_api_version, "max": desktop_api_version},
           }
 
           allowed = ('https://download.ktai.im/kt/signal-runtime/', 'https://github.com/kt-im/')
