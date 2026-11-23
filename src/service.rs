@@ -3837,9 +3837,56 @@ impl ConnectorService {
         gif: bool,
         dimensions: Option<(u32, u32)>,
     ) -> Result<PreparedSend, ServiceError> {
+        self.prepare_send_attachment_with_caption(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            dimensions,
+            None,
+        )
+    }
+
+    /// 单数附件 + 声明尺寸 + 附件级 caption（契约 1.297 §4.288）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_send_attachment_with_caption(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        data_base64: &str,
+        size_bytes: u64,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
         // 契约 1.294 §4.284：声明尺寸在写任何行之前复核（host 已配对，
         // service 只复核值域；越界 = INVALID_REQUEST，无 pending 行残留）。
         let dimensions = validate_attachment_dimensions_pair(dimensions)?;
+        let attachment_caption = validate_attachment_caption(attachment_caption)?;
+        if view_once && attachment_caption.is_some() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "view-once attachments must not carry attachmentCaption",
+                false,
+            )));
+        }
         let caption = validate_attachment_send_request(
             client_request_id,
             Some(data_base64),
@@ -3860,13 +3907,14 @@ impl ConnectorService {
         }
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_send_conversation(account_id, target)?;
-        let data_uri = build_attachment_data_uri(
+        let data_uri = build_attachment_data_uri_with_caption(
             data_base64,
             filename,
             content_type,
             voice_note,
             gif,
             dimensions,
+            attachment_caption,
         )?;
         // 契约 1.279（§4.263）：首发前把这条附件的原始 data URI 落进
         // outgoing_attachment_payloads——单附件面写 index 0（契约 1.280 起复合
@@ -3901,7 +3949,7 @@ impl ConnectorService {
             width: dimensions.map(|(width, _)| width),
             height: dimensions.map(|(_, height)| height),
             is_voice_note: voice_note,
-            caption: None,
+            caption: attachment_caption.map(str::to_string),
             // §4.127: the caller-computed placeholder, shipped verbatim —
             // the sender's bubble renders it from the first pending tick.
             blur_hash: blur_hash.map(str::to_string),
@@ -4158,6 +4206,7 @@ impl ConnectorService {
                     blur_hash: blur_hash
                         .map(str::to_string)
                         .or_else(|| descriptor.and_then(|entry| entry.blur_hash.clone())),
+                    attachment_caption: descriptor.and_then(|entry| entry.caption.clone()),
                     dimensions: caller_dimensions
                         .or_else(|| descriptor.and_then(|entry| entry.width.zip(entry.height))),
                 }]
@@ -4196,6 +4245,7 @@ impl ConnectorService {
                         voice: descriptor.is_voice_note,
                         gif: descriptor.is_gif,
                         blur_hash: descriptor.blur_hash.clone(),
+                        attachment_caption: descriptor.caption.clone(),
                         // 声明尺寸同样以行为准（首发陈述落行，URI 只作字节源）。
                         dimensions: descriptor.width.zip(descriptor.height),
                     });
@@ -4225,6 +4275,14 @@ impl ConnectorService {
             )?;
             // 契约 1.294 §4.284：行面/调用方来的尺寸在重建 URI 之前复核，
             // 坏值（越界/零）不得进上行帧。
+            validate_attachment_caption(entry.attachment_caption.as_deref())?;
+            if preserved_view_once && entry.attachment_caption.is_some() {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "view-once attachments must not carry attachmentCaption",
+                    false,
+                )));
+            }
             validate_attachment_dimensions_pair(entry.dimensions)?;
         }
         let caption = preserved_text.unwrap_or_default();
@@ -4237,13 +4295,14 @@ impl ConnectorService {
         let mut descriptors = Vec::with_capacity(resolved.len());
         let mut payloads = Vec::with_capacity(resolved.len());
         for (index, entry) in resolved.iter().enumerate() {
-            let data_uri = build_attachment_data_uri(
+            let data_uri = build_attachment_data_uri_with_caption(
                 &entry.data_base64,
                 entry.filename.as_deref(),
                 entry.content_type.as_deref(),
                 entry.voice,
                 entry.gif,
                 entry.dimensions,
+                entry.attachment_caption.as_deref(),
             )?;
             payloads.push((index as u32, data_uri.clone()));
             data_uris.push(json!(data_uri));
@@ -4263,7 +4322,7 @@ impl ConnectorService {
                 width: entry.dimensions.map(|(width, _)| width),
                 height: entry.dimensions.map(|(_, height)| height),
                 is_voice_note: entry.voice,
-                caption: None,
+                caption: entry.attachment_caption.clone(),
                 blur_hash: entry.blur_hash.clone(),
                 incremental_mac: None,
                 chunk_size: None,
@@ -4370,6 +4429,7 @@ impl ConnectorService {
             validate_attachment_content_type(entry.content_type.as_deref())?;
             // §4.127: the plural face carries the blur placeholder per entry.
             validate_blur_hash(entry.blur_hash.as_deref())?;
+            validate_attachment_caption(entry.attachment_caption.as_deref())?;
             // 契约 1.294 §4.284：复数面条目级声明尺寸同校验同值域，任一条
             // 坏形状整批 INVALID_REQUEST（写任何行之前）。
             validate_attachment_dimensions(entry.width, entry.height)?;
@@ -4399,13 +4459,14 @@ impl ConnectorService {
         let mut payloads = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             let dimensions = validate_attachment_dimensions(entry.width, entry.height)?;
-            let data_uri = build_attachment_data_uri(
+            let data_uri = build_attachment_data_uri_with_caption(
                 &entry.data_base64,
                 entry.filename.as_deref(),
                 entry.content_type.as_deref(),
                 false,
                 entry.gif,
                 dimensions,
+                entry.attachment_caption.as_deref(),
             )?;
             payloads.push((index as u32, data_uri.clone()));
             data_uris.push(json!(data_uri));
@@ -4424,7 +4485,7 @@ impl ConnectorService {
                 width: dimensions.map(|(width, _)| width),
                 height: dimensions.map(|(_, height)| height),
                 is_voice_note: false,
-                caption: None,
+                caption: entry.attachment_caption.clone(),
                 // §4.127: per-entry placeholder, same posture as the
                 // singular face.
                 blur_hash: entry.blur_hash.clone(),
@@ -18620,6 +18681,10 @@ pub struct MessagesSendAttachmentParams {
     /// top-level key beside the array is INVALID_REQUEST.
     #[serde(default)]
     pub blur_hash: Option<String>,
+    /// 契约 1.297 §4.288：附件级 caption（AttachmentPointer.caption），与消息级
+    /// `text` 分离。仅单数面使用；复数面由条目各自携带。
+    #[serde(default)]
+    pub attachment_caption: Option<String>,
     /// §4.147 (contract revision 1.149): the GIF marker — true appends the
     /// `;gif=true` data-URI parameter, which the engine maps to the official
     /// `Flags.GIF=8` bit (the receive side has projected `isGif` since
@@ -18673,6 +18738,9 @@ pub struct MessagesSendAttachmentEntry {
     pub content_type: Option<String>,
     #[serde(default)]
     pub blur_hash: Option<String>,
+    /// 契约 1.297 §4.288：本条附件的 caption，独立映射 AttachmentPointer.caption。
+    #[serde(default)]
+    pub attachment_caption: Option<String>,
     #[serde(default)]
     pub gif: bool,
     /// 条目级声明尺寸（BUG-11 wire 批，契约 1.294 §4.284）：与单数形态
@@ -20867,6 +20935,20 @@ fn validate_blur_hash(blur_hash: Option<&str>) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// 附件级 caption：独立于消息正文；空串/超 64 KiB UTF-8 一律确定性拒绝。
+fn validate_attachment_caption(value: Option<&str>) -> Result<Option<&str>, ServiceError> {
+    if let Some(caption) = value
+        && (caption.is_empty() || caption.len() > 65_536)
+    {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachmentCaption must contain between 1 and 65536 UTF-8 bytes",
+            false,
+        )));
+    }
+    Ok(value)
+}
+
 /// 出向声明尺寸校验（BUG-11 wire 批，契约 1.294 §4.284）：两键双参同进退
 /// （全缺 = 未声明，旧形状逐字节不变；只有半边 = INVALID_REQUEST，半边尺寸
 /// 对渲染面无意义）、各自正整数且 ≤ MAX_ATTACHMENT_DIMENSION_PX（与
@@ -22310,6 +22392,8 @@ struct ResolvedAttachmentPayload {
     voice: bool,
     gif: bool,
     blur_hash: Option<String>,
+    /// 契约 1.297 §4.288：重试从原 descriptor 恢复附件级 caption。
+    attachment_caption: Option<String>,
     /// 契约 1.294 §4.284：声明尺寸（调用方重述优先，否则行 descriptor 的
     /// 既有 width/height 对）。ids-only 重发从行面恢复，所以一份首发带尺寸
     /// 的失败附件在刷新/重启后重试仍带同一对声明。
@@ -22381,6 +22465,41 @@ fn build_attachment_data_uri(
     gif: bool,
     dimensions: Option<(u32, u32)>,
 ) -> Result<String, ServiceError> {
+    build_attachment_data_uri_with_caption(
+        base64_data,
+        filename,
+        content_type,
+        voice,
+        gif,
+        dimensions,
+        None,
+    )
+}
+
+/// filename/caption 共用 encodeURIComponent 语义，分号/逗号/百分号不破坏 URI。
+fn write_data_uri_percent_encoded(uri: &mut String, value: &str) {
+    use std::fmt::Write as _;
+    for byte in value.bytes() {
+        let c = byte as char;
+        if c.is_ascii_alphanumeric() || "-_.!~*'()".contains(c) {
+            uri.push(c);
+        } else {
+            let _ = write!(uri, "%{byte:02X}");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_attachment_data_uri_with_caption(
+    base64_data: &str,
+    filename: Option<&str>,
+    content_type: Option<&str>,
+    voice: bool,
+    gif: bool,
+    dimensions: Option<(u32, u32)>,
+    attachment_caption: Option<&str>,
+) -> Result<String, ServiceError> {
+    let attachment_caption = validate_attachment_caption(attachment_caption)?;
     let mut decoded = Vec::with_capacity(base64_data.len() / 4 * 3);
     base64_decode_to_vec(base64_data, &mut decoded).map_err(|_| {
         ServiceError::Api(ApiError::new(
@@ -22414,17 +22533,14 @@ fn build_attachment_data_uri(
     if let Some((width, height)) = dimensions {
         let _ = write!(uri, ";width={width};height={height}");
     }
+    if let Some(caption) = attachment_caption {
+        uri.push_str(";caption=");
+        write_data_uri_percent_encoded(&mut uri, caption);
+    }
     if let Some(filename) = filename {
         uri.push_str(";filename=");
         // encodeURIComponent semantics for the filename parameter.
-        for byte in filename.bytes() {
-            let c = byte as char;
-            if c.is_ascii_alphanumeric() || "-_.!~*'()".contains(c) {
-                uri.push(c);
-            } else {
-                let _ = write!(uri, "%{byte:02X}");
-            }
-        }
+        write_data_uri_percent_encoded(&mut uri, filename);
     }
     uri.push_str(";base64,");
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -26163,6 +26279,7 @@ mod tests {
             filename: Some("notes.txt".into()),
             content_type: Some("text/plain".into()),
             blur_hash: Some("abc123".into()),
+            attachment_caption: None,
             gif: false,
         }];
         let prepared = service
@@ -26225,6 +26342,7 @@ mod tests {
             filename: None,
             content_type: None,
             blur_hash: Some(String::new()),
+            attachment_caption: None,
             gif: false,
         }];
         let error = service
@@ -26781,7 +26899,7 @@ mod tests {
                 .unwrap()
         };
         let pending_id = match service
-            .prepare_send_attachment(
+            .prepare_send_attachment_with_caption(
                 &account.id,
                 &AttachmentSendTarget::Conversation(&conversation.id),
                 "req-attach-retry",
@@ -26795,6 +26913,8 @@ mod tests {
                 false,
                 None,
                 false,
+                None,
+                Some("attachment caption"),
             )
             .unwrap()
         {
@@ -26846,8 +26966,8 @@ mod tests {
         assert_eq!(params["message"], "retry caption");
         assert_eq!(
             params["attachments"][0].as_str().unwrap(),
-            "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw==",
-            "the retry carries the bytes again — the engine re-uploads them"
+            "data:text/plain;caption=attachment%20caption;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw==",
+            "the retry preserves the original attachment caption and bytes"
         );
         assert_eq!(row_count(&service), 1, "a retry never adds a row");
         let rearmed = service
@@ -26862,6 +26982,10 @@ mod tests {
         );
         assert_eq!(rearmed.text.as_deref(), Some("retry caption"));
         assert_eq!(rearmed.attachments.len(), 1);
+        assert_eq!(
+            rearmed.attachments[0].caption.as_deref(),
+            Some("attachment caption")
+        );
         assert_eq!(
             rearmed.attachments[0].id, failed.attachments[0].id,
             "the descriptor id is the first attempt's own (same bytes slot)"
@@ -27072,6 +27196,7 @@ mod tests {
                         filename: Some("one.txt".into()),
                         content_type: Some("text/plain".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
@@ -27083,6 +27208,7 @@ mod tests {
                         filename: Some("two.txt".into()),
                         content_type: Some("text/plain".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                 ],
@@ -27539,8 +27665,8 @@ mod tests {
             .unwrap();
         let client_request_id = "req-multi-payload";
         // "attachment bytes" / "second attachment"
-        let first_uri = "data:text/plain;filename=one.txt;base64,YXR0YWNobWVudCBieXRlcw==";
-        let second_uri = "data:application/octet-stream;gif=true;filename=two.bin;base64,c2Vjb25kIGF0dGFjaG1lbnQ=";
+        let first_uri = "data:text/plain;caption=first%20attachment;filename=one.txt;base64,YXR0YWNobWVudCBieXRlcw==";
+        let second_uri = "data:application/octet-stream;gif=true;caption=second%20attachment;filename=two.bin;base64,c2Vjb25kIGF0dGFjaG1lbnQ=";
         let pending_id = match service
             .prepare_send_attachment_multi(
                 &account.id,
@@ -27556,6 +27682,7 @@ mod tests {
                         filename: Some("one.txt".into()),
                         content_type: Some("text/plain".into()),
                         blur_hash: None,
+                        attachment_caption: Some("first attachment".into()),
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
@@ -27567,6 +27694,7 @@ mod tests {
                         filename: Some("two.bin".into()),
                         content_type: Some("application/octet-stream".into()),
                         blur_hash: None,
+                        attachment_caption: Some("second attachment".into()),
                         gif: true,
                     },
                 ],
@@ -27679,6 +27807,14 @@ mod tests {
             descriptor_ids,
             "every descriptor keeps the first attempt's own id (same byte slots)"
         );
+        assert_eq!(
+            rearmed.attachments[0].caption.as_deref(),
+            Some("first attachment")
+        );
+        assert_eq!(
+            rearmed.attachments[1].caption.as_deref(),
+            Some("second attachment")
+        );
         assert_eq!(rearmed.attachments[0].filename.as_deref(), Some("one.txt"));
         assert_eq!(
             rearmed.attachments[0].content_type.as_deref(),
@@ -27759,6 +27895,7 @@ mod tests {
                         filename: Some("one.txt".into()),
                         content_type: Some("text/plain".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
@@ -27770,6 +27907,7 @@ mod tests {
                         filename: Some("two.bin".into()),
                         content_type: Some("application/octet-stream".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                 ],
@@ -28147,6 +28285,7 @@ mod tests {
                         filename: Some("one.txt".into()),
                         content_type: Some("text/plain".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
@@ -28158,6 +28297,7 @@ mod tests {
                         filename: Some("two.bin".into()),
                         content_type: Some("application/octet-stream".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                 ],
@@ -32606,6 +32746,7 @@ mod tests {
                 filename: Some("tenor.gif".into()),
                 content_type: Some("video/mp4".into()),
                 blur_hash: None,
+                attachment_caption: Some("A;B,% 中".into()),
                 gif: true,
             },
             MessagesSendAttachmentEntry {
@@ -32617,6 +32758,7 @@ mod tests {
                 filename: Some("notes.txt".into()),
                 content_type: Some("text/plain".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             },
         ];
@@ -32637,7 +32779,7 @@ mod tests {
         assert_eq!(attachments.len(), 2);
         assert_eq!(
             attachments[0].as_str().unwrap(),
-            "data:video/mp4;gif=true;filename=tenor.gif;base64,YXR0YWNobWVudCBieXRlcw=="
+            "data:video/mp4;gif=true;caption=A%3BB%2C%25%20%E4%B8%AD;filename=tenor.gif;base64,YXR0YWNobWVudCBieXRlcw=="
         );
         assert_eq!(
             attachments[1].as_str().unwrap(),
@@ -32649,6 +32791,8 @@ mod tests {
             .unwrap()
             .expect("the pending multi gif row exists");
         assert!(row.attachments[0].is_gif);
+        assert_eq!(row.attachments[0].caption.as_deref(), Some("A;B,% 中"));
+        assert_eq!(row.attachments[1].caption, None);
         assert!(!row.attachments[1].is_gif);
     }
 
@@ -32663,7 +32807,7 @@ mod tests {
 
         // 声明尺寸：URI 参数 + descriptor 两键（首个 tick 即终态盒）。
         let prepared = service
-            .prepare_send_attachment_with_dimensions(
+            .prepare_send_attachment_with_caption(
                 &account.id,
                 &AttachmentSendTarget::Conversation(&conversation.id),
                 "req-dims-1",
@@ -32678,6 +32822,7 @@ mod tests {
                 None,
                 false,
                 Some((640, 480)),
+                Some("single caption"),
             )
             .unwrap();
         let PreparedSend::Dispatch { params, .. } = &prepared else {
@@ -32685,7 +32830,7 @@ mod tests {
         };
         assert_eq!(
             params["attachments"][0].as_str().unwrap(),
-            "data:image/jpeg;width=640;height=480;filename=photo.jpg;base64,YXR0YWNobWVudCBieXRlcw=="
+            "data:image/jpeg;width=640;height=480;caption=single%20caption;filename=photo.jpg;base64,YXR0YWNobWVudCBieXRlcw=="
         );
         let row = service
             .store
@@ -32695,6 +32840,10 @@ mod tests {
         assert_eq!(
             (row.attachments[0].width, row.attachments[0].height),
             (Some(640), Some(480))
+        );
+        assert_eq!(
+            row.attachments[0].caption.as_deref(),
+            Some("single caption")
         );
 
         // 未声明：URI 与 descriptor 逐字节回到 1.293 形状。
@@ -32767,6 +32916,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prepare_send_attachment_caption_rejects_empty_oversize_and_view_once() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let b64 = "YXR0YWNobWVudCBieXRlcw==";
+        for (request_id, caption, view_once) in [
+            ("caption-empty", "".to_string(), false),
+            ("caption-over", "a".repeat(65_537), false),
+            ("caption-view-once", "not allowed".to_string(), true),
+        ] {
+            let rejected = service.prepare_send_attachment_with_caption(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                request_id,
+                b64,
+                16,
+                Some("photo.jpg"),
+                Some("image/jpeg"),
+                None,
+                None,
+                false,
+                view_once,
+                None,
+                false,
+                None,
+                Some(&caption),
+            );
+            assert!(rejected.is_err(), "{request_id} must reject");
+            assert!(
+                service
+                    .store
+                    .message_by_client_request(&account.id, request_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
     /// BUG-11 wire 批复数面：条目级声明尺寸只染自己那条的 data URI 与
     /// descriptor，逐条对齐、互不串号。
     #[test]
@@ -32785,6 +32972,7 @@ mod tests {
                 filename: Some("photo.jpg".into()),
                 content_type: Some("image/jpeg".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             },
             MessagesSendAttachmentEntry {
@@ -32795,6 +32983,7 @@ mod tests {
                 filename: Some("notes.txt".into()),
                 content_type: Some("text/plain".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             },
         ];
@@ -32843,6 +33032,7 @@ mod tests {
             filename: None,
             content_type: None,
             blur_hash: None,
+            attachment_caption: None,
             gif: false,
         }];
         let rejected = service.prepare_send_attachment_multi(
@@ -32929,6 +33119,7 @@ mod tests {
                         filename: filename.map(str::to_string),
                         content_type: content_type.map(str::to_string),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                 )
@@ -33044,6 +33235,7 @@ mod tests {
                 filename: Some("a.txt".into()),
                 content_type: Some("text/plain".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             })
             .collect();
@@ -33080,6 +33272,7 @@ mod tests {
                 filename: Some("big.bin".into()),
                 content_type: Some("application/octet-stream".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             })
             .collect();
@@ -49339,6 +49532,7 @@ mod tests {
                 filename: Some("a.txt".into()),
                 content_type: Some("text/plain".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             },
             MessagesSendAttachmentEntry {
@@ -49350,6 +49544,7 @@ mod tests {
                 filename: Some("b.txt".into()),
                 content_type: Some("text/plain".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             },
         ];

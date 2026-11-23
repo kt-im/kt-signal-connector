@@ -22209,3 +22209,19 @@ UPSTREAM_ERROR 透出（确定性拒绝，盲重放同败）；memberLabel 对�
 `groups.approveJoinRequests`/`groups.revokeInvites` 的独立 refusal（§4.53/
 §4.57）不在本批范围。
 
+## 4.288 普通附件逐条 caption（Contract 1.297）
+
+`messages.attachments.send` 单数面新增可选 `attachmentCaption`，复数面在
+`attachments[]` 条目新增同名键。它对应官方 AttachmentPointer.caption，与消息级
+`text`（DataMessage.body）分离；connector 分别校验，附件 caption 非空且至多
+65536 UTF-8 字节。viewOnce 不允许任一 caption。
+
+写侧在既有附件 data URI 上附加 `;caption=<percent-encoded>`（filename 同款
+编码），engine 将该参数写入对应 AttachmentSpec.caption 并经既有上传原语产
+出 AttachmentPointer.caption。pending descriptor 同步记录；原始 URI 已按
+clientRequestId+attachmentIndex 持久化，ids-only/补字节重试自然保留该陈述。
+
+无新 engine 方法，`ENGINE_CONTRACT_MAX_REVISION` 保持 1.286；旧调用无键时
+data URI/descriptor/线上形状不变。验收覆盖单发/合并转发、分隔符与 CJK、
+非法输入、重试和旧调用字节不变。
+

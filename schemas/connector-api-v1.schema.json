@@ -4397,6 +4397,12 @@
           "maxLength": 128,
           "description": "Optional blur placeholder (contract revision 1.137, §4.127): 1..128 characters, shipped verbatim onto the row descriptor for the sender's own bubble; never decoded or charset-checked. The upstream data-URI attachment channel carries no blurHash key, so upstream recipients compute their own."
         },
+        "attachmentCaption": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "description": "Optional attachment-level caption (contract revision 1.297, §4.288): the official AttachmentPointer.caption for this entry, distinct from message-level text/DataMessage.body. Non-empty and at most 65536 UTF-8 bytes (the service enforces the byte bound); appended to this entry's data URI as ;caption=<percent-encoded>, recorded on its pending descriptor, and preserved by payload-group retries."
+        },
         "gif": {
           "type": "boolean",
           "default": false,
@@ -4486,6 +4492,12 @@
           "minLength": 1,
           "maxLength": 128,
           "description": "Singular form. Optional blur placeholder (contract revision 1.137, §4.127): 1..128 characters, shipped verbatim onto the pending row's descriptor for the sender's own bubble; never decoded or charset-checked (the receive face's own bound — one constant, both directions). Mutually exclusive with the attachments array: the plural form carries per-entry blurHash instead."
+        },
+        "attachmentCaption": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "description": "Singular-form attachment-level caption (contract revision 1.297, §4.288), independent of message-level text. Non-empty and at most 65536 UTF-8 bytes; rides the data URI as ;caption=<percent-encoded>, lands on AttachmentPointer.caption and the pending descriptor, and survives retries. Mutually exclusive with the plural attachments array (each entry carries its own)."
         },
         "width": {
           "type": "integer",
@@ -4583,6 +4595,11 @@
                 {
                   "required": [
                     "blurHash"
+                  ]
+                },
+                {
+                  "required": [
+                    "attachmentCaption"
                   ]
                 },
                 {

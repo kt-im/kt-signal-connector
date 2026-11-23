@@ -2943,14 +2943,15 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                             || params.view_once
                             || params.gif
                             || params.width.is_some()
-                            || params.height.is_some())
+                            || params.height.is_some()
+                            || params.attachment_caption.is_some())
                     {
                         return HostResponse::failure(
                             request_id,
                             reject_probe(
                                 "messages.attachments.send",
-                                "attachments,voiceNote,viewOnce,gif,width,height",
-                                "voiceNote, viewOnce, gif, width and height apply to the singular attachment form only",
+                                "attachments,voiceNote,viewOnce,gif,width,height,attachmentCaption",
+                                "voiceNote, viewOnce, gif, width, height and attachmentCaption apply to the singular attachment form only",
                             ),
                         );
                     }
@@ -3012,7 +3013,7 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                                 }
                             };
                             match runtime
-                                .send_attachment_with_dimensions(
+                                .send_attachment_with_caption(
                                     params.account_id,
                                     target,
                                     params.client_request_id,
@@ -3027,6 +3028,7 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                                     blur_hash,
                                     params.gif,
                                     dimensions,
+                                    params.attachment_caption,
                                 )
                                 .await
                             {

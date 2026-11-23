@@ -5923,6 +5923,46 @@ impl RuntimeSupervisor {
         gif: bool,
         dimensions: Option<(u32, u32)>,
     ) -> Result<MessageRecord, ServiceError> {
+        self.send_attachment_with_caption(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            dimensions,
+            None,
+        )
+        .await
+    }
+
+    /// 单数附件 + 尺寸 + 附件级 caption（契约 1.297 §4.288）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_attachment_with_caption(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: String,
+        size_bytes: u64,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<String>,
+    ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
             let service = self.service.lock().await;
@@ -5940,7 +5980,7 @@ impl RuntimeSupervisor {
                     peer_title: peer_title.as_deref(),
                 }),
             };
-            service.prepare_send_attachment_with_dimensions(
+            service.prepare_send_attachment_with_caption(
                 &account_id,
                 &attachment_target,
                 &client_request_id,
@@ -5955,6 +5995,7 @@ impl RuntimeSupervisor {
                 blur_hash.as_deref(),
                 gif,
                 dimensions,
+                attachment_caption.as_deref(),
             )?
         };
         self.dispatch_prepared(&engine, prepared).await
