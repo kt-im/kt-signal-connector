@@ -21,7 +21,7 @@ use crate::link::now_ms;
 /// The schema version this binary brings a store to. Public because the store
 /// health face (contract revision 1.282) reports both the version the store
 /// answered and this target, and callers must not re-derive one from the other.
-pub const SCHEMA_VERSION: i64 = 50;
+pub const SCHEMA_VERSION: i64 = 51;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -377,6 +377,7 @@ CREATE TABLE IF NOT EXISTS messages (
   attachments_json TEXT,
   attachment_locators TEXT,
   live_attachment_locators TEXT,
+  live_quote_attachment_locators TEXT,
   rich_json TEXT,
   sticker_json TEXT,
   expire_seconds INTEGER,
@@ -7793,15 +7794,31 @@ impl Store {
         // time; the sweep deadline derives from the same clock when the
         // envelope's own start stamp is absent (§4.41).
         let stored_at = crate::link::now_ms();
+        let live_quote_attachment_locators = message.quote_snapshot.as_ref().map(|quote| {
+            serde_json::to_string(
+                &quote
+                    .attachments
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .thumbnail
+                            .as_ref()
+                            .and_then(|thumbnail| thumbnail.locator.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("live quote attachment locators json")
+        });
         let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO messages(
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                     stored_at, body, body_bytes, body_truncated, status, client_request_id,
                     quote_message_id, quote_snapshot, attachments_json, live_attachment_locators,
-                    rich_json, edited_at, sender_name,
+                    live_quote_attachment_locators, rich_json, edited_at, sender_name,
                     mentions_self, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, author_aci
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?17, ?19, ?18, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?17, ?29, ?19, ?18, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
                 params![
                     message.id,
                     message.account_id,
@@ -7856,6 +7873,7 @@ impl Store {
                     message.server_guid,
                     message.server_timestamp.map(|value| value as i64),
                     message.author_aci,
+                    live_quote_attachment_locators,
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -7866,6 +7884,12 @@ impl Store {
             // the existing row's empty positions instead (post-relink repair:
             // the restored row may carry no descriptors while the live echo
             // does).
+            Self::merge_live_quote_attachment_locators_in(
+                &transaction,
+                &message.account_id,
+                &message.id,
+                message.quote_snapshot.as_ref(),
+            )?;
             Self::merge_attachment_faces_in(
                 &transaction,
                 &message.account_id,
@@ -9420,6 +9444,7 @@ impl Store {
                      attachments_json=NULL,
                      attachment_locators=NULL,
                      live_attachment_locators=NULL,
+                     live_quote_attachment_locators=NULL,
                      rich_json=NULL,
                      quote_message_id=NULL,
                      quote_snapshot=NULL
@@ -10721,6 +10746,20 @@ impl Store {
         self.message_attachment_locators_column(account_id, message_id, "live_attachment_locators")
     }
 
+    /// quote 附件缩略图的 live locator，按 quoteSnapshot.attachments 位置对齐。
+    /// 仅内部下载面读取；公开 quoteSnapshot 永不包含这些 key material。
+    pub fn live_quote_attachment_locators(
+        &self,
+        account_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<HistoryAttachmentLocator>, StoreError> {
+        self.message_attachment_locators_column(
+            account_id,
+            message_id,
+            "live_quote_attachment_locators",
+        )
+    }
+
     /// Shared single-column reader behind both locator faces.
     fn message_attachment_locators_column(
         &self,
@@ -10744,6 +10783,115 @@ impl Store {
             })
         })
         .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    /// 重复接收时仅补 quote thumbnail 的空 locator 槽。公开 thumbnail.id
+    /// 必须一致，既有非空 face 永不被后来者覆盖；普通附件回填不写此列。
+    pub fn merge_live_quote_attachment_locators(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        incoming: Option<&MessageQuoteSnapshot>,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let changed = Self::merge_live_quote_attachment_locators_in(
+            &transaction,
+            account_id,
+            message_id,
+            incoming,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed)
+    }
+
+    fn merge_live_quote_attachment_locators_in(
+        transaction: &rusqlite::Transaction<'_>,
+        account_id: &str,
+        message_id: &str,
+        incoming: Option<&MessageQuoteSnapshot>,
+    ) -> Result<bool, StoreError> {
+        let Some(incoming) = incoming else {
+            return Ok(false);
+        };
+        let row = transaction
+            .query_row(
+                "SELECT quote_snapshot, live_quote_attachment_locators
+                   FROM messages WHERE account_id=?1 AND id=?2",
+                params![account_id, message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some((Some(existing_json), locators_json)) = row else {
+            return Ok(false);
+        };
+        let existing: MessageQuoteSnapshot =
+            serde_json::from_str(&existing_json).map_err(|error| {
+                StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(error.into())))
+            })?;
+        let mut locators: Vec<HistoryAttachmentLocator> = match locators_json {
+            Some(json) => serde_json::from_str(&json).map_err(|error| {
+                StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(error.into())))
+            })?,
+            None => Vec::new(),
+        };
+        let mut changed = false;
+        for (index, entry) in incoming.attachments.iter().enumerate() {
+            let Some(incoming_thumb) = entry.thumbnail.as_ref() else {
+                continue;
+            };
+            let Some(incoming_locator) = incoming_thumb.locator.clone() else {
+                continue;
+            };
+            if incoming_locator == HistoryAttachmentLocator::default() {
+                continue;
+            }
+            let Some(existing_thumb) = existing
+                .attachments
+                .get(index)
+                .and_then(|candidate| candidate.thumbnail.as_ref())
+            else {
+                continue;
+            };
+            if existing_thumb.id != incoming_thumb.id {
+                continue;
+            }
+            if locators
+                .get(index)
+                .is_some_and(|locator| *locator != HistoryAttachmentLocator::default())
+            {
+                continue;
+            }
+            if locators.len() <= index {
+                locators.resize(index + 1, HistoryAttachmentLocator::default());
+            }
+            locators[index] = incoming_locator;
+            changed = true;
+        }
+        if changed {
+            transaction
+                .execute(
+                    "UPDATE messages SET live_quote_attachment_locators=?3
+                       WHERE account_id=?1 AND id=?2",
+                    params![
+                        account_id,
+                        message_id,
+                        serde_json::to_string(&locators).expect("quote locators json"),
+                    ],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        Ok(changed)
     }
 
     /// Merge descriptors and their locator faces into an existing row
@@ -14895,7 +15043,7 @@ impl Store {
                         SET body=NULL, body_bytes=NULL, body_truncated=0,
                             quote_snapshot=NULL, attachments_json=NULL,
                             attachment_locators=NULL, live_attachment_locators=NULL,
-                            sticker_json=NULL, rich_json=?2, is_erased=1
+                            live_quote_attachment_locators=NULL, sticker_json=NULL, rich_json=?2, is_erased=1
                       WHERE id=?1",
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -17918,6 +18066,17 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         // 没有数据迁移；旧库里已有的失败行在修复前没有 payload，重试会
         // 要求调用方带 bytes。（v49 把主键改成
         // (account_id, client_request_id, attachment_index) 并重写这张表，见下。）
+    }
+    if current < 51 {
+        // 契约 1.298（§4.289）：quote thumbnail 的内部 locator 列。旧行的
+        // quoteSnapshot 公开元数据保留；历史 pointer 未曾保存，NULL 不回填。
+        if !table_has_column(conn, "messages", "live_quote_attachment_locators")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN live_quote_attachment_locators TEXT",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
     }
     // 契约 1.280（§4.264）：payload 表的主键重建。这一步是**形状驱动**的，
     // 既不被版本号跳过，也不假设「跑到一半」不存在：版本号已经写成 49 的库
@@ -25875,6 +26034,55 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn schema_v51_adds_quote_locator_column_without_rewriting_existing_rows() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "ALTER TABLE messages DROP COLUMN live_quote_attachment_locators",
+                [],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute("UPDATE meta SET value='50' WHERE key='schema_version'", [])
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(
+            table_has_column(
+                &reopened.lock_conn().unwrap(),
+                "messages",
+                "live_quote_attachment_locators"
+            )
+            .unwrap()
+        );
+        let preserved: String = reopened
+            .conn()
+            .query_row(
+                "SELECT signal_account FROM accounts WHERE id=?1",
+                params![account.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, "+15555550100");
+        let version: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     /// 契约 1.280（§4.264）schema v49: the payload table's primary key widens

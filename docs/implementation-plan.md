@@ -22225,3 +22225,23 @@ clientRequestId+attachmentIndex 持久化，ids-only/补字节重试自然保留
 data URI/descriptor/线上形状不变。验收覆盖单发/合并转发、分隔符与 CJK、
 非法输入、重试和旧调用字节不变。
 
+## 4.289 quote 附件缩略图 locator 与下载（Contract 1.298）
+
+`attachments.download` 新增与 `attachmentIndex` 互斥的 `quoteAttachmentIndex`
+（0..7），用于定位 `quoteSnapshot.attachments[index].thumbnail`。两键恰一；
+普通消息附件的旧请求与 locator ladder 不变。quote 缩略图复用同一 attachv2
+下载/校验/解密/落盘链，不新增 base64 数据面。`messages.attachments.open`
+在 quote 请求中额外要求 `quoteAttachmentIndex + attachmentId` 同槽匹配；Main
+不得让同 id 的 outbox 普通附件命中该请求。Desktop 磁盘 mirror 使用
+`quote-thumbnail:<index>` 独立命名空间，真实 thumbnail.id 仅作协议身份。
+
+Store schema 51 新增内部可空 `live_quote_attachment_locators` JSON 列，按 quote
+附件位置保存 thumbnail locator；公开 quoteSnapshot 继续省略 locator/key/path。
+v50 原行不回填、不臆造。旧行或 pointer 缺失保持 INVALID_REQUEST/图标降级；
+已落盘文件按 thumbnail.id 幂等命中。viewOnce 燃烧同时清理 quote thumbnail。
+
+重复接收只按同 thumbnail.id 补空 locator 槽，first-face-wins；remote delete
+与 viewOnce 清除内部列，viewOnce 同时清理缩略图文件。验收覆盖迁移、内部列/
+公开形状隔离、普通/quote 寻址互斥、错误 locator、重复合并、重启下载与 viewOnce
+清理；无新 engine 方法，Engine 契约版本不变。
+

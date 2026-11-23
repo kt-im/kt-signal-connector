@@ -2486,13 +2486,23 @@ impl RuntimeSupervisor {
         &self,
         params: crate::service::AttachmentDownloadParams,
     ) -> Result<Value, ServiceError> {
+        params.validate_address()?;
         self.run_attachment_download_chain(|service| {
-            service.prepare_attachment_download(
-                &params.account_id,
-                &params.conversation_id,
-                &params.message_id,
-                params.attachment_index,
-            )
+            if let Some(index) = params.quote_attachment_index {
+                service.prepare_quote_attachment_download(
+                    &params.account_id,
+                    &params.conversation_id,
+                    &params.message_id,
+                    index,
+                )
+            } else {
+                service.prepare_attachment_download(
+                    &params.account_id,
+                    &params.conversation_id,
+                    &params.message_id,
+                    params.attachment_index.unwrap_or(0),
+                )
+            }
         })
         .await
     }
@@ -9587,12 +9597,23 @@ impl RuntimeSupervisor {
         &self,
         params: crate::service::MessagesAttachmentsOpenParams,
     ) -> Result<MediaOpenView, ServiceError> {
-        self.service.lock().await.open_media_handle(
-            &params.account_id,
-            &params.conversation_id,
-            &params.message_id,
-            &params.attachment_id,
-        )
+        let service = self.service.lock().await;
+        if let Some(index) = params.quote_attachment_index {
+            service.open_quote_media_handle(
+                &params.account_id,
+                &params.conversation_id,
+                &params.message_id,
+                &params.attachment_id,
+                index,
+            )
+        } else {
+            service.open_media_handle(
+                &params.account_id,
+                &params.conversation_id,
+                &params.message_id,
+                &params.attachment_id,
+            )
+        }
     }
 
     /// Media ingest: one sequential chunk from a live handle. The handle

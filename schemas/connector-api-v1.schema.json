@@ -4321,6 +4321,12 @@
           "minLength": 1,
           "maxLength": 128,
           "description": "The upstream attachment id from the received message's attachment metadata; a bare file name, never a path."
+        },
+        "quoteAttachmentIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 7,
+          "description": "Contract 1.298 (§4.289): when present, attachmentId must equal quoteSnapshot.attachments[index].thumbnail.id before any file is opened. Ordinary requests omit this key and retain the pre-1.298 behavior."
         }
       }
     },
@@ -6818,8 +6824,11 @@
       "required": [
         "accountId",
         "conversationId",
-        "messageId",
-        "attachmentIndex"
+        "messageId"
+      ],
+      "oneOf": [
+        { "required": ["attachmentIndex"] },
+        { "required": ["quoteAttachmentIndex"] }
       ],
       "description": "Download one message attachment's bytes from the Signal transit CDN (contract revision 1.61, §4.54, capability attachment-download): the on-demand byte channel for message-attachment pills — the caller names the message and the descriptor's positional index, the connector resolves the row locally and walks the stored pointer face through the official attachv2 pipeline (the same machine as history.attachmentDownload, §4.38 step 3: cdnNumber → cdn base map with the CDN-0 fallback, encodeURIComponent'd cdnKey path, streamed GET with connect 10 s / total 120 s / no redirects, trailing-MAC HMAC-SHA256 then whole-body SHA-256 digest gates, AES-256-CBC decrypt with the IV-prefixed body and PKCS7, the official log-pad trim, the plaintextHash face). The pointer face resolves through the locator ladder: the live-receive column first (persisted since this revision in the internal live_attachment_locators column when the engine projects a receive locator — the engine receive face projects metadata only today, so live rows answer the hole), then the schema-18 import column (the index-aligned archive faces persisted since 1.56). Fail-closed: an index past the descriptor list, or a hole in both locator columns (a descriptor without any pointer face) answers INVALID_REQUEST before any network traffic — never a guessed download. Download, integrity, and decryption failures answer UPSTREAM_ERROR retryable=false — terminal, never auto-retried; local filesystem failures answer UPSTREAM_ERROR retryable=true. Already-present files answer {sizeBytes} without touching the CDN (idempotent dedup: an earlier call, or the engine's own live download of the same id). Result {sizeBytes: N} — the plaintext byte count messages.attachments.open will report; no handle, no path: the bytes stay behind the chunked media triple. Send lane, account-scoped mutating (it lands a file in the governed media directory; the reaction-class write-lane mutex and delete drain barrier serialize it). Contract 1.98: the `attachment-download` capability is the one conditional handshake advertisement — the connector omits the tag unless its media ingest is armed, the exact gate this face answers CAPABILITY_UNAVAILABLE behind. Contract 1.98: the CDN GET rides the launcher's `KT_SIGNAL_SOCKS_PROXY` route as socks5h:// (remote DNS, the same mapping the engine child gets for `ALL_PROXY`) when the process environment carries it, the direct route otherwise; the connect 10 s / total 120 s / no-redirect posture is unchanged..",
       "properties": {
@@ -6836,7 +6845,13 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 31,
-          "description": "The zero-based position of the attachment in the message's received metadata — the descriptor list order the wire row already carries."
+          "description": "The zero-based position of the attachment in the message's received metadata — the descriptor list order the wire row already carries. Mutually exclusive with quoteAttachmentIndex."
+        },
+        "quoteAttachmentIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 7,
+          "description": "Contract 1.298 (§4.289): the zero-based quoteSnapshot.attachments position whose thumbnail is downloaded. Exactly one of attachmentIndex or quoteAttachmentIndex is required. The thumbnail locator rides the internal schema-51 live_quote_attachment_locators column; bytes land under thumbnail.id in the same account media bucket and open through messages.attachments.open. No locator/key/path crosses the host wire."
         }
       }
     },

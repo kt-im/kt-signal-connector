@@ -10300,6 +10300,19 @@ impl ConnectorService {
                     .delete_attachment(&record.account_id, &sanitized_id);
             }
         }
+        if let Some(quote) = record.quote_snapshot.as_ref() {
+            for descriptor in quote
+                .attachments
+                .iter()
+                .filter_map(|entry| entry.thumbnail.as_ref())
+            {
+                if let Ok(sanitized_id) = sanitize_attachment_id(&descriptor.id) {
+                    media
+                        .governor()
+                        .delete_attachment(&record.account_id, &sanitized_id);
+                }
+            }
+        }
         media
             .handles()
             .close_for_message(&record.account_id, &record.id);
@@ -10455,6 +10468,34 @@ impl ConnectorService {
             size_bytes,
             chunk_bytes: MEDIA_CHUNK_BYTES,
         })
+    }
+
+    /// quote-scope open：先证明 attachmentId 属于指定 quote 槽，再复用普通
+    /// 分块句柄，避免同 id 的其他消息/出站附件被误当此引用缩略图。
+    pub fn open_quote_media_handle(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        quote_attachment_index: usize,
+    ) -> Result<MediaOpenView, ServiceError> {
+        let (_account, _conversation, message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
+        let expected = message
+            .quote_snapshot
+            .as_ref()
+            .and_then(|quote| quote.attachments.get(quote_attachment_index))
+            .and_then(|entry| entry.thumbnail.as_ref())
+            .map(|thumbnail| thumbnail.id.as_str());
+        if expected != Some(attachment_id) {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachmentId does not match this quote thumbnail slot",
+                false,
+            )));
+        }
+        self.open_media_handle(account_id, conversation_id, message_id, attachment_id)
     }
 
     /// history.attachmentDownload (contract revision 1.57, §4.38 step 3) —
@@ -10613,6 +10654,72 @@ impl ConnectorService {
             return Ok(PreparedHistoryDownload::AlreadyPresent { size_bytes });
         }
         let locator = self.attachment_locator_for_index(account_id, &message, attachment_index)?;
+        let temp_path = write_dir.join(format!(".{}.{}.tmp", sanitized_id, random_id()));
+        let plaintext_path = write_dir.join(format!(".{}.{}.dec", sanitized_id, random_id()));
+        Ok(PreparedHistoryDownload::Ready {
+            locator,
+            descriptor_size,
+            target,
+            temp_path,
+            plaintext_path,
+        })
+    }
+
+    /// 契约 1.298 §4.289：quoteSnapshot.attachments[index].thumbnail 的
+    /// 下载前链。公开 descriptor 与内部 locator 按同一 quote 位置读取，复用
+    /// 普通附件的 CDN/校验/解密/落盘和后续 openMediaStream 通道。
+    pub fn prepare_quote_attachment_download(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        quote_attachment_index: usize,
+    ) -> Result<PreparedHistoryDownload, ServiceError> {
+        let Some(media) = self.media.as_ref() else {
+            return Err(media_capability_error());
+        };
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        let (_account, _conversation, message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
+        let descriptor = message
+            .quote_snapshot
+            .as_ref()
+            .and_then(|quote| quote.attachments.get(quote_attachment_index))
+            .and_then(|entry| entry.thumbnail.as_ref())
+            .ok_or_else(|| {
+                ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "quoteAttachmentIndex does not name a quote thumbnail of this message",
+                    false,
+                ))
+            })?;
+        let descriptor_size = descriptor.size;
+        let sanitized_id = sanitize_attachment_id(&descriptor.id)?;
+        let write_dir = media.write_dir(account_id)?;
+        let target = write_dir.join(&sanitized_id);
+        if let Some((_, size_bytes)) = media.locate_attachment(account_id, &sanitized_id) {
+            return Ok(PreparedHistoryDownload::AlreadyPresent { size_bytes });
+        }
+        let locator = self
+            .store
+            .live_quote_attachment_locators(account_id, &message.id)?
+            .get(quote_attachment_index)
+            .cloned()
+            .unwrap_or_default();
+        if locator.key.is_none()
+            && locator.cdn_key.is_none()
+            && locator.cdn_number.is_none()
+            && locator.digest.is_none()
+            && locator.plaintext_hash.is_none()
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "quote thumbnail has no downloadable pointer face",
+                false,
+            )));
+        }
         let temp_path = write_dir.join(format!(".{}.{}.tmp", sanitized_id, random_id()));
         let plaintext_path = write_dir.join(format!(".{}.{}.dec", sanitized_id, random_id()));
         Ok(PreparedHistoryDownload::Ready {
@@ -11930,6 +12037,11 @@ impl ConnectorService {
             // the existing face is authoritative and never moved.
             let mut attachments = receive.attachments.clone();
             fill_missing_attachment_ids(&existing.id, &mut attachments);
+            self.store.merge_live_quote_attachment_locators(
+                &account.id,
+                &existing.id,
+                receive.quote.as_ref(),
+            )?;
             self.store
                 .merge_live_attachment_faces(&account.id, &existing.id, &attachments)?;
             return Ok(Vec::new());
@@ -18108,12 +18220,14 @@ pub struct HistoryAttachmentDownloadParams {
 
 /// u64-bounded usize parse for `attachmentIndex`: JSON numbers are unsigned
 /// in the schema; anything else is the params-gate INVALID_REQUEST.
-fn parse_attachment_index<'de, D>(deserializer: D) -> Result<usize, D::Error>
+fn parse_optional_attachment_index<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = u64::deserialize(deserializer)?;
-    usize::try_from(value).map_err(|_| {
+    let Some(value) = Option::<u64>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    usize::try_from(value).map(Some).map_err(|_| {
         serde::de::Error::invalid_value(
             serde::de::Unexpected::Unsigned(value),
             &"an index inside the unsigned platform range",
@@ -18140,8 +18254,24 @@ pub struct AttachmentDownloadParams {
     pub account_id: String,
     pub conversation_id: String,
     pub message_id: String,
-    #[serde(deserialize_with = "parse_attachment_index")]
-    pub attachment_index: usize,
+    #[serde(default, deserialize_with = "parse_optional_attachment_index")]
+    pub attachment_index: Option<usize>,
+    /// 契约 1.298 §4.289：quoteSnapshot.attachments 的缩略图位置；与 attachmentIndex 恰一。
+    #[serde(default, deserialize_with = "parse_optional_attachment_index")]
+    pub quote_attachment_index: Option<usize>,
+}
+
+impl AttachmentDownloadParams {
+    pub(crate) fn validate_address(&self) -> Result<(), ServiceError> {
+        if self.attachment_index.is_some() == self.quote_attachment_index.is_some() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "exactly one of attachmentIndex or quoteAttachmentIndex must be provided",
+                false,
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// attachments.requestBackfill params (contract revision 1.175, §4.175):
@@ -20107,6 +20237,9 @@ pub struct MessagesAttachmentsOpenParams {
     pub conversation_id: String,
     pub message_id: String,
     pub attachment_id: String,
+    /// 契约 1.298：quote 槽位。存在时 attachmentId 必须等于该槽 thumbnail.id。
+    #[serde(default)]
+    pub quote_attachment_index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47793,11 +47926,36 @@ mod tests {
         assert_eq!(error.into_api().code, "MESSAGE_NOT_FOUND");
     }
 
+    #[test]
+    fn attachment_download_address_requires_exactly_one_normal_or_quote_index() {
+        for params in [
+            serde_json::json!({
+                "accountId": "a", "conversationId": "c", "messageId": "m", "attachmentIndex": 0
+            }),
+            serde_json::json!({
+                "accountId": "a", "conversationId": "c", "messageId": "m", "quoteAttachmentIndex": 0
+            }),
+        ] {
+            let parsed: AttachmentDownloadParams = serde_json::from_value(params).unwrap();
+            parsed.validate_address().unwrap();
+        }
+        for params in [
+            serde_json::json!({"accountId": "a", "conversationId": "c", "messageId": "m"}),
+            serde_json::json!({
+                "accountId": "a", "conversationId": "c", "messageId": "m",
+                "attachmentIndex": 0, "quoteAttachmentIndex": 0
+            }),
+        ] {
+            let parsed: AttachmentDownloadParams = serde_json::from_value(params).unwrap();
+            assert!(parsed.validate_address().is_err());
+        }
+    }
+
     /// Inbound quote + attachment metadata ride the message row end to end:
     /// ingest persists them, list_messages returns them verbatim.
     #[test]
     fn inbound_quote_and_attachment_metadata_roundtrip_through_the_store() {
-        let (_temp, mut service) = service();
+        let (_temp, mut service) = media_service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let receive = NormalizedReceive {
             required_protocol_version: None,
@@ -47869,7 +48027,23 @@ mod tests {
             server_timestamp: None,
         };
         service
-            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .ingest_receive(receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let mut replay = receive;
+        replay.quote.as_mut().unwrap().attachments[0]
+            .thumbnail
+            .as_mut()
+            .unwrap()
+            .locator = Some(crate::store::HistoryAttachmentLocator {
+            key: Some("thumbnail-key".into()),
+            cdn_key: Some("thumbnail-cdn-key".into()),
+            cdn_number: Some(2),
+            digest: Some("thumbnail-digest".into()),
+            ..Default::default()
+        });
+        // 同一 quote 行的迟到 pointer 只补空槽，不改公开 snapshot。
+        service
+            .ingest_receive(replay, crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
 
         let row = service
@@ -47879,6 +48053,8 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
+        let message_id = row.id.clone();
+        let duplicate = row.clone();
         let quote = row
             .quote_snapshot
             .expect("quote snapshot survives the roundtrip");
@@ -47895,11 +48071,81 @@ mod tests {
         let thumb = quoted.thumbnail.as_ref().expect("thumbnail survives");
         assert_eq!(thumb.id, "quote-thumb");
         assert_eq!(thumb.size, Some(1024));
-        assert_eq!(thumb.locator, None);
+        assert_eq!(thumb.locator, None, "公开 quoteSnapshot 不泄 locator");
+        let locators = service
+            .store_ref()
+            .live_quote_attachment_locators(&account.id, &message_id)
+            .unwrap();
+        assert_eq!(locators.len(), 1);
+        assert_eq!(locators[0].key.as_deref(), Some("thumbnail-key"));
+        assert_eq!(locators[0].cdn_key.as_deref(), Some("thumbnail-cdn-key"));
+        assert_eq!(locators[0].cdn_number, Some(2));
         assert_eq!(row.attachments.len(), 1);
         assert_eq!(row.attachments[0].id, "att-1");
         assert_eq!(row.attachments[0].filename.as_deref(), Some("shot.png"));
         assert_eq!(row.attachments[0].size, Some(2048));
+
+        let prepared = service
+            .prepare_quote_attachment_download(&account.id, &conversation.id, &message_id, 0)
+            .unwrap();
+        let PreparedHistoryDownload::Ready {
+            locator,
+            descriptor_size,
+            target,
+            ..
+        } = prepared
+        else {
+            panic!("quote thumbnail must stage its own pointer and file")
+        };
+        assert_eq!(locator.key.as_deref(), Some("thumbnail-key"));
+        assert_eq!(descriptor_size, Some(1024));
+        assert!(target.ends_with("quote-thumb"));
+        assert!(
+            service
+                .prepare_quote_attachment_download(&account.id, &conversation.id, &message_id, 1)
+                .is_err()
+        );
+        std::fs::write(&target, b"abc").unwrap();
+        let opened = service
+            .open_quote_media_handle(&account.id, &conversation.id, &message_id, "quote-thumb", 0)
+            .unwrap();
+        assert_eq!(opened.size_bytes, 3);
+        assert!(
+            service
+                .open_quote_media_handle(&account.id, &conversation.id, &message_id, "other-id", 0)
+                .is_err()
+        );
+        assert!(
+            service
+                .open_quote_media_handle(
+                    &account.id,
+                    &conversation.id,
+                    &message_id,
+                    "quote-thumb",
+                    1
+                )
+                .is_err()
+        );
+        let mut duplicate = duplicate;
+        duplicate.quote_snapshot.as_mut().unwrap().attachments[0]
+            .thumbnail
+            .as_mut()
+            .unwrap()
+            .locator = Some(crate::store::HistoryAttachmentLocator {
+            key: Some("later-key-must-not-overwrite".into()),
+            ..Default::default()
+        });
+        assert!(
+            !service
+                .store_ref()
+                .insert_message(&duplicate, None, None, false)
+                .unwrap()
+        );
+        let preserved = service
+            .store_ref()
+            .live_quote_attachment_locators(&account.id, &message_id)
+            .unwrap();
+        assert_eq!(preserved[0].key.as_deref(), Some("thumbnail-key"));
     }
 
     /// Contract 1.259 (§4.243, batch Z1 · S14), the receive seam: an
