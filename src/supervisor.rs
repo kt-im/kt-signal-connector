@@ -13725,6 +13725,7 @@ mod tests {
             id: "account-1".into(),
             display_name: None,
             masked_address: "•••".into(),
+            e164: None,
             state,
             linked_at: Some(1),
             last_message_at: None,

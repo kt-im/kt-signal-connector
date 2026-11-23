@@ -96,6 +96,10 @@
   `width`/`height`。无两键的旧 payload 逐字节不变；两键在 data URI 既有参数面之后
   纯附加，不改任何既有键名语义。`ENGINE_CONTRACT_MAX_REVISION` 保持 1.286（引擎
   参数面零新增方法：data URI 参数是既有附件形状的附加参数）。)
+- Contract revision: 1.300 (2026-11-23; §4.291 本机账号 e164 读面：`accounts` 各
+  AccountSummary 新增可选 `e164`，来源为同账号行 `signal_account` 的合法 `+` 前缀号码；
+  `maskedAddress`、日志和诊断脱敏不变。旧 connector 缺席该键时桌面回退 masked。
+  详见 §4.291。)
 - Contract revision: 1.296 (2026-11-22; §4.287 群写面解除 refusal：`groups.update`
   的 description/admin/ban 四族从整调 CAPABILITY_UNAVAILABLE 拒绝改为折叠转发——
   `groupDescription` → engine `description` 写臂（与 listGroups 投影同词，§4.188
@@ -22244,6 +22248,17 @@ v50 原行不回填、不臆造。旧行或 pointer 缺失保持 INVALID_REQUEST
 与 viewOnce 清除内部列，viewOnce 同时清理缩略图文件。验收覆盖迁移、内部列/
 公开形状隔离、普通/quote 寻址互斥、错误 locator、重复合并、重启下载与 viewOnce
 清理；无新 engine 方法，Engine 契约版本不变。
+
+## 4.291 本机账号 e164 读面（Contract 1.300）
+
+`accounts` 的 AccountSummary 新增可选 `e164`。accounts 表每行都是本机已关联账号，
+因此读取同一行已有的 `signal_account` 不构成额外身份探测；只有合法号码形状才投影，
+ACI 或其他键形仍为缺席。`maskedAddress` 保持原值，日志、诊断包和错误面继续脱敏。
+
+`list_accounts`、单个 `account_summary` 与 proxy-group 列表使用同一 row mapper，
+避免不同读面字段漂移。旧客户端忽略该键时行为不变；新桌面在 displayName/既有用户名
+和备注优先级之后使用 `e164`，缺失才回退 `maskedAddress`。测试覆盖全部读面、
+合法 e164、非 e164 键缺席及诊断字段不扩写。
 
 ## 4.290 大文件分块出站与 file URI（Contract 1.299）
 

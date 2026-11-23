@@ -1241,6 +1241,10 @@ pub struct AccountSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub masked_address: String,
+    /// This account's own full e164 (contract 1.300). Masking stays on the
+    /// existing maskedAddress/log/diagnostic surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e164: Option<String>,
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub linked_at: Option<u64>,
@@ -4490,7 +4494,7 @@ impl Store {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch, signal_account
                  FROM accounts ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -4519,7 +4523,7 @@ impl Store {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch, signal_account
                  FROM accounts WHERE proxy_group=?1
                  ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
             )
@@ -4662,7 +4666,7 @@ impl Store {
     pub fn account_summary(&self, account_id: &str) -> Result<Option<AccountSummary>, StoreError> {
         self.lock_conn()?
             .query_row(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch, signal_account
                  FROM accounts WHERE id=?1",
                 params![account_id],
                 account_summary_from_row,
@@ -18372,6 +18376,7 @@ fn account_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account
     Ok(AccountSummary {
         id: row.get(0)?,
         masked_address: row.get(1)?,
+        e164: plus_e164_form(&row.get::<_, String>(13)?),
         display_name: row.get(2)?,
         state: static_state(row.get::<_, String>(3)?),
         linked_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
@@ -19203,6 +19208,53 @@ mod tests {
         let summary = store.account_summary("a").unwrap().unwrap();
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["engineEpoch"], 2);
+    }
+
+    #[test]
+    fn account_summaries_expose_own_e164_without_changing_masked_address() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO accounts(id, signal_account, masked_address, state)
+                 VALUES('e164', '+15550001', '+15***01', 'ready');
+                 INSERT INTO accounts(id, signal_account, masked_address, state)
+                 VALUES('aci', '8fc8f8e2-1111-4222-8333-444455556666', '8fc***e2', 'ready');",
+            )
+            .unwrap();
+
+        let summary = store.account_summary("e164").unwrap().unwrap();
+        assert_eq!(summary.e164.as_deref(), Some("+15550001"));
+        assert_eq!(summary.masked_address, "+15***01");
+        assert_eq!(
+            store
+                .list_accounts()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == "e164")
+                .unwrap()
+                .e164,
+            summary.e164
+        );
+        assert_eq!(
+            store
+                .list_accounts_in_group(DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == "e164")
+                .unwrap()
+                .e164,
+            summary.e164
+        );
+
+        let aci = store.account_summary("aci").unwrap().unwrap();
+        assert_eq!(aci.e164, None);
+        let json = serde_json::to_value(aci).unwrap();
+        assert!(json.get("e164").is_none());
+        assert_eq!(json["maskedAddress"], "8fc***e2");
     }
 
     #[test]
