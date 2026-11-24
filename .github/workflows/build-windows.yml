@@ -216,7 +216,7 @@ jobs:
               body = json.dumps(catalog, ensure_ascii=False, indent=2).encode()
               try:
                   meta = bucket.head_object(CATALOG_KEY)
-                  bucket.put_object(CATALOG_KEY, body, headers={'x-oss-meta-sha256': hashlib.sha256(body).hexdigest()})
+                  bucket.put_object(CATALOG_KEY, body, headers={'x-oss-meta-sha256': hashlib.sha256(body).hexdigest(), 'Cache-Control': 'no-cache, no-store, must-revalidate'})
                   print(f"catalog updated: connector {VERSION} size={size} sha256={sha}")
                   print(f"public url: https://download.ktai.im/{CATALOG_KEY}")
                   break

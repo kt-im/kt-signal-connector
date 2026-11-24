@@ -84,3 +84,32 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run Release --ref "${{ needs.plan.outputs.tag }}"
+      - name: Wait for Release and verify the source catalog
+        if: steps.tag.outputs.released == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          COMPONENT: connector
+        run: |
+          set -euo pipefail
+          run_id=""
+          for attempt in {1..15}; do
+            run_id="$(gh run list --workflow Release --ref "$TAG" --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+            [[ -n "$run_id" ]] && break
+            sleep 2
+          done
+          if [[ -z "$run_id" ]]; then echo "Release run not found for $TAG" >&2; exit 1; fi
+          gh run watch "$run_id" --exit-status
+          python3 - "$TAG" "$COMPONENT" "$run_id" <<'PY'
+          import json, sys, urllib.request
+          tag, component, run_id = sys.argv[1:]
+          url = f"https://download.ktai.im/kt/signal-runtime/catalog.json?run={run_id}"
+          with urllib.request.urlopen(url, timeout=30) as response:
+              catalog = json.load(response)
+          entry = next((row for row in catalog.get("releases", []) if row.get("component") == component), None)
+          expected = tag[1:]
+          if not entry or entry.get("version") != expected or not entry.get("artifacts"):
+              raise SystemExit(f"catalog verification failed for {component} {expected}: {entry}")
+          print(f"catalog verified: {component} {expected}, platforms={sorted(entry['artifacts'])}")
+          PY
