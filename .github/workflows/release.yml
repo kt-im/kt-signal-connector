@@ -212,6 +212,10 @@ jobs:
                             "desktopApiVersion": {"min": "1.0", "max": "1.0"}}
                   catalog.setdefault('releases', []).append(connector)
               connector['version'] = version
+              # 兼容区间必须每次发布都刷新：connector 支持 engine contract 1.200-1.285
+              # （见 docs/engine-contract-handshake.md）；旧逻辑只在首次创建时写入，导致 1.92 残留。
+              connector['engineContractRevision'] = {'min': '1.200', 'max': '1.285'}
+              connector['desktopApiVersion'] = {'min': '1.0', 'max': '1.0'}
               connector.setdefault('artifacts', {})[platform] = {
                   "platform": platform,
                   "sizeBytes": size,
