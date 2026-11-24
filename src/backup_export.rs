@@ -2455,11 +2455,14 @@ mod tests {
         // artifact go, the newest stays, and foreign files are not the
         // build's business.
         prepare_plaintext_dir_for_export(&root);
-        let remaining: Vec<String> = std::fs::read_dir(&root)
+        let mut remaining: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
+        // Directory iteration order is filesystem-dependent; this assertion
+        // checks membership, not the host filesystem's enumeration order.
+        remaining.sort();
         assert_eq!(
             remaining,
             vec![listed[0].name.clone(), "unrelated.jsonl".to_string()]
