@@ -2486,13 +2486,23 @@ impl RuntimeSupervisor {
         &self,
         params: crate::service::AttachmentDownloadParams,
     ) -> Result<Value, ServiceError> {
+        params.validate_address()?;
         self.run_attachment_download_chain(|service| {
-            service.prepare_attachment_download(
-                &params.account_id,
-                &params.conversation_id,
-                &params.message_id,
-                params.attachment_index,
-            )
+            if let Some(index) = params.quote_attachment_index {
+                service.prepare_quote_attachment_download(
+                    &params.account_id,
+                    &params.conversation_id,
+                    &params.message_id,
+                    index,
+                )
+            } else {
+                service.prepare_attachment_download(
+                    &params.account_id,
+                    &params.conversation_id,
+                    &params.message_id,
+                    params.attachment_index.unwrap_or(0),
+                )
+            }
         })
         .await
     }
@@ -5923,6 +5933,46 @@ impl RuntimeSupervisor {
         gif: bool,
         dimensions: Option<(u32, u32)>,
     ) -> Result<MessageRecord, ServiceError> {
+        self.send_attachment_with_caption(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            dimensions,
+            None,
+        )
+        .await
+    }
+
+    /// 单数附件 + 尺寸 + 附件级 caption（契约 1.297 §4.288）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_attachment_with_caption(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: String,
+        size_bytes: u64,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<String>,
+    ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
             let service = self.service.lock().await;
@@ -5940,7 +5990,7 @@ impl RuntimeSupervisor {
                     peer_title: peer_title.as_deref(),
                 }),
             };
-            service.prepare_send_attachment_with_dimensions(
+            service.prepare_send_attachment_with_caption(
                 &account_id,
                 &attachment_target,
                 &client_request_id,
@@ -5955,6 +6005,103 @@ impl RuntimeSupervisor {
                 blur_hash.as_deref(),
                 gif,
                 dimensions,
+                attachment_caption.as_deref(),
+            )?
+        };
+        self.dispatch_prepared(&engine, prepared).await
+    }
+
+    pub async fn begin_attachment_upload(
+        &self,
+        account_id: String,
+        client_request_id: String,
+        size_bytes: u64,
+    ) -> Result<crate::service::AttachmentUploadBegin, ServiceError> {
+        self.service.lock().await.begin_attachment_upload(
+            &account_id,
+            &client_request_id,
+            size_bytes,
+        )
+    }
+
+    pub async fn write_attachment_upload_chunk(
+        &self,
+        account_id: String,
+        upload_id: String,
+        offset: u64,
+        data_base64: String,
+    ) -> Result<crate::service::AttachmentUploadWrite, ServiceError> {
+        self.service.lock().await.write_attachment_upload_chunk(
+            &account_id,
+            &upload_id,
+            offset,
+            &data_base64,
+        )
+    }
+
+    pub async fn abort_attachment_upload(
+        &self,
+        account_id: String,
+        upload_id: String,
+    ) -> Result<bool, ServiceError> {
+        self.service
+            .lock()
+            .await
+            .abort_attachment_upload(&account_id, &upload_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_attachment_staged(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        upload_id: String,
+        size_bytes: u64,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<String>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<String>,
+    ) -> Result<MessageRecord, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let mut service = self.service.lock().await;
+            let attachment_target = match &target {
+                SendTarget::Conversation(conversation_id) => {
+                    AttachmentSendTarget::Conversation(conversation_id)
+                }
+                SendTarget::Peer {
+                    kind,
+                    peer_key,
+                    peer_title,
+                } => AttachmentSendTarget::Peer(PeerTarget {
+                    kind,
+                    peer_key,
+                    peer_title: peer_title.as_deref(),
+                }),
+            };
+            service.prepare_send_attachment_staged(
+                &account_id,
+                &attachment_target,
+                &client_request_id,
+                &upload_id,
+                size_bytes,
+                filename.as_deref(),
+                content_type.as_deref(),
+                text.as_deref(),
+                quote_message_id.as_deref(),
+                voice_note,
+                view_once,
+                blur_hash.as_deref(),
+                gif,
+                dimensions,
+                attachment_caption.as_deref(),
             )?
         };
         self.dispatch_prepared(&engine, prepared).await
@@ -9546,12 +9693,23 @@ impl RuntimeSupervisor {
         &self,
         params: crate::service::MessagesAttachmentsOpenParams,
     ) -> Result<MediaOpenView, ServiceError> {
-        self.service.lock().await.open_media_handle(
-            &params.account_id,
-            &params.conversation_id,
-            &params.message_id,
-            &params.attachment_id,
-        )
+        let service = self.service.lock().await;
+        if let Some(index) = params.quote_attachment_index {
+            service.open_quote_media_handle(
+                &params.account_id,
+                &params.conversation_id,
+                &params.message_id,
+                &params.attachment_id,
+                index,
+            )
+        } else {
+            service.open_media_handle(
+                &params.account_id,
+                &params.conversation_id,
+                &params.message_id,
+                &params.attachment_id,
+            )
+        }
     }
 
     /// Media ingest: one sequential chunk from a live handle. The handle
@@ -13567,6 +13725,7 @@ mod tests {
             id: "account-1".into(),
             display_name: None,
             masked_address: "•••".into(),
+            e164: None,
             state,
             linked_at: Some(1),
             last_message_at: None,
@@ -15171,6 +15330,7 @@ mod tests {
                 source: Some("+15555550101".into()),
                 source_uuid: None,
                 peer_name: Some("Peer".into()),
+                source_number: None,
                 group_id: None,
                 text: Some("persist me".into()),
                 text_bytes: Some(10),

@@ -21,7 +21,7 @@ use crate::link::now_ms;
 /// The schema version this binary brings a store to. Public because the store
 /// health face (contract revision 1.282) reports both the version the store
 /// answered and this target, and callers must not re-derive one from the other.
-pub const SCHEMA_VERSION: i64 = 50;
+pub const SCHEMA_VERSION: i64 = 51;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -345,6 +345,14 @@ CREATE TABLE IF NOT EXISTS conversations (
   identity_verified_json TEXT,
   read_watermark_ms INTEGER,
   report_spam_token TEXT,
+  -- 契约 1.295（§4.248 · PNI 会话归并）：官方 maybeMergeContacts 三键索引
+  -- （serviceId/e164/pni）的本地数据面——直聊行的三个服务键各一列，形状解析
+  -- （PNI: 前缀 / 裸 ACI UUID / ±E164）+ §4.190 身份梯材料回填，PNI 合并后
+  -- 只是会话属性字段（官方 updatePni 词形）。NULL = 该键材料未到达（诚实
+  -- 缺席，绝不发明）。归并发现与 summary 的 pni/serviceId 投影读这里。
+  identity_aci TEXT,
+  identity_e164 TEXT,
+  identity_pni TEXT,
   UNIQUE(account_id, kind, peer_key),
   FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
@@ -369,6 +377,7 @@ CREATE TABLE IF NOT EXISTS messages (
   attachments_json TEXT,
   attachment_locators TEXT,
   live_attachment_locators TEXT,
+  live_quote_attachment_locators TEXT,
   rich_json TEXT,
   sticker_json TEXT,
   expire_seconds INTEGER,
@@ -661,6 +670,15 @@ CREATE INDEX IF NOT EXISTS messages_expire_due
 CREATE INDEX IF NOT EXISTS messages_retry_queue
   ON messages(next_attempt_at, id)
   WHERE direction='outgoing' AND status='failed' AND next_attempt_at IS NOT NULL;
+-- 契约 1.295（§4.248）：身份列的归并发现探针（maybeMergeContacts 部分匹配
+-- 腿）。放本层是因为老库的列由 ensure_additive_columns 无条件补齐，SCHEMA_DDL
+-- 层建索引会在旧库上引用不存在的列。
+CREATE INDEX IF NOT EXISTS conversations_identity_aci
+  ON conversations(account_id, identity_aci)
+  WHERE identity_aci IS NOT NULL;
+CREATE INDEX IF NOT EXISTS conversations_identity_pni
+  ON conversations(account_id, identity_pni)
+  WHERE identity_pni IS NOT NULL;
 ";
 /// Retention: newest rows a conversation keeps regardless of age.
 const MAX_MESSAGES_PER_CONVERSATION: i64 = 2_000;
@@ -1223,6 +1241,10 @@ pub struct AccountSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub masked_address: String,
+    /// This account's own full e164 (contract 1.300). Masking stays on the
+    /// existing maskedAddress/log/diagnostic surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e164: Option<String>,
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub linked_at: Option<u64>,
@@ -1607,9 +1629,10 @@ pub struct ConversationSummary {
     /// phone key), `serviceId` (a UUID-shaped key, or a phone-keyed row in
     /// either spelling mapped through the most recent ingest-written
     /// `peer_identities` row — the 1.146 §4.144 widening puts the ACI on the
-    /// `+`-keyed rows too), or neither. `pni` is reserved and always
-    /// absent — the connector has no PNI source and never invents one (the
-    /// honest hole §4.129 documents).
+    /// `+`-keyed rows too), or neither. 契约 1.295（§4.248）：`pni` 腿启用
+    /// ——PNI 形键的行投影自己的键，其余行的 PNI 材料（归并/绑定落下后
+    /// PNI 只是会话属性字段，官方 updatePni 词形）从身份列投影；材料未
+    /// 到 = 键缺席，绝不发明。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2563,6 +2586,7 @@ fn ledger_stamp_receipt(
 struct ConversationIdentifiers {
     service_id: Option<String>,
     e164: Option<String>,
+    pni: Option<String>,
     group_id: Option<String>,
 }
 
@@ -2576,8 +2600,39 @@ struct ConversationIdentifiers {
 /// seen yet, or a `+`-keyed row the ingest mapped) — through the most recent
 /// `peer_identities` mapping the ingest wrote, both spellings probed. A key
 /// nothing resolves answers all-absent: the row stays addressable by id, no
-/// identifier is invented. `pni` never appears — the connector has no PNI
-/// source (the honest hole §4.129 documents).
+/// identifier is invented.
+///
+/// 契约 1.295（§4.248 · PNI 会话归并）：`pni` 腿启用——三键索引的数据面。
+/// 直聊行的 pni = 身份列 identity_pni（PNI 合并/绑定材料落下后 PNI 只是
+/// 会话属性字段，官方 updatePni 词形）；PNI 形键的行（行键即材料）恒投影
+/// 自己的键。材料未到 = 键缺席（诚实，绝不发明）——pre-1.295 主机读到的行
+/// 逐字节不变。
+fn stamped_identity_columns(
+    conn: &Connection,
+    account_id: &str,
+    peer_key: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    conn.query_row(
+        "SELECT identity_aci, identity_e164, identity_pni FROM conversations
+          WHERE account_id=?1 AND kind='direct' AND peer_key=?2",
+        params![account_id, peer_key],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+    .map(|row| row.unwrap_or_default())
+    .unwrap_or_default()
+}
+
+/// 契约 1.295（§4.248）：直聊行已落库身份列的容错读（stamped_identity_columns
+/// 的 lossy 孪生）——查询失败降级全空，summary 永不因身份缺席失败整行
+/// （§4.42 容错纪律）。
+fn stamped_identity_columns_lossy(
+    conn: &Connection,
+    account_id: &str,
+    peer_key: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    stamped_identity_columns(conn, account_id, peer_key)
+}
 fn conversation_identifiers(
     conn: &Connection,
     account_id: &str,
@@ -2591,13 +2646,18 @@ fn conversation_identifiers(
         });
     }
     if peer_key.starts_with('+') {
+        let (stamped_aci, _, stamped_pni) =
+            stamped_identity_columns_lossy(conn, account_id, peer_key);
         return Ok(ConversationIdentifiers {
             e164: Some(peer_key.to_string()),
-            service_id: aci_for_phone_key_on(conn, account_id, peer_key)?,
+            service_id: aci_for_phone_key_on(conn, account_id, peer_key)?.or(stamped_aci),
+            pni: stamped_pni,
             ..ConversationIdentifiers::default()
         });
     }
     if crate::engine::is_uuid_shaped(peer_key) {
+        let (_, stamped_e164, stamped_pni) =
+            stamped_identity_columns_lossy(conn, account_id, peer_key);
         return Ok(ConversationIdentifiers {
             service_id: Some(peer_key.to_string()),
             // §4.229（契约 1.219，直聊标题 JOIN 键归一批）：e164 腿跨桥补齐——
@@ -2605,20 +2665,23 @@ fn conversation_identifiers(
             // 在 peer_identities 桥里持有的号码按 §4.129 家族补号码面；
             // 两种拼法归一 `+` 前缀 wire 词形，非号码键（不该出现在桥里）
             // 诚实缺席，绝不发明。
-            e164: phone_key_for_aci_on(conn, account_id, peer_key)?.and_then(|key| {
-                if key.starts_with('+') {
-                    Some(key)
-                } else if !key.is_empty() && key.chars().all(|c| c.is_ascii_digit()) {
-                    Some(format!("+{key}"))
-                } else {
-                    None
-                }
-            }),
+            e164: phone_key_for_aci_on(conn, account_id, peer_key)?
+                .and_then(|key| plus_e164_form(&key))
+                .or(stamped_e164),
+            pni: stamped_pni,
             ..ConversationIdentifiers::default()
         });
     }
+    // 契约 1.295（§4.248）：PNI 形键（及落不进上面两臂的键）——行键即 pni
+    // 材料（PNI 行恒投影自己的键）；serviceId 经桥或身份列升格的 ACI 面，
+    // 号码面只在身份列真有材料时出现（绝不发明）。
+    let (stamped_aci, _stamped_e164, stamped_pni) =
+        stamped_identity_columns_lossy(conn, account_id, peer_key);
     Ok(ConversationIdentifiers {
-        service_id: aci_for_phone_key_on(conn, account_id, peer_key)?,
+        service_id: aci_for_phone_key_on(conn, account_id, peer_key)?.or(stamped_aci),
+        // 号码面不在此臂投影：裸号码/其它键行的 e164 历史面是缺席（§4.129
+        // 词形），身份列只作归并材料——无 pni 材料时零行为变化。
+        pni: stamped_pni.or_else(|| pni_shaped(peer_key).then(|| peer_key.to_string())),
         ..ConversationIdentifiers::default()
     })
 }
@@ -4431,7 +4494,7 @@ impl Store {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch, signal_account
                  FROM accounts ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -4460,7 +4523,7 @@ impl Store {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch, signal_account
                  FROM accounts WHERE proxy_group=?1
                  ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
             )
@@ -4603,7 +4666,7 @@ impl Store {
     pub fn account_summary(&self, account_id: &str) -> Result<Option<AccountSummary>, StoreError> {
         self.lock_conn()?
             .query_row(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci, state_origin, state_observed_at, state_revision, engine_epoch, signal_account
                  FROM accounts WHERE id=?1",
                 params![account_id],
                 account_summary_from_row,
@@ -5022,6 +5085,21 @@ impl Store {
             )
             .optional()
             .map_err(map_err)?;
+        // 契约 1.295（§4.248）：三键兜底同款——ACI 键行缺席时，已升格
+        // identity_aci 的行（号码键行拿过桥/回填材料）就是 canonical。
+        let canonical_id = match canonical_id {
+            Some(id) => Some(id),
+            None => tx
+                .query_row(
+                    "SELECT id FROM conversations
+                      WHERE account_id=?1 AND kind='direct' AND identity_aci=?2
+                      ORDER BY id",
+                    params![account_id, aci],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(map_err)?,
+        };
         let Some(canonical_id) = canonical_id else {
             return Ok(None);
         };
@@ -5099,6 +5177,23 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(map_err)?;
+        // 契约 1.295（§4.248）：壳行的三键身份面——折并时 COALESCE 吸收进
+        // canonical 行（PNI 合并后只是会话属性字段，官方 updatePni 词形）；
+        // PNI 形壳键本身就是 pni 材料（键形即材料）。
+        let (shell_identity_aci, shell_identity_e164, shell_identity_pni): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = tx
+            .query_row(
+                "SELECT identity_aci, identity_e164, identity_pni FROM conversations
+                 WHERE id=?1",
+                params![shell_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(map_err)?;
+        let shell_pni_material =
+            shell_identity_pni.or_else(|| pni_shaped(&shell_key).then(|| shell_key.clone()));
 
         // Messages move deduplicated by the signal-identity tuple (the table
         // carries no unique constraint — the NOT EXISTS guard is the dedupe);
@@ -5227,7 +5322,10 @@ impl Store {
                     AND m.account_id=conversations.account_id
                     AND m.direction='incoming'
                     AND m.mentions_self=1
-                    AND m.sent_at > COALESCE(conversations.read_watermark_ms, 0))
+                    AND m.sent_at > COALESCE(conversations.read_watermark_ms, 0)),
+               identity_aci = COALESCE(identity_aci, ?12),
+               identity_e164 = COALESCE(identity_e164, ?13),
+               identity_pni = COALESCE(identity_pni, ?14)
              WHERE id=?11",
             params![
                 shell_id,
@@ -5241,6 +5339,9 @@ impl Store {
                 shell_last_at,
                 shell_last_preview,
                 canonical_id,
+                aci,
+                shell_identity_e164,
+                shell_pni_material,
             ],
         )
         .map_err(map_err)?;
@@ -5261,18 +5362,15 @@ impl Store {
                     &sent_at.to_string(),
                 ]);
                 // The wire word is the `+`-prefixed E.164 form (§4.235's wire
-                // word shape): a bare-digit shell key gains the prefix, a
-                // `+`-prefixed one rides verbatim, a non-phone key stays
-                // verbatim (never invented).
-                let wire_number = if !shell_key.starts_with('+')
-                    && !shell_key.is_empty()
-                    && shell_key.chars().all(|c| c.is_ascii_digit())
-                {
-                    format!("+{shell_key}")
-                } else {
-                    shell_key.clone()
+                // word shape): both phone spellings normalize to the prefix.
+                // 契约 1.295（§4.248）：非号码壳键（PNI 服务键等）走官方
+                // getNumber 的无号码臂——number 键诚实缺席，提示行以壳行
+                // 标题称呼对方（PNI 绝不当号码/标题展示，官方同判）。
+                let wire_number = plus_e164_form(&shell_key);
+                let text = match wire_number.as_deref() {
+                    Some(number) => format!("已合并与 {number} 的会话记录"),
+                    None => format!("已合并与 {shell_title} 的会话记录"),
                 };
-                let text = format!("已合并与 {wire_number} 的会话记录");
                 Some(MessageRecord {
                     is_erased: false,
                     delete_failed: false,
@@ -5300,7 +5398,8 @@ impl Store {
                     rich: Some(crate::engine::NormalizedRich {
                         conversation_merge: Some(crate::engine::NormalizedConversationMerge {
                             obsolete_conversation_title: Some(shell_title.clone()),
-                            obsolete_conversation_number: Some(wire_number),
+                            // 非号码壳键（PNI 形）→ 键缺席（官方无号码臂）。
+                            obsolete_conversation_number: wire_number,
                         }),
                         ..Default::default()
                     }),
@@ -5375,6 +5474,9 @@ impl Store {
             "lastMessagePreview": shell_last_preview,
             "droppedMessageIds": dropped_message_ids,
             "droppedEventIds": dropped_event_ids,
+            "identityAci": shell_identity_aci,
+            "identityE164": shell_identity_e164,
+            "identityPni": shell_pni_material,
             "noticeMinted": merge_notice.is_some(),
         });
         tx.execute(
@@ -5993,11 +6095,29 @@ impl Store {
             return Ok(existing);
         }
         let id = stable_hash_id(&[account_id, kind, peer_key]);
+        // 契约 1.295（§4.248）：新直聊行随建随落身份列（形状解析，与
+        // backfill_conversation_identity_columns 同一解析器）——后续归并发现
+        // 与 summary 投影读这三列；群行走 NULL（三键索引是直聊面）。
+        let (identity_aci, identity_e164, identity_pni) = if kind == "direct" {
+            identity_shape_of_peer_key(peer_key)
+        } else {
+            (None, None, None)
+        };
         self.lock_conn()?
             .execute(
-                "INSERT INTO conversations(id, account_id, kind, peer_key, title, unread_count, muted, pinned)
-                 VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, 0)",
-                params![id, account_id, kind, peer_key, title],
+                "INSERT INTO conversations(id, account_id, kind, peer_key, title, unread_count, muted, pinned,
+                 identity_aci, identity_e164, identity_pni)
+                 VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, 0, ?6, ?7, ?8)",
+                params![
+                    id,
+                    account_id,
+                    kind,
+                    peer_key,
+                    title,
+                    identity_aci,
+                    identity_e164,
+                    identity_pni,
+                ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(ConversationRow {
@@ -6753,7 +6873,9 @@ impl Store {
                         profile_sharing: None,
                         in_system_contacts: None,
                         service_id: identifiers.service_id,
-                        pni: None,
+                        // 契约 1.295（§4.248）：pni 腿从身份列投影
+                        // （材料未到 = 键缺席，pre-1.295 行逐字节不变）。
+                        pni: identifiers.pni,
                         e164: identifiers.e164,
                         group_id: identifiers.group_id,
                         // Contract 1.138 (§4.131): the stored blocked bit,
@@ -7676,15 +7798,31 @@ impl Store {
         // time; the sweep deadline derives from the same clock when the
         // envelope's own start stamp is absent (§4.41).
         let stored_at = crate::link::now_ms();
+        let live_quote_attachment_locators = message.quote_snapshot.as_ref().map(|quote| {
+            serde_json::to_string(
+                &quote
+                    .attachments
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .thumbnail
+                            .as_ref()
+                            .and_then(|thumbnail| thumbnail.locator.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("live quote attachment locators json")
+        });
         let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO messages(
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                     stored_at, body, body_bytes, body_truncated, status, client_request_id,
                     quote_message_id, quote_snapshot, attachments_json, live_attachment_locators,
-                    rich_json, edited_at, sender_name,
+                    live_quote_attachment_locators, rich_json, edited_at, sender_name,
                     mentions_self, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, author_aci
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?17, ?19, ?18, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?17, ?29, ?19, ?18, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
                 params![
                     message.id,
                     message.account_id,
@@ -7739,6 +7877,7 @@ impl Store {
                     message.server_guid,
                     message.server_timestamp.map(|value| value as i64),
                     message.author_aci,
+                    live_quote_attachment_locators,
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -7749,6 +7888,12 @@ impl Store {
             // the existing row's empty positions instead (post-relink repair:
             // the restored row may carry no descriptors while the live echo
             // does).
+            Self::merge_live_quote_attachment_locators_in(
+                &transaction,
+                &message.account_id,
+                &message.id,
+                message.quote_snapshot.as_ref(),
+            )?;
             Self::merge_attachment_faces_in(
                 &transaction,
                 &message.account_id,
@@ -9303,6 +9448,7 @@ impl Store {
                      attachments_json=NULL,
                      attachment_locators=NULL,
                      live_attachment_locators=NULL,
+                     live_quote_attachment_locators=NULL,
                      rich_json=NULL,
                      quote_message_id=NULL,
                      quote_snapshot=NULL
@@ -9949,6 +10095,79 @@ impl Store {
         Ok(())
     }
 
+    /// 契约 1.295（§4.248 · PNI 会话归并）：把一条「同人身份绑定」的观察落进
+    /// conversations 身份列——官方 maybeMergeContacts 三键索引在本地行的
+    /// 数据面。与 [`Self::upsert_peer_identity`] 分工：桥表（PK 每账号每
+    /// ACI 一行）只装「ACI → 最近一次观察到的 peer_key」的单值映射，pni
+    /// 材料不进桥（写桥会顶掉号码腿）；pni 归并材料住身份列——归并后 PNI
+    /// 只是会话属性字段（官方 updatePni 词形，models/conversations.preload.ts
+    /// :2322）。
+    ///
+    /// 幂等：aci 腿/e164 腿只在 NULL 时补（首次观察钉住）；pni 腿是「新者
+    /// 胜」（对端换号重注册会拿到新 PNI，官方 updatePni 同语义），重复证据
+    /// 重写同值零变化。degenerate（aci == peer_key）零写入。
+    pub fn stamp_peer_identity_binding(
+        &self,
+        account_id: &str,
+        aci: &str,
+        peer_key: &str,
+    ) -> Result<(), StoreError> {
+        if aci == peer_key {
+            return Ok(());
+        }
+        let conn = self.lock_conn()?;
+        let map_err = |error: rusqlite::Error| StoreError::Unavailable(Some(error));
+        // (a) 键在 peer_key 上的行拿 ACI 面（PNI 行/号码行的「升格」——行以
+        // ACI 暴露 serviceId，桌面备注键 signalRemarkKeyFor 由此不孤儿）；
+        // PNI 形键同时补自己的 pni 面（建列前落库的行由开库回填兜底）。
+        conn.execute(
+            "UPDATE conversations SET identity_aci=?3
+              WHERE account_id=?1 AND kind='direct' AND peer_key=?2
+                AND identity_aci IS NULL",
+            params![account_id, peer_key, aci],
+        )
+        .map_err(map_err)?;
+        if pni_shaped(peer_key) {
+            conn.execute(
+                "UPDATE conversations SET identity_pni=?3
+                  WHERE account_id=?1 AND kind='direct' AND peer_key=?2
+                    AND identity_pni IS NULL",
+                params![account_id, peer_key, peer_key],
+            )
+            .map_err(map_err)?;
+        }
+        // (b) 这个人的 ACI 键行（或已升格 identity_aci 的行）收属性面：pni
+        // 新者胜（官方 updatePni），e164 双拼法归一后首次补齐。
+        conn.execute(
+            "UPDATE conversations SET identity_aci=?3
+              WHERE account_id=?1 AND kind='direct' AND peer_key=?2
+                AND identity_aci IS NULL",
+            params![account_id, aci, aci],
+        )
+        .map_err(map_err)?;
+        if pni_shaped(peer_key) {
+            conn.execute(
+                "UPDATE conversations SET identity_pni=?3
+                  WHERE account_id=?1 AND kind='direct'
+                    AND (peer_key=?2 OR identity_aci=?2)
+                    AND peer_key<>?4",
+                params![account_id, aci, peer_key, peer_key],
+            )
+            .map_err(map_err)?;
+        }
+        if let Some(e164) = plus_e164_form(peer_key) {
+            conn.execute(
+                "UPDATE conversations SET identity_e164=?3
+                  WHERE account_id=?1 AND kind='direct'
+                    AND (peer_key=?2 OR identity_aci=?2)
+                    AND identity_e164 IS NULL",
+                params![account_id, aci, e164],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
     /// The peer keys one ACI has been observed as (contract revision 1.38):
     /// the §4.37 ladder's second rung. Empty when the account has no recorded
     /// mapping — the ACI itself stays the first rung.
@@ -10531,6 +10750,20 @@ impl Store {
         self.message_attachment_locators_column(account_id, message_id, "live_attachment_locators")
     }
 
+    /// quote 附件缩略图的 live locator，按 quoteSnapshot.attachments 位置对齐。
+    /// 仅内部下载面读取；公开 quoteSnapshot 永不包含这些 key material。
+    pub fn live_quote_attachment_locators(
+        &self,
+        account_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<HistoryAttachmentLocator>, StoreError> {
+        self.message_attachment_locators_column(
+            account_id,
+            message_id,
+            "live_quote_attachment_locators",
+        )
+    }
+
     /// Shared single-column reader behind both locator faces.
     fn message_attachment_locators_column(
         &self,
@@ -10554,6 +10787,115 @@ impl Store {
             })
         })
         .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    /// 重复接收时仅补 quote thumbnail 的空 locator 槽。公开 thumbnail.id
+    /// 必须一致，既有非空 face 永不被后来者覆盖；普通附件回填不写此列。
+    pub fn merge_live_quote_attachment_locators(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        incoming: Option<&MessageQuoteSnapshot>,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let changed = Self::merge_live_quote_attachment_locators_in(
+            &transaction,
+            account_id,
+            message_id,
+            incoming,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed)
+    }
+
+    fn merge_live_quote_attachment_locators_in(
+        transaction: &rusqlite::Transaction<'_>,
+        account_id: &str,
+        message_id: &str,
+        incoming: Option<&MessageQuoteSnapshot>,
+    ) -> Result<bool, StoreError> {
+        let Some(incoming) = incoming else {
+            return Ok(false);
+        };
+        let row = transaction
+            .query_row(
+                "SELECT quote_snapshot, live_quote_attachment_locators
+                   FROM messages WHERE account_id=?1 AND id=?2",
+                params![account_id, message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some((Some(existing_json), locators_json)) = row else {
+            return Ok(false);
+        };
+        let existing: MessageQuoteSnapshot =
+            serde_json::from_str(&existing_json).map_err(|error| {
+                StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(error.into())))
+            })?;
+        let mut locators: Vec<HistoryAttachmentLocator> = match locators_json {
+            Some(json) => serde_json::from_str(&json).map_err(|error| {
+                StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(error.into())))
+            })?,
+            None => Vec::new(),
+        };
+        let mut changed = false;
+        for (index, entry) in incoming.attachments.iter().enumerate() {
+            let Some(incoming_thumb) = entry.thumbnail.as_ref() else {
+                continue;
+            };
+            let Some(incoming_locator) = incoming_thumb.locator.clone() else {
+                continue;
+            };
+            if incoming_locator == HistoryAttachmentLocator::default() {
+                continue;
+            }
+            let Some(existing_thumb) = existing
+                .attachments
+                .get(index)
+                .and_then(|candidate| candidate.thumbnail.as_ref())
+            else {
+                continue;
+            };
+            if existing_thumb.id != incoming_thumb.id {
+                continue;
+            }
+            if locators
+                .get(index)
+                .is_some_and(|locator| *locator != HistoryAttachmentLocator::default())
+            {
+                continue;
+            }
+            if locators.len() <= index {
+                locators.resize(index + 1, HistoryAttachmentLocator::default());
+            }
+            locators[index] = incoming_locator;
+            changed = true;
+        }
+        if changed {
+            transaction
+                .execute(
+                    "UPDATE messages SET live_quote_attachment_locators=?3
+                       WHERE account_id=?1 AND id=?2",
+                    params![
+                        account_id,
+                        message_id,
+                        serde_json::to_string(&locators).expect("quote locators json"),
+                    ],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        Ok(changed)
     }
 
     /// Merge descriptors and their locator faces into an existing row
@@ -13424,7 +13766,9 @@ impl Store {
                         profile_sharing: None,
                         in_system_contacts: None,
                         service_id: identifiers.service_id,
-                        pni: None,
+                        // 契约 1.295（§4.248）：pni 腿从身份列投影
+                        // （材料未到 = 键缺席，pre-1.295 行逐字节不变）。
+                        pni: identifiers.pni,
                         e164: identifiers.e164,
                         group_id: identifiers.group_id,
                         // Contract 1.138 (§4.131): the stored blocked bit,
@@ -14703,7 +15047,7 @@ impl Store {
                         SET body=NULL, body_bytes=NULL, body_truncated=0,
                             quote_snapshot=NULL, attachments_json=NULL,
                             attachment_locators=NULL, live_attachment_locators=NULL,
-                            sticker_json=NULL, rich_json=?2, is_erased=1
+                            live_quote_attachment_locators=NULL, sticker_json=NULL, rich_json=?2, is_erased=1
                       WHERE id=?1",
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -15539,6 +15883,9 @@ fn apply_schema(conn: &Connection) -> Result<(), StoreError> {
     // （会话列表 INTERNAL_ERROR / UI「暂无聊天」）。这一层保证任何
     // 加列都不会再被版本号门控漏掉。
     ensure_additive_columns(conn)?;
+    // 契约 1.295（§4.248）：身份列回填——形状驱动 + §4.190 身份梯材料，
+    // 每次开库无条件跑，逐列 IS NULL 闸保证幂等可重跑（详见函数文档）。
+    backfill_conversation_identity_columns(conn)?;
     conn.execute_batch(POST_MIGRATION_SCHEMA_DDL)
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
     Ok(())
@@ -16132,6 +16479,17 @@ fn title_should_upgrade(current: &str, candidate: &str) -> bool {
     if cur.contains("***") && !cand.contains("***") {
         return true;
     }
+    // A bare E.164 is itself a placeholder-in-waiting, not a display name
+    // (official getTitle ladder: profile -> system -> e164 — the number is
+    // the fallback, never terminal). The number-title leg of the ingest
+    // fallback writes exactly this shape, so a later profile/system name
+    // from the contacts sync must still upgrade it.
+    if cur.starts_with('+')
+        && cur[1..].chars().all(|c| c.is_ascii_digit())
+        && !cand.starts_with('+')
+    {
+        return true;
+    }
     false
 }
 
@@ -16230,6 +16588,13 @@ fn ensure_additive_columns(conn: &Connection) -> Result<(), StoreError> {
             None,
         ),
         ("conversations", "color_from_primary", "INTEGER", None),
+        // 契约 1.295（§4.248 · PNI 会话归并）：官方 maybeMergeContacts 三键
+        // 索引（serviceId/e164/pni）的服务键列——纯加列，无条件幂等补齐，
+        // 不靠版本号门控（本函数文档注释的纪律）；回填见
+        // backfill_conversation_identity_columns。
+        ("conversations", "identity_aci", "TEXT", None),
+        ("conversations", "identity_e164", "TEXT", None),
+        ("conversations", "identity_pni", "TEXT", None),
     ];
     for (table, column, kind, legacy) in COLUMNS {
         if table_has_column(conn, table, column)? {
@@ -16254,6 +16619,146 @@ fn ensure_additive_columns(conn: &Connection) -> Result<(), StoreError> {
             );
         }
     }
+    Ok(())
+}
+
+/// 契约 1.295（§4.248 · PNI 会话归并）：PNI 服务键词形判定——引擎把 PNI
+/// 目的地投影成 `PNI:<uuid>` 前缀形（engine 侧 ConversationIdentifier 的
+/// 会话词形，engine.rs 投影注释自证），与裸 ACI UUID（`is_uuid_shaped`）和
+/// ±E164 号码键三形互斥。前缀后面不是严格 UUID 的键不是 PNI 材料，诚实
+/// 判否（装饰/截断值一概不认，宁缺勿错）。
+fn pni_shaped(peer_key: &str) -> bool {
+    peer_key
+        .strip_prefix("PNI:")
+        .is_some_and(crate::engine::is_uuid_shaped)
+}
+
+/// The `+`-prefixed E.164 wire form of a phone-shaped key (either spelling
+/// normalizes, the §4.129 family's dual-form discipline); None for non-phone
+/// keys — a number face is never invented for one.
+fn plus_e164_form(peer_key: &str) -> Option<String> {
+    let trimmed = peer_key.trim();
+    let digits = trimmed.strip_prefix('+').unwrap_or(trimmed);
+    if trimmed.is_empty()
+        || !digits.chars().all(|c| c.is_ascii_digit())
+        || trimmed.matches('+').count() > 1
+    {
+        return None;
+    }
+    Some(format!("+{digits}"))
+}
+
+/// 契约 1.295（§4.248）：一个直聊行按 peer_key 形状解析出的服务键三元组
+/// （aci/e164/pni，官方 maybeMergeContacts 的三键索引词形）。`PNI:<uuid>`
+/// → pni 腿，裸 UUID → aci 腿，号码（两种拼法归一 `+` 前缀）→ e164 腿；
+/// 其余形状（用户名、任意文本）三元组全空——键材料未到达，绝不发明。
+fn identity_shape_of_peer_key(peer_key: &str) -> (Option<String>, Option<String>, Option<String>) {
+    if pni_shaped(peer_key) {
+        return (None, None, Some(peer_key.to_string()));
+    }
+    if crate::engine::is_uuid_shaped(peer_key) {
+        return (Some(peer_key.to_string()), None, None);
+    }
+    if let Some(e164) = plus_e164_form(peer_key) {
+        return (None, Some(e164), None);
+    }
+    (None, None, None)
+}
+
+/// 契约 1.295（§4.248 · PNI 会话归并）：conversations 身份列的存量回填——
+/// 无条件幂等，每次开库执行（与 ensure_additive_columns 同纪律：不看版本号，
+/// 逐列 IS NULL 闸，重跑零变化）。
+///
+/// 两遍材料，来源各一：
+/// 1. **形状遍**：按 peer_key 现有形状解析（`PNI:`/裸 ACI UUID/±E164），
+///    直聊行缺哪列补哪列；
+/// 2. **身份梯遍（§4.190/§4.144 材料）**：peer_identities 桥行（§4.37
+///    收路 / §4.144 同步批写下）两向补齐——桥的 peer_key 腿命中本行键时
+///    回填 identity_aci（PNI 行/号码行由此拿到 ACI 面，桌面备注键 serviceId
+///    不孤儿）；桥的 aci 腿命中本行键时回填 identity_e164（`+` 归一词形）。
+///    同 peer_key 多 ACI 歧义时**不回填**（宁缺勿错——桥无时间戳，选哪个
+///    都是发明）；aci 腿是主键，天然无歧义。
+fn backfill_conversation_identity_columns(conn: &Connection) -> Result<(), StoreError> {
+    let map_err = |error: rusqlite::Error| StoreError::Unavailable(Some(error));
+    // 形状遍：只取仍缺列的直聊行（全列已满的行零成本跳过）。
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, peer_key FROM conversations
+                  WHERE kind='direct'
+                    AND (identity_aci IS NULL OR identity_e164 IS NULL
+                         OR identity_pni IS NULL)",
+            )
+            .map_err(map_err)?;
+        let mapped = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(map_err)?;
+        mapped.collect::<Result<Vec<_>, _>>().map_err(map_err)?
+    };
+    for (id, peer_key) in rows {
+        let (aci, e164, pni) = identity_shape_of_peer_key(&peer_key);
+        for (value, column) in [
+            (aci, "identity_aci"),
+            (e164, "identity_e164"),
+            (pni, "identity_pni"),
+        ] {
+            let Some(value) = value else { continue };
+            conn.execute(
+                &format!(
+                    "UPDATE conversations SET {column}=?1
+                     WHERE id=?2 AND {column} IS NULL"
+                ),
+                params![value, id],
+            )
+            .map_err(map_err)?;
+        }
+    }
+    // 身份梯遍（peer_key → aci 方向）：双拼法探桥，唯一命中才回填。
+    conn.execute(
+        "UPDATE conversations
+           SET identity_aci = (
+             SELECT pi.aci FROM peer_identities pi
+              WHERE pi.account_id = conversations.account_id
+                AND pi.peer_key IN (
+                    conversations.peer_key,
+                    '+' || conversations.peer_key,
+                    substr(conversations.peer_key, 2)))
+         WHERE kind='direct'
+           AND identity_aci IS NULL
+           AND (
+             SELECT count(*) FROM peer_identities pi
+              WHERE pi.account_id = conversations.account_id
+                AND pi.peer_key IN (
+                    conversations.peer_key,
+                    '+' || conversations.peer_key,
+                    substr(conversations.peer_key, 2))) = 1",
+        [],
+    )
+    .map_err(map_err)?;
+    // 身份梯遍（aci → peer_key 方向）：号码腿补 identity_e164（`+` 归一）；
+    // 桥的主键是 (account, aci)，天然至多一行，无歧义闸需求。
+    conn.execute(
+        "UPDATE conversations
+           SET identity_e164 = (
+             SELECT CASE WHEN pi.peer_key GLOB '+[0-9]*'
+                        THEN pi.peer_key
+                        ELSE '+' || pi.peer_key END
+               FROM peer_identities pi
+              WHERE pi.account_id = conversations.account_id
+                AND pi.aci = conversations.peer_key
+                AND (pi.peer_key GLOB '+[0-9]*' OR pi.peer_key GLOB '[0-9]*'))
+         WHERE kind='direct'
+           AND identity_e164 IS NULL
+           AND EXISTS (
+             SELECT 1 FROM peer_identities pi
+              WHERE pi.account_id = conversations.account_id
+                AND pi.aci = conversations.peer_key
+                AND (pi.peer_key GLOB '+[0-9]*' OR pi.peer_key GLOB '[0-9]*'))",
+        [],
+    )
+    .map_err(map_err)?;
     Ok(())
 }
 
@@ -17566,6 +18071,17 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         // 要求调用方带 bytes。（v49 把主键改成
         // (account_id, client_request_id, attachment_index) 并重写这张表，见下。）
     }
+    if current < 51 {
+        // 契约 1.298（§4.289）：quote thumbnail 的内部 locator 列。旧行的
+        // quoteSnapshot 公开元数据保留；历史 pointer 未曾保存，NULL 不回填。
+        if !table_has_column(conn, "messages", "live_quote_attachment_locators")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN live_quote_attachment_locators TEXT",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     // 契约 1.280（§4.264）：payload 表的主键重建。这一步是**形状驱动**的，
     // 既不被版本号跳过，也不假设「跑到一半」不存在：版本号已经写成 49 的库
     // 可能还是中间形状（(client_request_id, attachment_index)，主键不含
@@ -17860,6 +18376,7 @@ fn account_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account
     Ok(AccountSummary {
         id: row.get(0)?,
         masked_address: row.get(1)?,
+        e164: plus_e164_form(&row.get::<_, String>(13)?),
         display_name: row.get(2)?,
         state: static_state(row.get::<_, String>(3)?),
         linked_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
@@ -18448,6 +18965,19 @@ mod tests {
     /// Path characters that would change a SQLite URI's meaning are escaped;
     /// everything a normal path uses stays readable.
     #[test]
+    fn title_upgrade_treats_a_bare_e164_as_a_placeholder() {
+        // 号码是官方梯的 fallback 不是终态：真名到达必须能升上去。
+        assert!(title_should_upgrade("+15555550101", "Alice Example"));
+        // 候选也是号码（换号场景）→ 不经此腿，保持既有保守语义。
+        assert!(!title_should_upgrade("+15555550101", "+15555550109"));
+        // 真名不会被号码降级；真名换真名仍走既有规则（不升）。
+        assert!(!title_should_upgrade("Alice", "+15555550101"));
+        assert!(!title_should_upgrade("Alice Example", "Alice"));
+        // 掩码腿行为不变（既有语义回归钉）。
+        assert!(title_should_upgrade("8fc***e2", "Alice"));
+        assert!(!title_should_upgrade("8fc***e2", "+15***01"));
+    }
+    #[test]
     fn the_read_only_probe_uri_escapes_uri_control_characters() {
         assert_eq!(
             read_only_store_uri(Path::new("/tmp/kt state/connector.sqlite3")),
@@ -18678,6 +19208,53 @@ mod tests {
         let summary = store.account_summary("a").unwrap().unwrap();
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["engineEpoch"], 2);
+    }
+
+    #[test]
+    fn account_summaries_expose_own_e164_without_changing_masked_address() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO accounts(id, signal_account, masked_address, state)
+                 VALUES('e164', '+15550001', '+15***01', 'ready');
+                 INSERT INTO accounts(id, signal_account, masked_address, state)
+                 VALUES('aci', '8fc8f8e2-1111-4222-8333-444455556666', '8fc***e2', 'ready');",
+            )
+            .unwrap();
+
+        let summary = store.account_summary("e164").unwrap().unwrap();
+        assert_eq!(summary.e164.as_deref(), Some("+15550001"));
+        assert_eq!(summary.masked_address, "+15***01");
+        assert_eq!(
+            store
+                .list_accounts()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == "e164")
+                .unwrap()
+                .e164,
+            summary.e164
+        );
+        assert_eq!(
+            store
+                .list_accounts_in_group(DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == "e164")
+                .unwrap()
+                .e164,
+            summary.e164
+        );
+
+        let aci = store.account_summary("aci").unwrap().unwrap();
+        assert_eq!(aci.e164, None);
+        let json = serde_json::to_value(aci).unwrap();
+        assert!(json.get("e164").is_none());
+        assert_eq!(json["maskedAddress"], "8fc***e2");
     }
 
     #[test]
@@ -22398,6 +22975,137 @@ mod tests {
         assert_eq!(ids(&number_orphan.id), (None, None, None, None));
     }
 
+    /// 契约 1.295（§4.248）：身份列存量回填——形状驱动 + §4.190 身份梯材料，
+    /// 每次开库无条件幂等执行（ensure_additive_columns 同纪律，不靠版本号
+    /// 门控）。模拟 pre-1.295 老库：裸 SQL 建行（无身份列值），重开回填，
+    /// 二次重开零变化；桥同 peer_key 多 ACI 歧义不回填（宁缺勿错）。
+    #[test]
+    fn conversation_identity_backfill_is_shape_driven_and_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        const PNI_KEY: &str = "PNI:11111111-2222-4333-8444-555555555555";
+        const ACI_KEY: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        const PLUS_ACI: &str = "22222222-3333-4333-8444-555555555555";
+        const PNI_ACI: &str = "33333333-4444-4555-8666-777777777777";
+        const AMBIGUOUS_A: &str = "44444444-5555-4666-8777-888888888888";
+        const AMBIGUOUS_B: &str = "55555555-6666-4777-8888-999999999999";
+        // pre-1.295 老库形状：直聊/群行都不带身份列值（裸 SQL，绕过
+        // ensure_conversation 的新路径）。
+        let legacy_row = |kind: &str, peer_key: &str| {
+            let id = stable_hash_id(&[&account.id, kind, peer_key]);
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO conversations(id, account_id, kind, peer_key, title,
+                       unread_count, muted, pinned)
+                     VALUES(?1, ?2, ?3, ?4, 'legacy', 0, 0, 0)",
+                    params![id, account.id, kind, peer_key],
+                )
+                .unwrap();
+            id
+        };
+        let pni_row = legacy_row("direct", PNI_KEY);
+        let aci_row = legacy_row("direct", ACI_KEY);
+        let plus_row = legacy_row("direct", "+15555550101");
+        let bare_row = legacy_row("direct", "15555550102");
+        let ambiguous_row = legacy_row("direct", "+15555550103");
+        let group_row = legacy_row("group", "AbCdEf0123456789=");
+        // §4.190 身份梯材料（桥行）。
+        store
+            .upsert_peer_identity(&account.id, PLUS_ACI, "+15555550101")
+            .unwrap();
+        store
+            .upsert_peer_identity(&account.id, PNI_ACI, PNI_KEY)
+            .unwrap();
+        store
+            .upsert_peer_identity(&account.id, ACI_KEY, "+15555550104")
+            .unwrap();
+        // 同 peer_key 两个 ACI：歧义，不回填。
+        store
+            .upsert_peer_identity(&account.id, AMBIGUOUS_A, "+15555550103")
+            .unwrap();
+        store
+            .upsert_peer_identity(&account.id, AMBIGUOUS_B, "+15555550103")
+            .unwrap();
+
+        drop(store);
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        fn identity(store: &Store, id: &str) -> (Option<String>, Option<String>, Option<String>) {
+            store
+                .conn()
+                .query_row(
+                    "SELECT identity_aci, identity_e164, identity_pni
+                       FROM conversations WHERE id=?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        }
+        // 形状遍补 pni 腿 + 唯一桥命中把 PNI 行升格 ACI 面
+        //（备注键 serviceId 锚不孤儿）。
+        assert_eq!(
+            identity(&store, &pni_row),
+            (Some(PNI_ACI.into()), None, Some(PNI_KEY.into()))
+        );
+        assert_eq!(
+            identity(&store, &aci_row),
+            (Some(ACI_KEY.into()), Some("+15555550104".into()), None)
+        );
+        assert_eq!(
+            identity(&store, &plus_row),
+            (Some(PLUS_ACI.into()), Some("+15555550101".into()), None)
+        );
+        assert_eq!(
+            identity(&store, &bare_row),
+            (None, Some("+15555550102".into()), None)
+        );
+        // 歧义桥：宁缺勿错。
+        assert_eq!(
+            identity(&store, &ambiguous_row),
+            (None, Some("+15555550103".into()), None)
+        );
+        // 群行不参与三键索引。
+        assert_eq!(identity(&store, &group_row), (None, None, None));
+        // summary 投影：PNI 行的 pni 面 + 升格 serviceId；+行双面。
+        let pni_summary = store
+            .conversation_summary(&account.id, &pni_row)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pni_summary.pni.as_deref(), Some(PNI_KEY));
+        assert_eq!(pni_summary.service_id.as_deref(), Some(PNI_ACI));
+        let plus_summary = store
+            .conversation_summary(&account.id, &plus_row)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plus_summary.e164.as_deref(), Some("+15555550101"));
+        assert_eq!(plus_summary.service_id.as_deref(), Some(PLUS_ACI));
+
+        // 幂等：二次重开零变化（逐列 IS NULL 闸）。
+        drop(store);
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert_eq!(
+            identity(&store, &pni_row),
+            (Some(PNI_ACI.into()), None, Some(PNI_KEY.into()))
+        );
+        assert_eq!(
+            identity(&store, &aci_row),
+            (Some(ACI_KEY.into()), Some("+15555550104".into()), None)
+        );
+        assert_eq!(
+            identity(&store, &ambiguous_row),
+            (None, Some("+15555550103".into()), None)
+        );
+    }
+
     /// Contract 1.146 (§4.144): `contacts.list` direct rows additively
     /// carry the derived serviceId through the same §4.129 family — a
     /// UUID-shaped peer key verbatim, a phone-keyed row (either spelling)
@@ -25378,6 +26086,55 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn schema_v51_adds_quote_locator_column_without_rewriting_existing_rows() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "ALTER TABLE messages DROP COLUMN live_quote_attachment_locators",
+                [],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute("UPDATE meta SET value='50' WHERE key='schema_version'", [])
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(
+            table_has_column(
+                &reopened.lock_conn().unwrap(),
+                "messages",
+                "live_quote_attachment_locators"
+            )
+            .unwrap()
+        );
+        let preserved: String = reopened
+            .conn()
+            .query_row(
+                "SELECT signal_account FROM accounts WHERE id=?1",
+                params![account.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, "+15555550100");
+        let version: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     /// 契约 1.280（§4.264）schema v49: the payload table's primary key widens

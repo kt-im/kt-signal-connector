@@ -141,6 +141,10 @@
             "messages.sendText",
             "messages.retryText",
             "messages.attachments.send",
+            "messages.attachments.sendStaged",
+            "attachments.upload.begin",
+            "attachments.upload.write",
+            "attachments.upload.abort",
             "messages.attachments.retry",
             "messages.sendSticker",
             "messages.sendContact",
@@ -1341,6 +1345,74 @@
             "properties": {
               "params": {
                 "$ref": "#/$defs/messagesRetryTextParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "messages.attachments.sendStaged"
+              }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/messagesSendStagedAttachmentParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "attachments.upload.begin"
+              }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/attachmentUploadBeginParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "attachments.upload.write"
+              }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/attachmentUploadWriteParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "attachments.upload.abort"
+              }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/attachmentUploadAbortParams"
               }
             }
           }
@@ -3326,7 +3398,7 @@
         "accountId",
         "limit"
       ],
-      "description": "Read lane over the local conversation cache; ordered by newest message, page-bounded, cursor-resumable. Contract 1.43 (§4.42): the result includes the linked account's own Note to Self direct conversation — the contacts sync no longer drops the self entry, so its skeleton materializes like any contact's — and every summary row carries isSelf (always-serialized boolean): true exactly for the direct conversation whose peerKey equals the account's own number (number-based, the §4.24 boundary: the own ACI is not queryable upstream, so a UUID-keyed row cannot be marked), false on every other row including groups. The self row's title is raw contact material (the account's own profile name); the desktop localizes the Note to Self title and avatar from isSelf — the connector ships no copy. Contract 1.60 (§4.52): every summary row carries isTerminated (plain bool, present only when true — absent on false, pre-1.60 hosts read byte-identical rows): the group termination flag the 1.53 §4.50 appendix sync capture stores in the kind='group' contacts row, stamped at read time (a group and its contacts row share the stable id; a group with no cache row yet, every direct row, and every pre-1.53 sync row answer absent/false). The desktop forward-target filter consumes it (the official selectors/composable face excludes terminated groups); the receive chain cannot refresh the flag, only the next contacts.sync can, and syncedAt remains the staleness signal. Contract 1.65 (§4.58): every summary row carries messageRequestAccepted (bare always-serialized boolean, the muted/pinned/isSelf discipline — both values are meaningful): the official isConversationAccepted multi-factor derived at read time over the row's stored engine factor stamp (mrr_factors_json — {hidden, profileSharing, blocked} the throttled listContacts enrich stamps on its existing round trip, schema version 20; an engine without the flags stamps the probed-absent {}), the message window, and isSelf. Contract 1.70 (§4.58 consume batch): the stamp also carries the authoritative acceptResponseType face (the official factor's first weight) that a linked device's syncMessage.messageRequestResponse mirror writes on ingest — a well-formed mirror (known non-UNKNOWN enum member, exactly one thread leg, the ServiceId UUID / 32-byte base64 shapes) stamps it, everything else fails closed into the plain skip; a stamped ACCEPT accepts ahead of every window weight, any other member keeps the window answer, and a row without the stamp keeps the 1.65 local fallback verbatim. Honest per-factor holes never invented (each collapses to inactive, the official default posture): messageCountBeforeMessageRequests (official-desktop migration state), and the group factors addedBy/pendingAdminApprovalV2/group profileSharing (no engine read face) — a group row derives accepted from its own outgoing window alone. A desktop consumes the key as authoritative when present and keeps its local window derivation only for pre-1.65 connectors where the key is absent. Contract 1.221 (2026-10-24, message-request B batch): every direct-row summary additively carries the trusted-contact factor pair the desktop's isMissingRequiredProfileSharing gate reads - profileSharing (the stored mrr_factors_json.profileSharing bit) and inSystemContacts (the inverted hidden bit, the official isInSystemContacts factor). Both are optional: absent means unknown (a pre-1.221 stamp, the probed-absent {} marker, or any group row), never an invented false; the accepted derivation is untouched. The engine listContacts face now exposes isHidden/profileSharing per contact item, and the existing mrr_factors_stamp consumer carries them through unchanged. Wire additive: pre-1.221 hosts read byte-identical rows. Contract 1.71 (2026-10-07, dated note — the desktop evidence-gate data-plane gap, desktop matrix §18.4 2026-10-06 record): every summary row also carries hasUserInitiatedOutbound (bare always-serialized boolean, the muted/pinned/isSelf discipline — both values are meaningful): true exactly when the conversation's whole history contains at least one outgoing data row — the official sentMessageCount > 0 factor (ts/util/isConversationAccepted.preload.ts:58,75, the same factor weight the §4.58 derivation reads) surfaced as a standalone bit, aligned with the official hasUserInitiatedMessages whole-history EXISTS semantics (Server.node.ts:2389-2410, Interface.std.ts:486, conversations.preload.ts:4621/:3752-3755, maybeForwardMessages.preload.ts:192-201), independent of any message window or the newest row. Derived at read time (the same read-time family as messageRequestAccepted, list page and single-row conversation.changed summary share one helper); pure wire addition — pre-1.71 hosts read byte-identical rows without it. Absent store evidence (a fresh row, or any history the connector does not hold) projects false — honest absence, never invented. Contract 1.138 (§4.129): every summary row additively carries its protocol identifiers, derived at read time from the peer key's shape so the desktop's `!` selector faces match without a second lookup — groupId (a group row, the raw group master key, the §4.44/§4.50 addressing form), e164 (a direct row keyed on a +prefixed phone number), serviceId (a direct row keyed on a ServiceId UUID, or keyed on a number-shaped key mapped through the most recent ingest-written peer_identities row); a key nothing resolves leaves all three absent (the row stays addressable by id, no identifier invented) and pni is reserved-never-present (the connector has no PNI source — the honest hole §4.129 documents). Contract 1.138 (§4.131): every summary row also carries blocked (bare always-serialized boolean, the muted/pinned/isSelf discipline): the direct row's stored blocked stamp — written by the §4.47 setBlocked write-back, the §4.58 BLOCK-family request-response verbs (BLOCK=3/BLOCK_AND_DELETE=4/BLOCK_AND_SPAM=6), and the contacts enrich's own isBlocked — so the desktop renders the mask state from the list/event stream instead of a pull; group rows stay false (§4.45 pull remains the group authority, the honest hole). Contract 1.138 (§4.130): every summary row also carries draftTimestamp (epoch ms, absent when nothing is drafted or after conversations.clearDraft) — the official DraftRepository record's clock, the only draft material the connector holds (draft text stays desktop-side safeStorage); written by the new local conversations.saveDraft/conversations.clearDraft faces, and the refreshed summary rides conversation.changed on every write. Contract 1.146 (§4.144): the serviceId derivation widens — a direct row keyed on a +prefixed number now also maps through the most recent ingest-written peer_identities row (either spelling, the dual-form number normalization: the exact form probes first, the alternate only on a miss), so such a row answers e164 and serviceId together; a key nothing resolves keeps the pre-1.146 answer verbatim and pni stays reserved-never-present. The sync-contacts ingest (§4.122, same revision) lands a numbered record's ACI into that table through the §4.37 receive-chain write, so a contact that never showed up on a live envelope resolves too; wire additive, pre-1.146 hosts read byte-identical rows. Contract 1.219 (§4.229, direct-title JOIN key normalization): the e164 derivation widens once more — a direct row keyed on a ServiceId UUID now also maps through the most recent ingest-written peer_identities row (the receive chain §4.37 and the contacts sync §4.144 write it), answering the observed number in its `+`-prefixed wire form (both number spellings normalize); the same batch widens the summary naming material (systemName/username) and the contacts-sync title upgrade to probe the whole §4.190 identity ladder, so a number-keyed contacts row meets an ACI-keyed conversation. A key nothing resolves keeps the pre-1.219 answer verbatim; absent-key additive, pre-1.219 hosts read byte-identical rows. Contract 1.217 (2026-10-23, §29.2 avatar byte face; L2 wiring batch): every summary row additively carries the cached avatar pair — avatarUrl (the cached `data:<mime>;base64,<payload>` data URI exactly as the last successful conversations.getAvatar Read-lane commit stored it) and hasAvatar (present only when true), the official Avatar prop word forms (Avatar.dom.tsx:63 avatarUrl, Props.hasAvatar). Both derive from one conversation_avatars cache read (schema version 40; conversation-row id addressing shared with the contacts rows): a cache hit carries both — the bit is true exactly with bytes, never alone — and a cache miss leaves both absent = the honest uncached face (upstream avatar presence is unknowable without a fetch and never invented; the §29.2 remaining-item ⑤ honest hole). Absent-key additive, pre-1.217 hosts read byte-identical rows.",
+      "description": "Read lane over the local conversation cache; ordered by newest message, page-bounded, cursor-resumable. Contract 1.43 (§4.42): the result includes the linked account's own Note to Self direct conversation — the contacts sync no longer drops the self entry, so its skeleton materializes like any contact's — and every summary row carries isSelf (always-serialized boolean): true exactly for the direct conversation whose peerKey equals the account's own number (number-based, the §4.24 boundary: the own ACI is not queryable upstream, so a UUID-keyed row cannot be marked), false on every other row including groups. The self row's title is raw contact material (the account's own profile name); the desktop localizes the Note to Self title and avatar from isSelf — the connector ships no copy. Contract 1.60 (§4.52): every summary row carries isTerminated (plain bool, present only when true — absent on false, pre-1.60 hosts read byte-identical rows): the group termination flag the 1.53 §4.50 appendix sync capture stores in the kind='group' contacts row, stamped at read time (a group and its contacts row share the stable id; a group with no cache row yet, every direct row, and every pre-1.53 sync row answer absent/false). The desktop forward-target filter consumes it (the official selectors/composable face excludes terminated groups); the receive chain cannot refresh the flag, only the next contacts.sync can, and syncedAt remains the staleness signal. Contract 1.65 (§4.58): every summary row carries messageRequestAccepted (bare always-serialized boolean, the muted/pinned/isSelf discipline — both values are meaningful): the official isConversationAccepted multi-factor derived at read time over the row's stored engine factor stamp (mrr_factors_json — {hidden, profileSharing, blocked} the throttled listContacts enrich stamps on its existing round trip, schema version 20; an engine without the flags stamps the probed-absent {}), the message window, and isSelf. Contract 1.70 (§4.58 consume batch): the stamp also carries the authoritative acceptResponseType face (the official factor's first weight) that a linked device's syncMessage.messageRequestResponse mirror writes on ingest — a well-formed mirror (known non-UNKNOWN enum member, exactly one thread leg, the ServiceId UUID / 32-byte base64 shapes) stamps it, everything else fails closed into the plain skip; a stamped ACCEPT accepts ahead of every window weight, any other member keeps the window answer, and a row without the stamp keeps the 1.65 local fallback verbatim. Honest per-factor holes never invented (each collapses to inactive, the official default posture): messageCountBeforeMessageRequests (official-desktop migration state), and the group factors addedBy/pendingAdminApprovalV2/group profileSharing (no engine read face) — a group row derives accepted from its own outgoing window alone. A desktop consumes the key as authoritative when present and keeps its local window derivation only for pre-1.65 connectors where the key is absent. Contract 1.221 (2026-10-24, message-request B batch): every direct-row summary additively carries the trusted-contact factor pair the desktop's isMissingRequiredProfileSharing gate reads - profileSharing (the stored mrr_factors_json.profileSharing bit) and inSystemContacts (the inverted hidden bit, the official isInSystemContacts factor). Both are optional: absent means unknown (a pre-1.221 stamp, the probed-absent {} marker, or any group row), never an invented false; the accepted derivation is untouched. The engine listContacts face now exposes isHidden/profileSharing per contact item, and the existing mrr_factors_stamp consumer carries them through unchanged. Wire additive: pre-1.221 hosts read byte-identical rows. Contract 1.71 (2026-10-07, dated note — the desktop evidence-gate data-plane gap, desktop matrix §18.4 2026-10-06 record): every summary row also carries hasUserInitiatedOutbound (bare always-serialized boolean, the muted/pinned/isSelf discipline — both values are meaningful): true exactly when the conversation's whole history contains at least one outgoing data row — the official sentMessageCount > 0 factor (ts/util/isConversationAccepted.preload.ts:58,75, the same factor weight the §4.58 derivation reads) surfaced as a standalone bit, aligned with the official hasUserInitiatedMessages whole-history EXISTS semantics (Server.node.ts:2389-2410, Interface.std.ts:486, conversations.preload.ts:4621/:3752-3755, maybeForwardMessages.preload.ts:192-201), independent of any message window or the newest row. Derived at read time (the same read-time family as messageRequestAccepted, list page and single-row conversation.changed summary share one helper); pure wire addition — pre-1.71 hosts read byte-identical rows without it. Absent store evidence (a fresh row, or any history the connector does not hold) projects false — honest absence, never invented. Contract 1.138 (§4.129): every summary row additively carries its protocol identifiers, derived at read time from the peer key's shape so the desktop's `!` selector faces match without a second lookup — groupId (a group row, the raw group master key, the §4.44/§4.50 addressing form), e164 (a direct row keyed on a +prefixed phone number), serviceId (a direct row keyed on a ServiceId UUID, or keyed on a number-shaped key mapped through the most recent ingest-written peer_identities row); a key nothing resolves leaves all three absent (the row stays addressable by id, no identifier invented) and pni is reserved-never-present (the connector has no PNI source — the honest hole §4.129 documents). Contract 1.295 (§4.248, PNI conversation merge): the pni leg goes live — a PNI-keyed direct row projects its own key, every other direct row projects the stamped identity_pni column (after the maybeMergeContacts-shaped fold, PNI is just a conversation attribute, the official updatePni word form); absent material keeps the key absent (honest, never invented) and pre-1.295 hosts read byte-identical rows. Contract 1.138 (§4.131): every summary row also carries blocked (bare always-serialized boolean, the muted/pinned/isSelf discipline): the direct row's stored blocked stamp — written by the §4.47 setBlocked write-back, the §4.58 BLOCK-family request-response verbs (BLOCK=3/BLOCK_AND_DELETE=4/BLOCK_AND_SPAM=6), and the contacts enrich's own isBlocked — so the desktop renders the mask state from the list/event stream instead of a pull; group rows stay false (§4.45 pull remains the group authority, the honest hole). Contract 1.138 (§4.130): every summary row also carries draftTimestamp (epoch ms, absent when nothing is drafted or after conversations.clearDraft) — the official DraftRepository record's clock, the only draft material the connector holds (draft text stays desktop-side safeStorage); written by the new local conversations.saveDraft/conversations.clearDraft faces, and the refreshed summary rides conversation.changed on every write. Contract 1.146 (§4.144): the serviceId derivation widens — a direct row keyed on a +prefixed number now also maps through the most recent ingest-written peer_identities row (either spelling, the dual-form number normalization: the exact form probes first, the alternate only on a miss), so such a row answers e164 and serviceId together; a key nothing resolves keeps the pre-1.146 answer verbatim and pni stays reserved-never-present. The sync-contacts ingest (§4.122, same revision) lands a numbered record's ACI into that table through the §4.37 receive-chain write, so a contact that never showed up on a live envelope resolves too; wire additive, pre-1.146 hosts read byte-identical rows. Contract 1.219 (§4.229, direct-title JOIN key normalization): the e164 derivation widens once more — a direct row keyed on a ServiceId UUID now also maps through the most recent ingest-written peer_identities row (the receive chain §4.37 and the contacts sync §4.144 write it), answering the observed number in its `+`-prefixed wire form (both number spellings normalize); the same batch widens the summary naming material (systemName/username) and the contacts-sync title upgrade to probe the whole §4.190 identity ladder, so a number-keyed contacts row meets an ACI-keyed conversation. A key nothing resolves keeps the pre-1.219 answer verbatim; absent-key additive, pre-1.219 hosts read byte-identical rows. Contract 1.217 (2026-10-23, §29.2 avatar byte face; L2 wiring batch): every summary row additively carries the cached avatar pair — avatarUrl (the cached `data:<mime>;base64,<payload>` data URI exactly as the last successful conversations.getAvatar Read-lane commit stored it) and hasAvatar (present only when true), the official Avatar prop word forms (Avatar.dom.tsx:63 avatarUrl, Props.hasAvatar). Both derive from one conversation_avatars cache read (schema version 40; conversation-row id addressing shared with the contacts rows): a cache hit carries both — the bit is true exactly with bytes, never alone — and a cache miss leaves both absent = the honest uncached face (upstream avatar presence is unknowable without a fetch and never invented; the §29.2 remaining-item ⑤ honest hole). Absent-key additive, pre-1.217 hosts read byte-identical rows.",
       "properties": {
         "accountId": {
           "$ref": "#/$defs/opaqueId"
@@ -4321,6 +4393,12 @@
           "minLength": 1,
           "maxLength": 128,
           "description": "The upstream attachment id from the received message's attachment metadata; a bare file name, never a path."
+        },
+        "quoteAttachmentIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 7,
+          "description": "Contract 1.298 (§4.289): when present, attachmentId must equal quoteSnapshot.attachments[index].thumbnail.id before any file is opened. Ordinary requests omit this key and retain the pre-1.298 behavior."
         }
       }
     },
@@ -4397,6 +4475,12 @@
           "maxLength": 128,
           "description": "Optional blur placeholder (contract revision 1.137, §4.127): 1..128 characters, shipped verbatim onto the row descriptor for the sender's own bubble; never decoded or charset-checked. The upstream data-URI attachment channel carries no blurHash key, so upstream recipients compute their own."
         },
+        "attachmentCaption": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "description": "Optional attachment-level caption (contract revision 1.297, §4.288): the official AttachmentPointer.caption for this entry, distinct from message-level text/DataMessage.body. Non-empty and at most 65536 UTF-8 bytes (the service enforces the byte bound); appended to this entry's data URI as ;caption=<percent-encoded>, recorded on its pending descriptor, and preserved by payload-group retries."
+        },
         "gif": {
           "type": "boolean",
           "default": false,
@@ -4414,6 +4498,68 @@
           "maximum": 16384,
           "description": "Optional declared height (contract revision 1.294, §4.284 BUG-11 wire 批): the sender's measured pixel height. Pairs with width (both keys or neither, 1..16384); paired values ride the upstream data URI as ';width=<px>;height=<px>' and are recorded on the pending descriptor so the sender's own bubble renders the terminal box from the first tick."
         }
+      }
+    },
+    "attachmentUploadBeginParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "clientRequestId", "sizeBytes"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "clientRequestId": { "$ref": "#/$defs/opaqueId" },
+        "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 104857600 }
+      }
+    },
+    "attachmentUploadWriteParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "uploadId", "offset", "dataBase64"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "uploadId": { "$ref": "#/$defs/opaqueId" },
+        "offset": { "type": "integer", "minimum": 0 },
+        "dataBase64": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 349528,
+          "pattern": "^[A-Za-z0-9+/]+={0,2}$"
+        }
+      }
+    },
+    "attachmentUploadAbortParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "uploadId"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "uploadId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesSendStagedAttachmentParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "clientRequestId", "uploadId", "sizeBytes"],
+      "description": "Contract 1.299: send a fully-written connector-owned upload. Only bounded chunks cross the host; the upstream send carries a file URI, never a whole-file base64 payload.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "kind": { "type": "string", "enum": ["contact", "direct", "group"] },
+        "peerKey": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "peerTitle": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "clientRequestId": { "$ref": "#/$defs/opaqueId" },
+        "uploadId": { "$ref": "#/$defs/opaqueId" },
+        "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 104857600 },
+        "filename": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "contentType": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "quoteMessageId": { "$ref": "#/$defs/opaqueId" },
+        "voiceNote": { "type": "boolean", "default": false },
+        "viewOnce": { "type": "boolean", "default": false },
+        "blurHash": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "attachmentCaption": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "gif": { "type": "boolean", "default": false },
+        "width": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 16384 }
       }
     },
     "messagesSendAttachmentParams": {
@@ -4486,6 +4632,12 @@
           "minLength": 1,
           "maxLength": 128,
           "description": "Singular form. Optional blur placeholder (contract revision 1.137, §4.127): 1..128 characters, shipped verbatim onto the pending row's descriptor for the sender's own bubble; never decoded or charset-checked (the receive face's own bound — one constant, both directions). Mutually exclusive with the attachments array: the plural form carries per-entry blurHash instead."
+        },
+        "attachmentCaption": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "description": "Singular-form attachment-level caption (contract revision 1.297, §4.288), independent of message-level text. Non-empty and at most 65536 UTF-8 bytes; rides the data URI as ;caption=<percent-encoded>, lands on AttachmentPointer.caption and the pending descriptor, and survives retries. Mutually exclusive with the plural attachments array (each entry carries its own)."
         },
         "width": {
           "type": "integer",
@@ -4583,6 +4735,11 @@
                 {
                   "required": [
                     "blurHash"
+                  ]
+                },
+                {
+                  "required": [
+                    "attachmentCaption"
                   ]
                 },
                 {
@@ -5918,7 +6075,7 @@
         "accountId",
         "conversationId"
       ],
-      "description": "Apply one group-management change set to one group conversation (contract revision 1.45, §4.44; avatar tri-state added by contract revision 1.89; the engine write face wired by contract revision 1.115, §4.96). The change keys are individually optional and mirror the pinned signal-cli updateGroup jsonRpc surface verbatim: name (from groupName), description (from groupDescription), members (from addMembers), removeMembers, admins (from promoteAdmins), removeAdmins (from demoteAdmins), bans (from banMembers), unbans (from unbanMembers), resetLink, link (from linkState: the connector's enabled-without-approval maps to the upstream choice 'enabled'), setPermissionAddMember / setPermissionEditDetails / setPermissionSendMessages (every-member | only-admins), memberLabel, memberLabelEmoji. At least one change parameter must be present (an empty change set answers INVALID_REQUEST; resetLink=false counts as absent). An empty member array is INVALID_REQUEST — upstream reads absence as 'no change' and an explicit empty set would commit a no-delta group change broadcast. Member arrays carry at most 1001 entries (the official GroupsV2 ceiling), each 1-128 chars, forwarded verbatim (the upstream resolves and rejects unknown addresses). groupName/memberLabel 1-256 bytes, groupDescription up to 4096 bytes, memberLabelEmoji one emoji grapheme cluster (<=32 bytes). conversationId must resolve to a kind='group' row before any upstream call (direct answers INVALID_REQUEST). Group avatar (since contract 1.89, the accounts.setProfile tri-state): absent = keep, explicit null = remove, a data:image/*;base64, data URI (decoded 1..10485760 bytes) = replace — the avatar member counts toward the at-least-one-change rule, and the value rides upstream verbatim. The wired engine subset (1.115): the change set folds onto the engine's updateGroup vocabulary — groupName→title, addMembers/removeMembers verbatim, the avatar tri-state verbatim, and linkState onto the engine's addFromInviteLinkAccess word (enabled-without-approval→ANY, enabled-with-approval→ADMINISTRATOR, disabled→UNSATISFIABLE), and (contract revision 1.180, §4.180) resetLink onto the engine's inviteLinkPassword arm: the connector mints the official 16-byte CSPRNG password locally (the official client's own refreshGroupLink posture, conversations.preload.ts:4793-4795) and rides it standard base64 onto the payload — the old link dies with the old password, and (contract revision 1.188, §4.188) setPermissionSendMessages onto the engine's announcementsOnly bool (only-admins → true, every-member → false — the official modifyAnnouncementsOnly change, groups.preload.ts:895-904; both values are real write intents, lifting included; engine arm 8ea56f6 on the engine's pushed integration line — an engine build without the arm answers the plain engine refusal through the structured UPSTREAM_ERROR face). And (contract revision 1.252, §4.238) setPermissionAddMember / setPermissionEditDetails / setPermissionMemberLabel onto the engine's membersPermission / attributesPermission / memberLabelPermission words (every-member = MEMBER, only-admins = ADMINISTRATOR — the official access-control change family; the engine composes the official modifyMemberLabels clear actions from its own group state on the member-label tightening, so the single host parameter carries the official two-half change). A change set naming any key outside that subset (groupDescription — the engine's updateGroup still carries no description write arm, a recorded gap; promoteAdmins/demoteAdmins, banMembers/unbanMembers, memberLabel/memberLabelEmoji) answers CAPABILITY_UNAVAILABLE (retryable=false) naming the offending keys after local validation — the honest whole-call refusal, never a partial application (the engine commits the set as one change broadcast). Send lane, account-scoped mutating: result is {status: 'sent'} on a definite success; an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. A server-rejected change answers GROUP_UPDATE_FAILED (retryable=false) with data {status?} — the honest HTTP pass-through; a 409 revision race unblocks only after the caller re-reads the group state (groups.get / conversations.list), never by blind replay of the same change set. The engine's deny faces (unknown account/group, non-member) answer UPSTREAM_ERROR with retryable=false — deterministic refusals a replay cannot clear. A failed avatar upload after a landed group change answers GROUP_AVATAR_UPLOAD_FAILED (retryable=true) with data {retryable, textSaved} — the honest partial-success report. Group state converges through the receive projection: a bodyless groupInfo type=UPDATE envelope lands as a system row (rich marker isGroupUpdate) and conversation.changed carries the mirrored title.",
+      "description": "Apply one group-management change set to one group conversation (contract revision 1.45, §4.44; avatar tri-state added by contract revision 1.89; the engine write face wired by contract revision 1.115, §4.96). The change keys are individually optional and mirror the pinned signal-cli updateGroup jsonRpc surface verbatim: name (from groupName), description (from groupDescription), members (from addMembers), removeMembers, admins (from promoteAdmins), removeAdmins (from demoteAdmins), bans (from banMembers), unbans (from unbanMembers), resetLink, link (from linkState: the connector's enabled-without-approval maps to the upstream choice 'enabled'), setPermissionAddMember / setPermissionEditDetails / setPermissionSendMessages (every-member | only-admins), memberLabel, memberLabelEmoji. At least one change parameter must be present (an empty change set answers INVALID_REQUEST; resetLink=false counts as absent). An empty member array is INVALID_REQUEST — upstream reads absence as 'no change' and an explicit empty set would commit a no-delta group change broadcast. Member arrays carry at most 1001 entries (the official GroupsV2 ceiling), each 1-128 chars, forwarded verbatim (the upstream resolves and rejects unknown addresses). groupName/memberLabel 1-256 bytes, groupDescription up to 4096 bytes, memberLabelEmoji one emoji grapheme cluster (<=32 bytes). conversationId must resolve to a kind='group' row before any upstream call (direct answers INVALID_REQUEST). Group avatar (since contract 1.89, the accounts.setProfile tri-state): absent = keep, explicit null = remove, a data:image/*;base64, data URI (decoded 1..10485760 bytes) = replace — the avatar member counts toward the at-least-one-change rule, and the value rides upstream verbatim. The wired engine subset (1.115): the change set folds onto the engine's updateGroup vocabulary — groupName→title, addMembers/removeMembers verbatim, the avatar tri-state verbatim, and linkState onto the engine's addFromInviteLinkAccess word (enabled-without-approval→ANY, enabled-with-approval→ADMINISTRATOR, disabled→UNSATISFIABLE), and (contract revision 1.180, §4.180) resetLink onto the engine's inviteLinkPassword arm: the connector mints the official 16-byte CSPRNG password locally (the official client's own refreshGroupLink posture, conversations.preload.ts:4793-4795) and rides it standard base64 onto the payload — the old link dies with the old password, and (contract revision 1.188, §4.188) setPermissionSendMessages onto the engine's announcementsOnly bool (only-admins → true, every-member → false — the official modifyAnnouncementsOnly change, groups.preload.ts:895-904; both values are real write intents, lifting included; engine arm 8ea56f6 on the engine's pushed integration line — an engine build without the arm answers the plain engine refusal through the structured UPSTREAM_ERROR face). And (contract revision 1.252, §4.238) setPermissionAddMember / setPermissionEditDetails / setPermissionMemberLabel onto the engine's membersPermission / attributesPermission / memberLabelPermission words (every-member = MEMBER, only-admins = ADMINISTRATOR — the official access-control change family; the engine composes the official modifyMemberLabels clear actions from its own group state on the member-label tightening, so the single host parameter carries the official two-half change). And (contract revision 1.296, §4.287) groupDescription onto the engine's `description` write arm (the same word its listGroups projection reads) and promoteAdmins/demoteAdmins/banMembers/unbanMembers onto the engine's same-named member-family arms — the desktop conversation-info admin/ban/description writes travel the one engine change broadcast (an engine build without the arms answers its own refusal through the structured UPSTREAM_ERROR face, the 1.188 posture — never a disguised local refusal). A change set naming any key outside that subset (memberLabel/memberLabelEmoji — the engine's updateGroup carries no member-label write arm, a recorded gap) answers CAPABILITY_UNAVAILABLE (retryable=false) naming the offending keys after local validation — the honest whole-call refusal, never a partial application (the engine commits the set as one change broadcast). Send lane, account-scoped mutating: result is {status: 'sent'} on a definite success; an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. A server-rejected change answers GROUP_UPDATE_FAILED (retryable=false) with data {status?} — the honest HTTP pass-through; a 409 revision race unblocks only after the caller re-reads the group state (groups.get / conversations.list), never by blind replay of the same change set. The engine's deny faces (unknown account/group, non-member) answer UPSTREAM_ERROR with retryable=false — deterministic refusals a replay cannot clear. A failed avatar upload after a landed group change answers GROUP_AVATAR_UPLOAD_FAILED (retryable=true) with data {retryable, textSaved} — the honest partial-success report. Group state converges through the receive projection: a bodyless groupInfo type=UPDATE envelope lands as a system row (rich marker isGroupUpdate) and conversation.changed carries the mirrored title.",
       "properties": {
         "accountId": {
           "$ref": "#/$defs/opaqueId"
@@ -5939,7 +6096,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 4096,
-          "description": "New group description; upstream key 'description'."
+          "description": "New group description; upstream key 'description'. Since contract revision 1.296 (§4.287) it folds onto the engine's description write arm (the same word its listGroups projection reads) — the former whole-call CAPABILITY_UNAVAILABLE refusal is lifted."
         },
         "addMembers": {
           "type": "array",
@@ -5969,7 +6126,7 @@
             "minLength": 1,
             "maxLength": 128
           },
-          "description": "Members to promote to admin; upstream key 'admins'."
+          "description": "Members to promote to admin; upstream key 'admins'. Since contract revision 1.296 (§4.287) it folds onto the engine's promoteAdmins arm — the former whole-call CAPABILITY_UNAVAILABLE refusal is lifted."
         },
         "demoteAdmins": {
           "type": "array",
@@ -5979,7 +6136,7 @@
             "minLength": 1,
             "maxLength": 128
           },
-          "description": "Admins to demote; upstream key 'removeAdmins'."
+          "description": "Admins to demote; upstream key 'removeAdmins'. Since contract revision 1.296 (§4.287) it folds onto the engine's demoteAdmins arm — the former whole-call CAPABILITY_UNAVAILABLE refusal is lifted."
         },
         "banMembers": {
           "type": "array",
@@ -5989,7 +6146,7 @@
             "minLength": 1,
             "maxLength": 128
           },
-          "description": "Members to ban; upstream key 'bans'."
+          "description": "Members to ban; upstream key 'bans'. Since contract revision 1.296 (§4.287) it folds onto the engine's banMembers arm — the former whole-call CAPABILITY_UNAVAILABLE refusal is lifted."
         },
         "unbanMembers": {
           "type": "array",
@@ -5999,7 +6156,7 @@
             "minLength": 1,
             "maxLength": 128
           },
-          "description": "Members to unban; upstream key 'unbans'."
+          "description": "Members to unban; upstream key 'unbans'. Since contract revision 1.296 (§4.287) it folds onto the engine's unbanMembers arm — the former whole-call CAPABILITY_UNAVAILABLE refusal is lifted."
         },
         "linkState": {
           "type": "string",
@@ -6801,8 +6958,11 @@
       "required": [
         "accountId",
         "conversationId",
-        "messageId",
-        "attachmentIndex"
+        "messageId"
+      ],
+      "oneOf": [
+        { "required": ["attachmentIndex"] },
+        { "required": ["quoteAttachmentIndex"] }
       ],
       "description": "Download one message attachment's bytes from the Signal transit CDN (contract revision 1.61, §4.54, capability attachment-download): the on-demand byte channel for message-attachment pills — the caller names the message and the descriptor's positional index, the connector resolves the row locally and walks the stored pointer face through the official attachv2 pipeline (the same machine as history.attachmentDownload, §4.38 step 3: cdnNumber → cdn base map with the CDN-0 fallback, encodeURIComponent'd cdnKey path, streamed GET with connect 10 s / total 120 s / no redirects, trailing-MAC HMAC-SHA256 then whole-body SHA-256 digest gates, AES-256-CBC decrypt with the IV-prefixed body and PKCS7, the official log-pad trim, the plaintextHash face). The pointer face resolves through the locator ladder: the live-receive column first (persisted since this revision in the internal live_attachment_locators column when the engine projects a receive locator — the engine receive face projects metadata only today, so live rows answer the hole), then the schema-18 import column (the index-aligned archive faces persisted since 1.56). Fail-closed: an index past the descriptor list, or a hole in both locator columns (a descriptor without any pointer face) answers INVALID_REQUEST before any network traffic — never a guessed download. Download, integrity, and decryption failures answer UPSTREAM_ERROR retryable=false — terminal, never auto-retried; local filesystem failures answer UPSTREAM_ERROR retryable=true. Already-present files answer {sizeBytes} without touching the CDN (idempotent dedup: an earlier call, or the engine's own live download of the same id). Result {sizeBytes: N} — the plaintext byte count messages.attachments.open will report; no handle, no path: the bytes stay behind the chunked media triple. Send lane, account-scoped mutating (it lands a file in the governed media directory; the reaction-class write-lane mutex and delete drain barrier serialize it). Contract 1.98: the `attachment-download` capability is the one conditional handshake advertisement — the connector omits the tag unless its media ingest is armed, the exact gate this face answers CAPABILITY_UNAVAILABLE behind. Contract 1.98: the CDN GET rides the launcher's `KT_SIGNAL_SOCKS_PROXY` route as socks5h:// (remote DNS, the same mapping the engine child gets for `ALL_PROXY`) when the process environment carries it, the direct route otherwise; the connect 10 s / total 120 s / no-redirect posture is unchanged..",
       "properties": {
@@ -6819,7 +6979,13 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 31,
-          "description": "The zero-based position of the attachment in the message's received metadata — the descriptor list order the wire row already carries."
+          "description": "The zero-based position of the attachment in the message's received metadata — the descriptor list order the wire row already carries. Mutually exclusive with quoteAttachmentIndex."
+        },
+        "quoteAttachmentIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 7,
+          "description": "Contract 1.298 (§4.289): the zero-based quoteSnapshot.attachments position whose thumbnail is downloaded. Exactly one of attachmentIndex or quoteAttachmentIndex is required. The thumbnail locator rides the internal schema-51 live_quote_attachment_locators column; bytes land under thumbnail.id in the same account media bucket and open through messages.attachments.open. No locator/key/path crosses the host wire."
         }
       }
     },
@@ -9660,6 +9826,7 @@
             "AUTHENTICATION_FAILED",
             "METHOD_NOT_ALLOWED",
             "CAPABILITY_UNAVAILABLE",
+            "RESOURCE_EXHAUSTED",
             "RUNTIME_ALREADY_RUNNING",
             "RUNTIME_NOT_RUNNING",
             "RUNTIME_START_FAILED",

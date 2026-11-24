@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2045,6 +2046,19 @@ pub struct SyncDeletedAttachment {
 const TYPING_RATE_LIMIT_MS: u64 = 1_000;
 const TYPING_RATE_MAP_CAPACITY: usize = 256;
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentUploadBegin {
+    pub upload_id: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentUploadWrite {
+    pub written_bytes: u64,
+}
+
 /// The filesystem-and-handles half of media ingest (ADR 0004), injected into
 /// one service per proxy group when the launcher passes `--media-ingest`.
 /// `None` is the pre-1.17 shape: every media method answers
@@ -2138,6 +2152,10 @@ impl MediaIngest {
         descriptor_id: &str,
         data_uri: &str,
     ) -> Result<(), &'static str> {
+        if data_uri.starts_with("file:") {
+            let (path, _) = parse_file_attachment_uri(data_uri).map_err(|_| "file-uri")?;
+            return self.stash_outbound_attachment_file(account_id, descriptor_id, &path);
+        }
         let Some(payload) = data_uri
             .strip_prefix("data:")
             .and_then(|rest| rest.rsplit_once(','))
@@ -2155,6 +2173,29 @@ impl MediaIngest {
         let target = dir.join(&sanitized);
         let temp = dir.join(format!(".{sanitized}.{}.tmp", random_id()));
         std::fs::write(&temp, &bytes).map_err(|_| "write")?;
+        std::fs::rename(&temp, &target).map_err(|_| "rename")?;
+        Ok(())
+    }
+
+    /// File-backed sends already stage at the deterministic descriptor path.
+    /// Keep the byte source zero-copy where possible and never decode/re-encode.
+    pub fn stash_outbound_attachment_file(
+        &self,
+        account_id: &str,
+        descriptor_id: &str,
+        source: &std::path::Path,
+    ) -> Result<(), &'static str> {
+        let sanitized = sanitize_attachment_id(descriptor_id).map_err(|_| "id-shape")?;
+        let dir = self.write_dir(account_id).map_err(|_| "write-dir")?;
+        let target = dir.join(&sanitized);
+        if source == target || target.is_file() {
+            return Ok(());
+        }
+        if std::fs::hard_link(source, &target).is_ok() {
+            return Ok(());
+        }
+        let temp = dir.join(format!(".{sanitized}.{}.tmp", random_id()));
+        std::fs::copy(source, &temp).map_err(|_| "copy")?;
         std::fs::rename(&temp, &target).map_err(|_| "rename")?;
         Ok(())
     }
@@ -2332,8 +2373,17 @@ struct EarlyReceiptEntry {
     buffered_at: u64,
 }
 
+struct OutgoingAttachmentUpload {
+    account_id: String,
+    path: PathBuf,
+    expected_size: u64,
+    written: u64,
+    last_touched: u64,
+}
+
 pub struct ConnectorService {
     store: Arc<Store>,
+    upload_sessions: std::collections::HashMap<String, OutgoingAttachmentUpload>,
     link: Option<ActiveLinkSession>,
     /// Typing rate limiter: (account_id, conversation_id) → last emission.
     typing_last_emission: std::collections::HashMap<(String, String), u64>,
@@ -2385,6 +2435,7 @@ impl ConnectorService {
         }
         Self {
             store,
+            upload_sessions: std::collections::HashMap::new(),
             link: None,
             typing_last_emission: std::collections::HashMap::new(),
             early_controls: Vec::new(),
@@ -2396,6 +2447,278 @@ impl ConnectorService {
 
     pub fn store_ref(&self) -> &Store {
         &self.store
+    }
+
+    const OUTGOING_UPLOAD_TTL_MS: u64 = 15 * 60 * 1000;
+    const OUTGOING_UPLOAD_MAX_SESSIONS: usize = 8;
+    const OUTGOING_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+
+    fn expire_upload_sessions(&mut self, now: u64) {
+        let expired: Vec<String> = self
+            .upload_sessions
+            .iter()
+            .filter(|(_, session)| {
+                now.saturating_sub(session.last_touched) >= Self::OUTGOING_UPLOAD_TTL_MS
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for upload_id in expired {
+            if let Some(session) = self.upload_sessions.remove(&upload_id) {
+                // These sessions never reached sendStaged; finalized payloads
+                // remove their session synchronously and are never in this set.
+                let _ = std::fs::remove_file(session.path);
+            }
+        }
+    }
+
+    /// Begin a connector-owned, single-file upload. The final path is the
+    /// descriptor's deterministic id, so send-time local retention is a no-op
+    /// rather than a second full-file copy.
+    pub fn begin_attachment_upload(
+        &mut self,
+        account_id: &str,
+        client_request_id: &str,
+        size_bytes: u64,
+    ) -> Result<AttachmentUploadBegin, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(client_request_id, "clientRequestId")?;
+        if size_bytes == 0 || size_bytes > MAX_ATTACHMENT_BYTES as u64 {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "sizeBytes must be between 1 and the attachment budget",
+                false,
+            )));
+        }
+        let Some(media) = self.media.clone() else {
+            return Err(media_capability_error());
+        };
+        let account = self.resolve_account(account_id)?;
+        let now = now_ms();
+        self.expire_upload_sessions(now);
+        if self.upload_sessions.len() >= Self::OUTGOING_UPLOAD_MAX_SESSIONS {
+            return Err(ServiceError::Api(ApiError::new(
+                "RESOURCE_EXHAUSTED",
+                "too many active attachment uploads",
+                true,
+            )));
+        }
+        let path = media.write_dir(&account.id)?.join(stable_hash_id(&[
+            account_id,
+            client_request_id,
+            "attachment",
+            "0",
+        ]));
+        if self
+            .upload_sessions
+            .values()
+            .any(|session| session.path == path)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "clientRequestId already has an active attachment upload",
+                false,
+            )));
+        }
+        let has_message = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+            .is_some();
+        let has_payload = !self
+            .store
+            .outgoing_attachment_payloads(account_id, client_request_id)?
+            .is_empty();
+        if has_message || has_payload {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "clientRequestId already has a persisted attachment; use ids-only retry",
+                false,
+            )));
+        }
+        if path.exists() {
+            // A crashed/expired upload has no row and no payload. Only this
+            // abandoned staging file may be reclaimed; persisted bytes are
+            // never deleted or overwritten by a fresh begin.
+            std::fs::remove_file(&path).map_err(|_| ServiceError::Io)?;
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|_| ServiceError::Io)?;
+        let upload_id = random_id();
+        self.upload_sessions.insert(
+            upload_id.clone(),
+            OutgoingAttachmentUpload {
+                account_id: account_id.to_owned(),
+                path,
+                expected_size: size_bytes,
+                written: 0,
+                last_touched: now,
+            },
+        );
+        Ok(AttachmentUploadBegin {
+            upload_id,
+            size_bytes,
+        })
+    }
+
+    /// Append one canonical base64 chunk at its declared sequential offset.
+    pub fn write_attachment_upload_chunk(
+        &mut self,
+        account_id: &str,
+        upload_id: &str,
+        offset: u64,
+        data_base64: &str,
+    ) -> Result<AttachmentUploadWrite, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(upload_id, "uploadId")?;
+        if data_base64.is_empty()
+            || data_base64.len() > 4 * Self::OUTGOING_UPLOAD_CHUNK_BYTES.div_ceil(3)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload chunk exceeds the bounded base64 chunk budget",
+                false,
+            )));
+        }
+        let mut bytes = Vec::with_capacity(data_base64.len() / 4 * 3);
+        base64_decode_to_vec(data_base64, &mut bytes).map_err(|_| {
+            ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload chunk is not valid base64",
+                false,
+            ))
+        })?;
+        if bytes.is_empty() || bytes.len() > Self::OUTGOING_UPLOAD_CHUNK_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload chunk must contain 1..=262144 decoded bytes",
+                false,
+            )));
+        }
+        self.expire_upload_sessions(now_ms());
+        let session = self.upload_sessions.get_mut(upload_id).ok_or_else(|| {
+            ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "uploadId is unknown or expired",
+                false,
+            ))
+        })?;
+        if session.account_id != account_id || session.written != offset {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload chunks must be sequential and belong to the account",
+                false,
+            )));
+        }
+        let next = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(ServiceError::Io)?;
+        if next > session.expected_size {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload chunks exceed the declared sizeBytes",
+                false,
+            )));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&session.path)
+            .map_err(|_| ServiceError::Io)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| ServiceError::Io)?;
+        file.write_all(&bytes).map_err(|_| ServiceError::Io)?;
+        file.flush().map_err(|_| ServiceError::Io)?;
+        session.written = next;
+        session.last_touched = now_ms();
+        Ok(AttachmentUploadWrite {
+            written_bytes: next,
+        })
+    }
+
+    pub fn abort_attachment_upload(
+        &mut self,
+        account_id: &str,
+        upload_id: &str,
+    ) -> Result<bool, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(upload_id, "uploadId")?;
+        let Some(session) = self.upload_sessions.remove(upload_id) else {
+            return Ok(false);
+        };
+        if session.account_id != account_id {
+            self.upload_sessions.insert(upload_id.to_owned(), session);
+            return Ok(false);
+        }
+        match std::fs::remove_file(&session.path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(_) => Err(ServiceError::Io),
+        }
+    }
+
+    /// Finalize a fully-written upload through the same send preparation and
+    /// idempotent settlement path as the legacy base64 family.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_send_attachment_staged(
+        &mut self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        upload_id: &str,
+        size_bytes: u64,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
+        validate_opaque_id(upload_id, "uploadId")?;
+        self.expire_upload_sessions(now_ms());
+        let session = self.upload_sessions.get(upload_id).ok_or_else(|| {
+            ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "uploadId is unknown or expired",
+                false,
+            ))
+        })?;
+        if session.account_id != account_id
+            || session.expected_size != size_bytes
+            || session.written != size_bytes
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "upload is incomplete or does not match sizeBytes",
+                false,
+            )));
+        }
+        let path = session.path.clone();
+        let result = self.prepare_send_attachment_file(
+            account_id,
+            target,
+            client_request_id,
+            &path,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            dimensions,
+            attachment_caption,
+        );
+        if result.is_ok() {
+            self.upload_sessions.remove(upload_id);
+        }
+        result
     }
 
     pub fn clear_link(&mut self) {
@@ -3837,9 +4160,56 @@ impl ConnectorService {
         gif: bool,
         dimensions: Option<(u32, u32)>,
     ) -> Result<PreparedSend, ServiceError> {
+        self.prepare_send_attachment_with_caption(
+            account_id,
+            target,
+            client_request_id,
+            data_base64,
+            size_bytes,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            dimensions,
+            None,
+        )
+    }
+
+    /// 单数附件 + 声明尺寸 + 附件级 caption（契约 1.297 §4.288）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_send_attachment_with_caption(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        data_base64: &str,
+        size_bytes: u64,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
         // 契约 1.294 §4.284：声明尺寸在写任何行之前复核（host 已配对，
         // service 只复核值域；越界 = INVALID_REQUEST，无 pending 行残留）。
         let dimensions = validate_attachment_dimensions_pair(dimensions)?;
+        let attachment_caption = validate_attachment_caption(attachment_caption)?;
+        if view_once && attachment_caption.is_some() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "view-once attachments must not carry attachmentCaption",
+                false,
+            )));
+        }
         let caption = validate_attachment_send_request(
             client_request_id,
             Some(data_base64),
@@ -3860,21 +4230,151 @@ impl ConnectorService {
         }
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_send_conversation(account_id, target)?;
-        let data_uri = build_attachment_data_uri(
+        let data_uri = build_attachment_data_uri_with_caption(
             data_base64,
             filename,
             content_type,
             voice_note,
             gif,
             dimensions,
+            attachment_caption,
         )?;
-        // 契约 1.279（§4.263）：首发前把这条附件的原始 data URI 落进
-        // outgoing_attachment_payloads——单附件面写 index 0（契约 1.280 起复合
-        // 主键的固定槽位）。失败/unknown 保留、成功删除，于是刷新或重启之后仍能
-        // 按同一个 clientRequestId 重试——payload 不再只活在桌面内存里。已有行
-        // 保留原 payload（ON CONFLICT DO NOTHING），幂等重放不会把首发的数据
-        // 覆盖成后来的请求。写失败即失败：不发送，否则修复会静默退化回
-        // 「刷新即丢」。
+        self.dispatch_attachment_uri(
+            &account,
+            &conversation,
+            client_request_id,
+            data_uri,
+            size_bytes,
+            filename,
+            content_type,
+            caption,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            dimensions,
+            attachment_caption,
+        )
+    }
+
+    /// File-backed singular send (contract 1.299): the path is connector-owned
+    /// staging output, never a caller-selected arbitrary path. No base64 payload
+    /// crosses the connector/engine JSON boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_send_attachment_file(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        file_path: &std::path::Path,
+        size_bytes: u64,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
+        let dimensions = validate_attachment_dimensions_pair(dimensions)?;
+        let attachment_caption = validate_attachment_caption(attachment_caption)?;
+        if view_once && attachment_caption.is_some() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "view-once attachments must not carry attachmentCaption",
+                false,
+            )));
+        }
+        let caption = validate_attachment_send_metadata(
+            client_request_id,
+            filename,
+            content_type,
+            text,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+        )?;
+        let Some(media) = self.media.as_ref() else {
+            return Err(media_capability_error());
+        };
+        let account = self.resolve_account(account_id)?;
+        let expected_path = media.write_dir(&account.id)?.join(stable_hash_id(&[
+            account_id,
+            client_request_id,
+            "attachment",
+            "0",
+        ]));
+        if file_path != expected_path {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "file-backed attachment must use the connector staging path",
+                false,
+            )));
+        }
+        if let Some(existing) = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+        {
+            return Ok(PreparedSend::Existing(Box::new(existing)));
+        }
+        let conversation = self.resolve_send_conversation(account_id, target)?;
+        let data_uri = build_attachment_file_uri(
+            file_path,
+            size_bytes,
+            filename,
+            content_type,
+            voice_note,
+            gif,
+            dimensions,
+            attachment_caption,
+        )?;
+        self.dispatch_attachment_uri(
+            &account,
+            &conversation,
+            client_request_id,
+            data_uri,
+            size_bytes,
+            filename,
+            content_type,
+            caption,
+            quote_message_id,
+            voice_note,
+            view_once,
+            blur_hash,
+            gif,
+            dimensions,
+            attachment_caption,
+        )
+    }
+
+    /// Shared dispatch for legacy data URIs and connector-owned file URIs.
+    /// The payload is persisted before the pending row so failed sends can be
+    /// rebuilt after a renderer restart without re-reading renderer memory.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_attachment_uri(
+        &self,
+        account: &AccountRow,
+        conversation: &ConversationRow,
+        client_request_id: &str,
+        data_uri: String,
+        size_bytes: u64,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        caption: &str,
+        quote_message_id: Option<&str>,
+        voice_note: bool,
+        view_once: bool,
+        blur_hash: Option<&str>,
+        gif: bool,
+        dimensions: Option<(u32, u32)>,
+        attachment_caption: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
+        let account_id = account.id.as_str();
         self.store.remember_outgoing_attachment_payload(
             account_id,
             &conversation.id,
@@ -3883,46 +4383,27 @@ impl ConnectorService {
             &data_uri,
             now_ms(),
         )?;
-        // The pending row carries the same metadata-only descriptor the
-        // renderer projects (contract 1.15 wire shape), so the desktop bubble
-        // and conversation preview exist from the first pending tick instead
-        // of collapsing into an invisible empty row. The voice flag rides the
-        // descriptor (§4.30), so the sender's own bubble renders the voice UI
-        // across restarts.
         let descriptor = NormalizedAttachment {
             locator: None,
             id: stable_hash_id(&[account_id, client_request_id, "attachment", "0"]),
             content_type: content_type.map(str::to_string),
             filename: filename.map(str::to_string),
             size: Some(size_bytes),
-            // 契约 1.294 §4.284：声明尺寸同步落 pending 行 descriptor——
-            // 发送方自己的气泡从首个 tick 就是终态盒（与 blurHash/gif 同款
-            // 「首发陈述即行面」纪律）。
             width: dimensions.map(|(width, _)| width),
             height: dimensions.map(|(_, height)| height),
             is_voice_note: voice_note,
-            caption: None,
-            // §4.127: the caller-computed placeholder, shipped verbatim —
-            // the sender's bubble renders it from the first pending tick.
+            caption: attachment_caption.map(str::to_string),
             blur_hash: blur_hash.map(str::to_string),
             incremental_mac: None,
             chunk_size: None,
             is_borderless: false,
-            // §4.147: the GIF marker rides the descriptor too, so the
-            // sender's own bubble renders the GIF UI from the first pending
-            // tick (the same statement the `;gif=true` URI parameter makes
-            // upstream).
             is_gif: gif,
-            // §4.149: the connector never fabricates the waveform pair — the
-            // engine generates it upstream at send time (or ships neither on
-            // failure); the desktop's own bubble gets it from the engine
-            // transcript echo through the receive face.
             waveform: None,
             duration: None,
         };
         self.dispatch_send(
-            &account,
-            &conversation,
+            account,
+            conversation,
             caption,
             client_request_id,
             quote_message_id,
@@ -4146,6 +4627,7 @@ impl ConnectorService {
                 let descriptor = row.attachments.first();
                 vec![ResolvedAttachmentPayload {
                     data_base64: data_base64.to_string(),
+                    file_path: None,
                     size_bytes,
                     content_type: content_type
                         .map(str::to_string)
@@ -4158,6 +4640,7 @@ impl ConnectorService {
                     blur_hash: blur_hash
                         .map(str::to_string)
                         .or_else(|| descriptor.and_then(|entry| entry.blur_hash.clone())),
+                    attachment_caption: descriptor.and_then(|entry| entry.caption.clone()),
                     dimensions: caller_dimensions
                         .or_else(|| descriptor.and_then(|entry| entry.width.zip(entry.height))),
                 }]
@@ -4185,17 +4668,36 @@ impl ConnectorService {
                 let mut resolved = Vec::with_capacity(stored.len());
                 for ((_, data_uri), descriptor) in stored.iter().zip(row.attachments.iter()) {
                     let parsed = parse_attachment_data_uri(data_uri)?;
+                    if let Some(path) = parsed.file_path.as_ref() {
+                        let Some(media) = self.media.as_ref() else {
+                            return Err(ServiceError::Api(ApiError::new(
+                                "RETRY_NOT_ALLOWED",
+                                "file-backed attachment media is unavailable",
+                                false,
+                            )));
+                        };
+                        let expected = media.write_dir(account_id)?.join(&descriptor.id);
+                        if path != &expected {
+                            return Err(ServiceError::Api(ApiError::new(
+                                "RETRY_NOT_ALLOWED",
+                                "file-backed attachment is outside the connector staging path",
+                                false,
+                            )));
+                        }
+                    }
                     // Descriptor faces come from the row, never from the URI: the
                     // URI's mime/filename are builder defaults, and a field the
                     // first send genuinely lacked must not be conjured back.
                     resolved.push(ResolvedAttachmentPayload {
                         data_base64: parsed.data_base64,
+                        file_path: parsed.file_path,
                         size_bytes: parsed.size_bytes,
                         content_type: descriptor.content_type.clone(),
                         filename: descriptor.filename.clone(),
                         voice: descriptor.is_voice_note,
                         gif: descriptor.is_gif,
                         blur_hash: descriptor.blur_hash.clone(),
+                        attachment_caption: descriptor.caption.clone(),
                         // 声明尺寸同样以行为准（首发陈述落行，URI 只作字节源）。
                         dimensions: descriptor.width.zip(descriptor.height),
                     });
@@ -4225,6 +4727,14 @@ impl ConnectorService {
             )?;
             // 契约 1.294 §4.284：行面/调用方来的尺寸在重建 URI 之前复核，
             // 坏值（越界/零）不得进上行帧。
+            validate_attachment_caption(entry.attachment_caption.as_deref())?;
+            if preserved_view_once && entry.attachment_caption.is_some() {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "view-once attachments must not carry attachmentCaption",
+                    false,
+                )));
+            }
             validate_attachment_dimensions_pair(entry.dimensions)?;
         }
         let caption = preserved_text.unwrap_or_default();
@@ -4237,14 +4747,27 @@ impl ConnectorService {
         let mut descriptors = Vec::with_capacity(resolved.len());
         let mut payloads = Vec::with_capacity(resolved.len());
         for (index, entry) in resolved.iter().enumerate() {
-            let data_uri = build_attachment_data_uri(
-                &entry.data_base64,
-                entry.filename.as_deref(),
-                entry.content_type.as_deref(),
-                entry.voice,
-                entry.gif,
-                entry.dimensions,
-            )?;
+            let data_uri = match entry.file_path.as_deref() {
+                Some(path) => build_attachment_file_uri(
+                    path,
+                    entry.size_bytes,
+                    entry.filename.as_deref(),
+                    entry.content_type.as_deref(),
+                    entry.voice,
+                    entry.gif,
+                    entry.dimensions,
+                    entry.attachment_caption.as_deref(),
+                )?,
+                None => build_attachment_data_uri_with_caption(
+                    &entry.data_base64,
+                    entry.filename.as_deref(),
+                    entry.content_type.as_deref(),
+                    entry.voice,
+                    entry.gif,
+                    entry.dimensions,
+                    entry.attachment_caption.as_deref(),
+                )?,
+            };
             payloads.push((index as u32, data_uri.clone()));
             data_uris.push(json!(data_uri));
             descriptors.push(NormalizedAttachment {
@@ -4263,7 +4786,7 @@ impl ConnectorService {
                 width: entry.dimensions.map(|(width, _)| width),
                 height: entry.dimensions.map(|(_, height)| height),
                 is_voice_note: entry.voice,
-                caption: None,
+                caption: entry.attachment_caption.clone(),
                 blur_hash: entry.blur_hash.clone(),
                 incremental_mac: None,
                 chunk_size: None,
@@ -4370,6 +4893,7 @@ impl ConnectorService {
             validate_attachment_content_type(entry.content_type.as_deref())?;
             // §4.127: the plural face carries the blur placeholder per entry.
             validate_blur_hash(entry.blur_hash.as_deref())?;
+            validate_attachment_caption(entry.attachment_caption.as_deref())?;
             // 契约 1.294 §4.284：复数面条目级声明尺寸同校验同值域，任一条
             // 坏形状整批 INVALID_REQUEST（写任何行之前）。
             validate_attachment_dimensions(entry.width, entry.height)?;
@@ -4399,13 +4923,14 @@ impl ConnectorService {
         let mut payloads = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             let dimensions = validate_attachment_dimensions(entry.width, entry.height)?;
-            let data_uri = build_attachment_data_uri(
+            let data_uri = build_attachment_data_uri_with_caption(
                 &entry.data_base64,
                 entry.filename.as_deref(),
                 entry.content_type.as_deref(),
                 false,
                 entry.gif,
                 dimensions,
+                entry.attachment_caption.as_deref(),
             )?;
             payloads.push((index as u32, data_uri.clone()));
             data_uris.push(json!(data_uri));
@@ -4424,7 +4949,7 @@ impl ConnectorService {
                 width: dimensions.map(|(width, _)| width),
                 height: dimensions.map(|(_, height)| height),
                 is_voice_note: false,
-                caption: None,
+                caption: entry.attachment_caption.clone(),
                 // §4.127: per-entry placeholder, same posture as the
                 // singular face.
                 blur_hash: entry.blur_hash.clone(),
@@ -5106,13 +5631,16 @@ impl ConnectorService {
     /// conversation id must resolve to a kind='group' row (direct answers
     /// INVALID_REQUEST before any upstream call). The engine carries the
     /// title/member/avatar/link-access subset plus the 1.180 resetLink fold,
-    /// the 1.188 send-messages fold, and the 1.252 access-control folds
+    /// the 1.188 send-messages fold, the 1.252 access-control folds
     /// (§4.238 — add-member / edit-details / member-label permissions onto
     /// the engine words membersPermission / attributesPermission /
     /// memberLabelPermission, the engine composing the official
-    /// modifyMemberLabels clears from its own group state); a change set
-    /// naming anything outside it (description, admin/ban families, the
-    /// member label pair) answers CAPABILITY_UNAVAILABLE naming the keys
+    /// modifyMemberLabels clears from its own group state), and the 1.296
+    /// description/admin/ban folds (§4.287 — groupDescription onto the
+    /// engine's `description` arm, promoteAdmins/demoteAdmins/
+    /// banMembers/unbanMembers onto the engine's same-named member-family
+    /// arms); the member-label write pair stays outside the engine face
+    /// and answers CAPABILITY_UNAVAILABLE naming the keys
     /// (retryable=false) after the local validation completed — the honest
     /// whole-call refusal, never a partial application. Zero local writes:
     /// group state converges through the receive projection.
@@ -5326,12 +5854,14 @@ impl ConnectorService {
         // arrays verbatim, the avatar tri-state verbatim, the link access
         // word above, (contract 1.180, §4.180) resetLink→a freshly
         // minted `inviteLinkPassword` (the official refreshGroupLink fold),
-        // and (contract 1.188, §4.188) setPermissionSendMessages→the
-        // engine's `announcementsOnly` bool. A change set carrying any key
-        // outside that subset (groupDescription, the admin and ban
-        // families, the remaining permission pair including the contract
-        // 1.221 member-label access arm, the member label pair)
-        // answers
+        // (contract 1.188, §4.188) setPermissionSendMessages→the
+        // engine's `announcementsOnly` bool, and (contract 1.296, §4.287)
+        // groupDescription→`description` plus the admin/ban member families
+        // onto the engine's promoteAdmins / demoteAdmins / banMembers /
+        // unbanMembers arms — the desktop's promote/demote/ban/unban and
+        // description-edit writes now travel the same single engine change
+        // broadcast. The member-label write pair (memberLabel /
+        // memberLabelEmoji) stays outside the engine face and answers
         // CAPABILITY_UNAVAILABLE naming the keys — the honest whole-call
         // refusal, never a partial application: the engine commits the set
         // as one change broadcast and the official client applies it
@@ -5403,18 +5933,38 @@ impl ConnectorService {
                         json!(engine_access_control_word(&value)),
                     );
                 }
-                // The refusal names the caller's schema vocabulary, not the
-                // internal upstream keys the change vec carries.
+                // Contract 1.296 (§4.287): the description write arm and the
+                // admin/ban member families ride the engine's updateGroup
+                // write arms — `description` verbatim (the same word the
+                // engine's listGroups projection reads, §4.188) and the four
+                // member arrays onto the engine's own family words
+                // promoteAdmins / demoteAdmins / banMembers / unbanMembers
+                // (the addMembers/removeMembers naming discipline — the
+                // engine's member-array words are the connector's host
+                // words). An engine build without the arms answers its own
+                // refusal through the structured UPSTREAM_ERROR face — the
+                // same posture the 1.188 announcementsOnly arm recorded.
+                "description" => {
+                    payload.insert("description".to_owned(), value);
+                }
+                "admins" => {
+                    payload.insert("promoteAdmins".to_owned(), value);
+                }
+                "removeAdmins" => {
+                    payload.insert("demoteAdmins".to_owned(), value);
+                }
+                "bans" => {
+                    payload.insert("banMembers".to_owned(), value);
+                }
+                "unbans" => {
+                    payload.insert("unbanMembers".to_owned(), value);
+                }
+                // The refusal names the caller's schema vocabulary, not an
+                // internal upstream key — and the remaining refused set
+                // (the member-label write pair) already carries the host
+                // words verbatim on the change vec.
                 _ => {
-                    let host = match key {
-                        "description" => "groupDescription",
-                        "admins" => "promoteAdmins",
-                        "removeAdmins" => "demoteAdmins",
-                        "bans" => "banMembers",
-                        "unbans" => "unbanMembers",
-                        other => other,
-                    };
-                    unsupported.push(host);
+                    unsupported.push(key);
                 }
             }
         }
@@ -10214,6 +10764,19 @@ impl ConnectorService {
                     .delete_attachment(&record.account_id, &sanitized_id);
             }
         }
+        if let Some(quote) = record.quote_snapshot.as_ref() {
+            for descriptor in quote
+                .attachments
+                .iter()
+                .filter_map(|entry| entry.thumbnail.as_ref())
+            {
+                if let Ok(sanitized_id) = sanitize_attachment_id(&descriptor.id) {
+                    media
+                        .governor()
+                        .delete_attachment(&record.account_id, &sanitized_id);
+                }
+            }
+        }
         media
             .handles()
             .close_for_message(&record.account_id, &record.id);
@@ -10369,6 +10932,34 @@ impl ConnectorService {
             size_bytes,
             chunk_bytes: MEDIA_CHUNK_BYTES,
         })
+    }
+
+    /// quote-scope open：先证明 attachmentId 属于指定 quote 槽，再复用普通
+    /// 分块句柄，避免同 id 的其他消息/出站附件被误当此引用缩略图。
+    pub fn open_quote_media_handle(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        quote_attachment_index: usize,
+    ) -> Result<MediaOpenView, ServiceError> {
+        let (_account, _conversation, message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
+        let expected = message
+            .quote_snapshot
+            .as_ref()
+            .and_then(|quote| quote.attachments.get(quote_attachment_index))
+            .and_then(|entry| entry.thumbnail.as_ref())
+            .map(|thumbnail| thumbnail.id.as_str());
+        if expected != Some(attachment_id) {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachmentId does not match this quote thumbnail slot",
+                false,
+            )));
+        }
+        self.open_media_handle(account_id, conversation_id, message_id, attachment_id)
     }
 
     /// history.attachmentDownload (contract revision 1.57, §4.38 step 3) —
@@ -10527,6 +11118,72 @@ impl ConnectorService {
             return Ok(PreparedHistoryDownload::AlreadyPresent { size_bytes });
         }
         let locator = self.attachment_locator_for_index(account_id, &message, attachment_index)?;
+        let temp_path = write_dir.join(format!(".{}.{}.tmp", sanitized_id, random_id()));
+        let plaintext_path = write_dir.join(format!(".{}.{}.dec", sanitized_id, random_id()));
+        Ok(PreparedHistoryDownload::Ready {
+            locator,
+            descriptor_size,
+            target,
+            temp_path,
+            plaintext_path,
+        })
+    }
+
+    /// 契约 1.298 §4.289：quoteSnapshot.attachments[index].thumbnail 的
+    /// 下载前链。公开 descriptor 与内部 locator 按同一 quote 位置读取，复用
+    /// 普通附件的 CDN/校验/解密/落盘和后续 openMediaStream 通道。
+    pub fn prepare_quote_attachment_download(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        quote_attachment_index: usize,
+    ) -> Result<PreparedHistoryDownload, ServiceError> {
+        let Some(media) = self.media.as_ref() else {
+            return Err(media_capability_error());
+        };
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        let (_account, _conversation, message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
+        let descriptor = message
+            .quote_snapshot
+            .as_ref()
+            .and_then(|quote| quote.attachments.get(quote_attachment_index))
+            .and_then(|entry| entry.thumbnail.as_ref())
+            .ok_or_else(|| {
+                ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "quoteAttachmentIndex does not name a quote thumbnail of this message",
+                    false,
+                ))
+            })?;
+        let descriptor_size = descriptor.size;
+        let sanitized_id = sanitize_attachment_id(&descriptor.id)?;
+        let write_dir = media.write_dir(account_id)?;
+        let target = write_dir.join(&sanitized_id);
+        if let Some((_, size_bytes)) = media.locate_attachment(account_id, &sanitized_id) {
+            return Ok(PreparedHistoryDownload::AlreadyPresent { size_bytes });
+        }
+        let locator = self
+            .store
+            .live_quote_attachment_locators(account_id, &message.id)?
+            .get(quote_attachment_index)
+            .cloned()
+            .unwrap_or_default();
+        if locator.key.is_none()
+            && locator.cdn_key.is_none()
+            && locator.cdn_number.is_none()
+            && locator.digest.is_none()
+            && locator.plaintext_hash.is_none()
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "quote thumbnail has no downloadable pointer face",
+                false,
+            )));
+        }
         let temp_path = write_dir.join(format!(".{}.{}.tmp", sanitized_id, random_id()));
         let plaintext_path = write_dir.join(format!(".{}.{}.dec", sanitized_id, random_id()));
         Ok(PreparedHistoryDownload::Ready {
@@ -11767,6 +12424,19 @@ impl ConnectorService {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
+                // The number leg before the mask (official getTitle ladder:
+                // profile -> system -> e164 -> ... — a masked id is never a
+                // title). Two number sources: the envelope metadata above,
+                // and a peer that is itself an E.164 (the sent-transcript
+                // destination ladder already prefers destinationNumber) — the
+                // latter must ride verbatim, never masked. A PNI-only
+                // destination without any number still falls to the mask
+                // until the identity ladder resolves it.
+                .or_else(|| receive.source_number.clone())
+                .or_else(|| {
+                    let raw = peer.trim();
+                    (!raw.is_empty() && raw.starts_with('+')).then(|| raw.to_string())
+                })
                 .unwrap_or_else(|| mask_address(peer));
             ("direct", peer.to_string(), label)
         } else {
@@ -11831,6 +12501,11 @@ impl ConnectorService {
             // the existing face is authoritative and never moved.
             let mut attachments = receive.attachments.clone();
             fill_missing_attachment_ids(&existing.id, &mut attachments);
+            self.store.merge_live_quote_attachment_locators(
+                &account.id,
+                &existing.id,
+                receive.quote.as_ref(),
+            )?;
             self.store
                 .merge_live_attachment_faces(&account.id, &existing.id, &attachments)?;
             return Ok(Vec::new());
@@ -12106,6 +12781,12 @@ impl ConnectorService {
         {
             self.store
                 .upsert_peer_identity(&account.id, aci, &peer_key)?;
+            // 契约 1.295（§4.248）：绑定观察同步落身份列——信封落在 PNI 键行
+            // 而 sourceUuid 是裸 ACI 时，即使 ACI 键行尚不存在（折叠的
+            // canonical 缺席臂），PNI 行也立刻拿 ACI 面（serviceId 解析不
+            // 孤儿）；号码腿绑定同理补 e164 面。
+            self.store
+                .stamp_peer_identity_binding(&account.id, aci, &peer_key)?;
             if let Some(outcome) = self
                 .store
                 .merge_peer_identity(&account.id, aci, &peer_key)?
@@ -15357,7 +16038,25 @@ impl ConnectorService {
             if record.number.is_some() && record.aci != peer_key {
                 self.store
                     .upsert_peer_identity(&account.id, &record.aci, &peer_key)?;
+                self.store
+                    .stamp_peer_identity_binding(&account.id, &record.aci, &peer_key)?;
                 bindings_written.push((record.aci.clone(), peer_key.clone()));
+            }
+            // 契约 1.295（§4.248 · PNI 会话归并）：同记录携 aci+pni 即同人
+            // 证据（官方 maybeMergeContacts 三键的 pni 腿）。pni 不进
+            // peer_identities 桥（桥 PK 每账号每 ACI 一行，写 pni 会顶掉
+            // 号码腿）——材料落 conversations 身份列；绑定进折叠扫，把
+            // PNI 键会话行折进 ACI 键行。缺席/退化（等于 aci）零动作，
+            // 诚实降级（pre-1.295 行为零变化）。
+            if let Some(pni) = record
+                .pni
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && *value != record.aci)
+            {
+                self.store
+                    .stamp_peer_identity_binding(&account.id, &record.aci, pni)?;
+                bindings_written.push((record.aci.clone(), pni.to_string()));
             }
             let title = record
                 .name
@@ -17985,12 +18684,14 @@ pub struct HistoryAttachmentDownloadParams {
 
 /// u64-bounded usize parse for `attachmentIndex`: JSON numbers are unsigned
 /// in the schema; anything else is the params-gate INVALID_REQUEST.
-fn parse_attachment_index<'de, D>(deserializer: D) -> Result<usize, D::Error>
+fn parse_optional_attachment_index<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = u64::deserialize(deserializer)?;
-    usize::try_from(value).map_err(|_| {
+    let Some(value) = Option::<u64>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    usize::try_from(value).map(Some).map_err(|_| {
         serde::de::Error::invalid_value(
             serde::de::Unexpected::Unsigned(value),
             &"an index inside the unsigned platform range",
@@ -18017,8 +18718,24 @@ pub struct AttachmentDownloadParams {
     pub account_id: String,
     pub conversation_id: String,
     pub message_id: String,
-    #[serde(deserialize_with = "parse_attachment_index")]
-    pub attachment_index: usize,
+    #[serde(default, deserialize_with = "parse_optional_attachment_index")]
+    pub attachment_index: Option<usize>,
+    /// 契约 1.298 §4.289：quoteSnapshot.attachments 的缩略图位置；与 attachmentIndex 恰一。
+    #[serde(default, deserialize_with = "parse_optional_attachment_index")]
+    pub quote_attachment_index: Option<usize>,
+}
+
+impl AttachmentDownloadParams {
+    pub(crate) fn validate_address(&self) -> Result<(), ServiceError> {
+        if self.attachment_index.is_some() == self.quote_attachment_index.is_some() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "exactly one of attachmentIndex or quoteAttachmentIndex must be provided",
+                false,
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// attachments.requestBackfill params (contract revision 1.175, §4.175):
@@ -18515,6 +19232,61 @@ pub struct UpstreamSendTextStyle {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentUploadBeginParams {
+    pub account_id: String,
+    pub client_request_id: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentUploadWriteParams {
+    pub account_id: String,
+    pub upload_id: String,
+    pub offset: u64,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentUploadAbortParams {
+    pub account_id: String,
+    pub upload_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendStagedAttachmentParams {
+    pub account_id: String,
+    pub conversation_id: Option<String>,
+    pub kind: Option<String>,
+    pub peer_key: Option<String>,
+    pub peer_title: Option<String>,
+    pub client_request_id: String,
+    pub upload_id: String,
+    pub size_bytes: u64,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+    pub text: Option<String>,
+    pub quote_message_id: Option<String>,
+    #[serde(default)]
+    pub voice_note: bool,
+    #[serde(default)]
+    pub view_once: bool,
+    #[serde(default)]
+    pub blur_hash: Option<String>,
+    #[serde(default)]
+    pub attachment_caption: Option<String>,
+    #[serde(default)]
+    pub gif: bool,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessagesSendAttachmentParams {
     pub account_id: String,
     pub conversation_id: Option<String>,
@@ -18558,6 +19330,10 @@ pub struct MessagesSendAttachmentParams {
     /// top-level key beside the array is INVALID_REQUEST.
     #[serde(default)]
     pub blur_hash: Option<String>,
+    /// 契约 1.297 §4.288：附件级 caption（AttachmentPointer.caption），与消息级
+    /// `text` 分离。仅单数面使用；复数面由条目各自携带。
+    #[serde(default)]
+    pub attachment_caption: Option<String>,
     /// §4.147 (contract revision 1.149): the GIF marker — true appends the
     /// `;gif=true` data-URI parameter, which the engine maps to the official
     /// `Flags.GIF=8` bit (the receive side has projected `isGif` since
@@ -18611,6 +19387,9 @@ pub struct MessagesSendAttachmentEntry {
     pub content_type: Option<String>,
     #[serde(default)]
     pub blur_hash: Option<String>,
+    /// 契约 1.297 §4.288：本条附件的 caption，独立映射 AttachmentPointer.caption。
+    #[serde(default)]
+    pub attachment_caption: Option<String>,
     #[serde(default)]
     pub gif: bool,
     /// 条目级声明尺寸（BUG-11 wire 批，契约 1.294 §4.284）：与单数形态
@@ -19977,6 +20756,9 @@ pub struct MessagesAttachmentsOpenParams {
     pub conversation_id: String,
     pub message_id: String,
     pub attachment_id: String,
+    /// 契约 1.298：quote 槽位。存在时 attachmentId 必须等于该槽 thumbnail.id。
+    #[serde(default)]
+    pub quote_attachment_index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -20803,6 +21585,20 @@ fn validate_blur_hash(blur_hash: Option<&str>) -> Result<(), ServiceError> {
         )));
     }
     Ok(())
+}
+
+/// 附件级 caption：独立于消息正文；空串/超 64 KiB UTF-8 一律确定性拒绝。
+fn validate_attachment_caption(value: Option<&str>) -> Result<Option<&str>, ServiceError> {
+    if let Some(caption) = value
+        && (caption.is_empty() || caption.len() > 65_536)
+    {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachmentCaption must contain between 1 and 65536 UTF-8 bytes",
+            false,
+        )));
+    }
+    Ok(value)
 }
 
 /// 出向声明尺寸校验（BUG-11 wire 批，契约 1.294 §4.284）：两键双参同进退
@@ -22242,12 +23038,16 @@ fn validate_avatar_data_uri(data_uri: &str) -> Result<String, ServiceError> {
 /// 每个条目各解出一个（契约 1.280，§4.264）。
 struct ResolvedAttachmentPayload {
     data_base64: String,
+    /// file-backed payload path for the streaming send family; None = legacy base64.
+    file_path: Option<std::path::PathBuf>,
     size_bytes: u64,
     content_type: Option<String>,
     filename: Option<String>,
     voice: bool,
     gif: bool,
     blur_hash: Option<String>,
+    /// 契约 1.297 §4.288：重试从原 descriptor 恢复附件级 caption。
+    attachment_caption: Option<String>,
     /// 契约 1.294 §4.284：声明尺寸（调用方重述优先，否则行 descriptor 的
     /// 既有 width/height 对）。ids-only 重发从行面恢复，所以一份首发带尺寸
     /// 的失败附件在刷新/重启后重试仍带同一对声明。
@@ -22263,11 +23063,20 @@ struct ResolvedAttachmentPayload {
 struct StoredAttachmentPayload {
     data_base64: String,
     size_bytes: u64,
+    file_path: Option<std::path::PathBuf>,
 }
 
 fn parse_attachment_data_uri(data_uri: &str) -> Result<StoredAttachmentPayload, ServiceError> {
     fn invalid(detail: &'static str) -> ServiceError {
         ServiceError::Api(ApiError::new("RETRY_NOT_ALLOWED", detail, false))
+    }
+    if data_uri.starts_with("file:") {
+        let (path, size_bytes) = parse_file_attachment_uri(data_uri)?;
+        return Ok(StoredAttachmentPayload {
+            data_base64: String::new(),
+            size_bytes,
+            file_path: Some(path),
+        });
     }
     let Some(rest) = data_uri.strip_prefix("data:") else {
         return Err(invalid("the stored attachment payload is not a data URI"));
@@ -22290,7 +23099,66 @@ fn parse_attachment_data_uri(data_uri: &str) -> Result<StoredAttachmentPayload, 
     Ok(StoredAttachmentPayload {
         data_base64: payload.to_string(),
         size_bytes: decoded.len() as u64,
+        file_path: None,
     })
+}
+
+fn decode_file_uri_component(value: &str) -> Result<String, ()> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(());
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(|_| ())?;
+            decoded.push(u8::from_str_radix(hex, 16).map_err(|_| ())?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| ())
+}
+
+/// Parse only connector-generated file URIs. Metadata and byte length are
+/// checked without reading the file into memory; descriptor faces remain row-owned.
+fn parse_file_attachment_uri(data_uri: &str) -> Result<(std::path::PathBuf, u64), ServiceError> {
+    fn invalid(detail: &'static str) -> ServiceError {
+        ServiceError::Api(ApiError::new("RETRY_NOT_ALLOWED", detail, false))
+    }
+    let rest = data_uri
+        .strip_prefix("file:")
+        .ok_or_else(|| invalid("the stored attachment payload is not a file URI"))?;
+    let mut parts = rest.split(';');
+    let path = decode_file_uri_component(parts.next().ok_or_else(|| invalid("missing file path"))?)
+        .map_err(|_| invalid("invalid file URI path"))?;
+    let path_ref = std::path::Path::new(&path);
+    if !path_ref.is_absolute()
+        || path_ref
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(invalid("file URI path must be absolute and traversal-free"));
+    }
+    let size = parts
+        .find_map(|part| part.strip_prefix("sizeBytes="))
+        .ok_or_else(|| invalid("file URI is missing sizeBytes"))?
+        .parse::<u64>()
+        .map_err(|_| invalid("file URI sizeBytes is invalid"))?;
+    if size == 0 || size > MAX_ATTACHMENT_BYTES as u64 {
+        return Err(invalid("file URI sizeBytes exceeds the attachment budget"));
+    }
+    let metadata = std::fs::metadata(path_ref)
+        .map_err(|_| invalid("file-backed attachment is no longer available"))?;
+    if !metadata.is_file() || metadata.len() != size {
+        return Err(invalid(
+            "file-backed attachment size does not match its declaration",
+        ));
+    }
+    Ok((path_ref.to_path_buf(), size))
 }
 
 /// Build the RFC 2397 data URI the pinned upstream accepts
@@ -22319,6 +23187,109 @@ fn build_attachment_data_uri(
     gif: bool,
     dimensions: Option<(u32, u32)>,
 ) -> Result<String, ServiceError> {
+    build_attachment_data_uri_with_caption(
+        base64_data,
+        filename,
+        content_type,
+        voice,
+        gif,
+        dimensions,
+        None,
+    )
+}
+
+/// filename/caption 共用 encodeURIComponent 语义，分号/逗号/百分号不破坏 URI。
+fn write_data_uri_percent_encoded(uri: &mut String, value: &str) {
+    use std::fmt::Write as _;
+    for byte in value.bytes() {
+        let c = byte as char;
+        if c.is_ascii_alphanumeric() || "-_.!~*'()".contains(c) {
+            uri.push(c);
+        } else {
+            let _ = write!(uri, "%{byte:02X}");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_attachment_file_uri(
+    path: &std::path::Path,
+    size_bytes: u64,
+    filename: Option<&str>,
+    content_type: Option<&str>,
+    voice: bool,
+    gif: bool,
+    dimensions: Option<(u32, u32)>,
+    attachment_caption: Option<&str>,
+) -> Result<String, ServiceError> {
+    fn invalid(detail: &'static str) -> ServiceError {
+        ServiceError::Api(ApiError::new("INVALID_REQUEST", detail, false))
+    }
+    validate_attachment_caption(attachment_caption)?;
+    validate_attachment_dimensions_pair(dimensions)?;
+    if size_bytes == 0 || size_bytes > MAX_ATTACHMENT_BYTES as u64 {
+        return Err(invalid(
+            "file-backed attachment size exceeds the attachment budget",
+        ));
+    }
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(invalid(
+            "file-backed attachment path must be absolute and traversal-free",
+        ));
+    }
+    let metadata =
+        std::fs::metadata(path).map_err(|_| invalid("file-backed attachment is unavailable"))?;
+    if !metadata.is_file() || metadata.len() != size_bytes {
+        return Err(invalid(
+            "file-backed attachment size does not match its declaration",
+        ));
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| invalid("file-backed path is not UTF-8"))?;
+    let mut uri = String::with_capacity(path.len() + 128);
+    uri.push_str("file:");
+    write_data_uri_percent_encoded(&mut uri, path);
+    uri.push_str(";contentType=");
+    write_data_uri_percent_encoded(&mut uri, content_type.unwrap_or("application/octet-stream"));
+    if voice {
+        uri.push_str(";voice=true");
+    }
+    if gif {
+        uri.push_str(";gif=true");
+    }
+    if let Some((width, height)) = dimensions {
+        use std::fmt::Write as _;
+        let _ = write!(uri, ";width={width};height={height}");
+    }
+    if let Some(caption) = attachment_caption {
+        uri.push_str(";caption=");
+        write_data_uri_percent_encoded(&mut uri, caption);
+    }
+    if let Some(filename) = filename {
+        uri.push_str(";filename=");
+        write_data_uri_percent_encoded(&mut uri, filename);
+    }
+    use std::fmt::Write as _;
+    let _ = write!(uri, ";sizeBytes={size_bytes}");
+    Ok(uri)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_attachment_data_uri_with_caption(
+    base64_data: &str,
+    filename: Option<&str>,
+    content_type: Option<&str>,
+    voice: bool,
+    gif: bool,
+    dimensions: Option<(u32, u32)>,
+    attachment_caption: Option<&str>,
+) -> Result<String, ServiceError> {
+    let attachment_caption = validate_attachment_caption(attachment_caption)?;
     let mut decoded = Vec::with_capacity(base64_data.len() / 4 * 3);
     base64_decode_to_vec(base64_data, &mut decoded).map_err(|_| {
         ServiceError::Api(ApiError::new(
@@ -22352,17 +23323,14 @@ fn build_attachment_data_uri(
     if let Some((width, height)) = dimensions {
         let _ = write!(uri, ";width={width};height={height}");
     }
+    if let Some(caption) = attachment_caption {
+        uri.push_str(";caption=");
+        write_data_uri_percent_encoded(&mut uri, caption);
+    }
     if let Some(filename) = filename {
         uri.push_str(";filename=");
         // encodeURIComponent semantics for the filename parameter.
-        for byte in filename.bytes() {
-            let c = byte as char;
-            if c.is_ascii_alphanumeric() || "-_.!~*'()".contains(c) {
-                uri.push(c);
-            } else {
-                let _ = write!(uri, "%{byte:02X}");
-            }
-        }
+        write_data_uri_percent_encoded(&mut uri, filename);
     }
     uri.push_str(";base64,");
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -23214,6 +24182,120 @@ mod tests {
     /// row (the member ACI — the author's protocol identity), and the
     /// backfill request for that landed group row names it verbatim. The
     /// row's `sender_id` ingest hash never appears in the prepared frame,
+    /// 标题回退的号码腿（对齐官方 getTitle 梯：e164 在掩码/unknown 之前）：
+    /// peer_name 缺席但信封带号码 → 标题落号码；对端本身是 E.164（sent
+    /// 转录 destination 阶梯的产物）→ 原样透出，绝不掩码；只有无号码的
+    /// 服务 id（PNI/裸 ACI）才落掩码占位，等身份梯解析后升级。
+    #[test]
+    fn direct_receive_titles_by_number_before_mask() {
+        let (_temp, mut service) = service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let base = |source: &str, source_number: Option<&str>, ts: u64| NormalizedReceive {
+            required_protocol_version: None,
+            timestamp: Some(ts),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some(source.into()),
+            source_uuid: None,
+            peer_name: None,
+            source_number: source_number.map(str::to_string),
+            group_id: None,
+            text: Some("hi".into()),
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+        };
+
+        // 1) ACI 键 + 信封带号码：标题 = 号码，不再掩码。
+        service
+            .ingest_receive(
+                base(
+                    "22222222-2222-4222-8222-222222222222",
+                    Some("+15555550101"),
+                    1_000,
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let aci_row = service
+            .store_ref()
+            .conversation_by_peer(
+                &account.id,
+                "direct",
+                "22222222-2222-4222-8222-222222222222",
+            )
+            .unwrap()
+            .expect("aci row");
+        assert_eq!(
+            service
+                .store_ref()
+                .conversation_title(&aci_row.id)
+                .expect("title read")
+                .unwrap_or_default(),
+            "+15555550101"
+        );
+
+        // 2) peer 本身是 E.164：原样，绝不掩码。
+        service
+            .ingest_receive(
+                base("+15555550109", None, 2_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let e164_row = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", "+15555550109")
+            .unwrap()
+            .expect("e164 row");
+        let e164_title = service
+            .store_ref()
+            .conversation_title(&e164_row.id)
+            .expect("title read")
+            .unwrap_or_default();
+        assert_eq!(e164_title, "+15555550109");
+        assert!(!e164_title.contains("***"));
+
+        // 3) PNI 服务 id 且无号码：掩码占位（身份梯解析后升级的语义不变）。
+        service
+            .ingest_receive(
+                base("PNI:33333333-3333-4333-8333-333333333333", None, 3_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let pni_row = service
+            .store_ref()
+            .conversation_by_peer(
+                &account.id,
+                "direct",
+                "PNI:33333333-3333-4333-8333-333333333333",
+            )
+            .unwrap()
+            .expect("pni row");
+        let pni_title = service
+            .store_ref()
+            .conversation_title(&pni_row.id)
+            .expect("title read")
+            .unwrap_or_default();
+        assert!(
+            pni_title.contains("***"),
+            "pni placeholder stays masked: {pni_title}"
+        );
+    }
+
     /// and the direct receive captures its peer identity the same way.
     #[test]
     fn group_receive_captures_the_member_aci_and_the_backfill_names_it() {
@@ -23233,6 +24315,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: Some(member_aci.to_string()),
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: Some("ZmFrZS1ncm91cA==".into()),
             text: Some("photo".into()),
             text_bytes: None,
@@ -25272,6 +26355,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: Some("Peer".into()),
+                    source_number: None,
                     group_id: None,
                     text: Some(full_text.clone()),
                     text_bytes: None,
@@ -25348,6 +26432,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some(oversized),
                     text_bytes: None,
@@ -25984,6 +27069,7 @@ mod tests {
             filename: Some("notes.txt".into()),
             content_type: Some("text/plain".into()),
             blur_hash: Some("abc123".into()),
+            attachment_caption: None,
             gif: false,
         }];
         let prepared = service
@@ -26046,6 +27132,7 @@ mod tests {
             filename: None,
             content_type: None,
             blur_hash: Some(String::new()),
+            attachment_caption: None,
             gif: false,
         }];
         let error = service
@@ -26602,7 +27689,7 @@ mod tests {
                 .unwrap()
         };
         let pending_id = match service
-            .prepare_send_attachment(
+            .prepare_send_attachment_with_caption(
                 &account.id,
                 &AttachmentSendTarget::Conversation(&conversation.id),
                 "req-attach-retry",
@@ -26616,6 +27703,8 @@ mod tests {
                 false,
                 None,
                 false,
+                None,
+                Some("attachment caption"),
             )
             .unwrap()
         {
@@ -26667,8 +27756,8 @@ mod tests {
         assert_eq!(params["message"], "retry caption");
         assert_eq!(
             params["attachments"][0].as_str().unwrap(),
-            "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw==",
-            "the retry carries the bytes again — the engine re-uploads them"
+            "data:text/plain;caption=attachment%20caption;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw==",
+            "the retry preserves the original attachment caption and bytes"
         );
         assert_eq!(row_count(&service), 1, "a retry never adds a row");
         let rearmed = service
@@ -26683,6 +27772,10 @@ mod tests {
         );
         assert_eq!(rearmed.text.as_deref(), Some("retry caption"));
         assert_eq!(rearmed.attachments.len(), 1);
+        assert_eq!(
+            rearmed.attachments[0].caption.as_deref(),
+            Some("attachment caption")
+        );
         assert_eq!(
             rearmed.attachments[0].id, failed.attachments[0].id,
             "the descriptor id is the first attempt's own (same bytes slot)"
@@ -26893,6 +27986,7 @@ mod tests {
                         filename: Some("one.txt".into()),
                         content_type: Some("text/plain".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
@@ -26904,6 +27998,7 @@ mod tests {
                         filename: Some("two.txt".into()),
                         content_type: Some("text/plain".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                 ],
@@ -27360,8 +28455,8 @@ mod tests {
             .unwrap();
         let client_request_id = "req-multi-payload";
         // "attachment bytes" / "second attachment"
-        let first_uri = "data:text/plain;filename=one.txt;base64,YXR0YWNobWVudCBieXRlcw==";
-        let second_uri = "data:application/octet-stream;gif=true;filename=two.bin;base64,c2Vjb25kIGF0dGFjaG1lbnQ=";
+        let first_uri = "data:text/plain;caption=first%20attachment;filename=one.txt;base64,YXR0YWNobWVudCBieXRlcw==";
+        let second_uri = "data:application/octet-stream;gif=true;caption=second%20attachment;filename=two.bin;base64,c2Vjb25kIGF0dGFjaG1lbnQ=";
         let pending_id = match service
             .prepare_send_attachment_multi(
                 &account.id,
@@ -27377,6 +28472,7 @@ mod tests {
                         filename: Some("one.txt".into()),
                         content_type: Some("text/plain".into()),
                         blur_hash: None,
+                        attachment_caption: Some("first attachment".into()),
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
@@ -27388,6 +28484,7 @@ mod tests {
                         filename: Some("two.bin".into()),
                         content_type: Some("application/octet-stream".into()),
                         blur_hash: None,
+                        attachment_caption: Some("second attachment".into()),
                         gif: true,
                     },
                 ],
@@ -27500,6 +28597,14 @@ mod tests {
             descriptor_ids,
             "every descriptor keeps the first attempt's own id (same byte slots)"
         );
+        assert_eq!(
+            rearmed.attachments[0].caption.as_deref(),
+            Some("first attachment")
+        );
+        assert_eq!(
+            rearmed.attachments[1].caption.as_deref(),
+            Some("second attachment")
+        );
         assert_eq!(rearmed.attachments[0].filename.as_deref(), Some("one.txt"));
         assert_eq!(
             rearmed.attachments[0].content_type.as_deref(),
@@ -27580,6 +28685,7 @@ mod tests {
                         filename: Some("one.txt".into()),
                         content_type: Some("text/plain".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
@@ -27591,6 +28697,7 @@ mod tests {
                         filename: Some("two.bin".into()),
                         content_type: Some("application/octet-stream".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                 ],
@@ -27968,6 +29075,7 @@ mod tests {
                         filename: Some("one.txt".into()),
                         content_type: Some("text/plain".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                     MessagesSendAttachmentEntry {
@@ -27979,6 +29087,7 @@ mod tests {
                         filename: Some("two.bin".into()),
                         content_type: Some("application/octet-stream".into()),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                 ],
@@ -28596,6 +29705,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("same text is not identity".into()),
             text_bytes: Some(25),
@@ -28739,6 +29849,7 @@ mod tests {
             source: Some(source.into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-one".into()),
             text: Some(text.into()),
             text_bytes: Some(text.len() as u32),
@@ -28815,6 +29926,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("林菲菲".into()),
+            source_number: None,
             group_id: Some("group-one".into()),
             text: Some("你好".into()),
             text_bytes: Some(6),
@@ -28924,6 +30036,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: Some("Peer".into()),
+                    source_number: None,
                     group_id: Some("group-one".into()),
                     text: Some("@you".into()),
                     text_bytes: Some(4),
@@ -29081,6 +30194,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: Some("hi".into()),
             text_bytes: Some(2),
@@ -29112,6 +30226,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: Some("group-one".into()),
             text: Some("hi".into()),
             text_bytes: Some(2),
@@ -29235,6 +30350,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("unstable identity".into()),
             text_bytes: Some(17),
@@ -29649,6 +30765,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("quoted text".into()),
                     text_bytes: Some(11),
@@ -29872,6 +30989,7 @@ mod tests {
                     source: Some("+15555550105".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: Some("group-one".into()),
                     text: Some("group text".into()),
                     text_bytes: Some(10),
@@ -30181,6 +31299,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("peer text".into()),
                     text_bytes: Some(9),
@@ -30310,6 +31429,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("peer text".into()),
                     text_bytes: Some(9),
@@ -30453,6 +31573,7 @@ mod tests {
                     source: Some("+15555550105".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: Some("group-one".into()),
                     text: Some("group text".into()),
                     text_bytes: Some(10),
@@ -31106,6 +32227,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("peer pin target".into()),
                     text_bytes: Some(15),
@@ -31260,6 +32382,7 @@ mod tests {
                     source: Some("+15555550105".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: Some("group-one".into()),
                     text: Some("group text".into()),
                     text_bytes: Some(10),
@@ -31448,6 +32571,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("peer pin target".into()),
                     text_bytes: Some(15),
@@ -32041,6 +33165,192 @@ mod tests {
     /// params carry the data URI under `attachments`, and an unknown
     /// clientRequestId replay returns the same existing row (idempotency).
     #[test]
+    fn staged_attachment_upload_writes_chunks_and_prepares_file_backed_send() {
+        let (_temp, mut service) = media_service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let client_request_id = "upload-client-1";
+        let started = service
+            .begin_attachment_upload(&account.id, client_request_id, 5)
+            .unwrap();
+        assert_eq!(started.size_bytes, 5);
+        let first = service
+            .write_attachment_upload_chunk(&account.id, &started.upload_id, 0, "aGVs")
+            .unwrap();
+        assert_eq!(first.written_bytes, 3);
+        assert!(
+            service
+                .write_attachment_upload_chunk(&account.id, &started.upload_id, 0, "bG8=")
+                .is_err()
+        );
+        let second = service
+            .write_attachment_upload_chunk(&account.id, &started.upload_id, 3, "bG8=")
+            .unwrap();
+        assert_eq!(second.written_bytes, 5);
+
+        let prepared = service
+            .prepare_send_attachment_staged(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                &started.upload_id,
+                5,
+                Some("hello.txt"),
+                Some("text/plain"),
+                Some("caption"),
+                None,
+                false,
+                false,
+                None,
+                false,
+                None,
+                Some("attachment caption"),
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = prepared else {
+            panic!("staged upload must create a dispatch")
+        };
+        let uri = params["attachments"][0].as_str().unwrap();
+        assert!(
+            uri.starts_with("file:"),
+            "file URI must avoid whole-file base64"
+        );
+        assert!(uri.contains("sizeBytes=5"));
+        assert!(!uri.contains(";base64,"));
+        let row = service
+            .store
+            .message_by_client_request(&account.id, client_request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.attachments[0].size, Some(5));
+        assert_eq!(
+            row.attachments[0].caption.as_deref(),
+            Some("attachment caption")
+        );
+        let payloads = service
+            .store
+            .outgoing_attachment_payloads(&account.id, client_request_id)
+            .unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert!(payloads[0].1.starts_with("file:"));
+        let (path, size) = parse_file_attachment_uri(&payloads[0].1).unwrap();
+        assert_eq!(size, 5);
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert!(
+            service
+                .prepare_send_attachment_staged(
+                    &account.id,
+                    &AttachmentSendTarget::Conversation(&conversation.id),
+                    client_request_id,
+                    &started.upload_id,
+                    5,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .is_err()
+        );
+        service
+            .store
+            .conn()
+            .execute("UPDATE messages SET status='failed' WHERE id=?1", [&row.id])
+            .unwrap();
+        let retry = service
+            .prepare_retry_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                client_request_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = retry else {
+            panic!("file-backed ids-only retry must dispatch")
+        };
+        assert!(
+            params["attachments"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("file:")
+        );
+        assert!(
+            service
+                .begin_attachment_upload(&account.id, client_request_id, 5)
+                .is_err(),
+            "persisted payload must never be overwritten by begin"
+        );
+        assert!(
+            path.exists(),
+            "persisted staging file survives rejected begin"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            service
+                .begin_attachment_upload(&account.id, client_request_id, 5)
+                .is_err(),
+            "persisted payload is protected even when its file is missing"
+        );
+        std::fs::write(&path, b"hello").unwrap();
+
+        let abandoned_id = "upload-client-abandoned";
+        let abandoned = service
+            .begin_attachment_upload(&account.id, abandoned_id, 5)
+            .unwrap();
+        service
+            .write_attachment_upload_chunk(&account.id, &abandoned.upload_id, 0, "aGVs")
+            .unwrap();
+        let abandoned_path = service
+            .upload_sessions
+            .get(&abandoned.upload_id)
+            .unwrap()
+            .path
+            .clone();
+        service.upload_sessions.clear();
+        let reopened = service
+            .begin_attachment_upload(&account.id, abandoned_id, 5)
+            .unwrap();
+        assert!(abandoned_path.is_file());
+        assert_ne!(reopened.upload_id, abandoned.upload_id);
+        assert!(reopened.upload_id != abandoned.upload_id);
+        service
+            .abort_attachment_upload(&account.id, &reopened.upload_id)
+            .unwrap();
+
+        let ttl_id = "upload-client-ttl";
+        let ttl = service
+            .begin_attachment_upload(&account.id, ttl_id, 5)
+            .unwrap();
+        let ttl_path = service
+            .upload_sessions
+            .get(&ttl.upload_id)
+            .unwrap()
+            .path
+            .clone();
+        service.expire_upload_sessions(u64::MAX);
+        assert!(!ttl_path.exists(), "TTL removes abandoned staging bytes");
+        let after_ttl = service
+            .begin_attachment_upload(&account.id, ttl_id, 5)
+            .unwrap();
+        service
+            .abort_attachment_upload(&account.id, &after_ttl.upload_id)
+            .unwrap();
+    }
+
+    #[test]
     fn prepare_send_attachment_builds_data_uri_params_and_is_idempotent() {
         let (_temp, mut service) = service();
         let account = service
@@ -32062,6 +33372,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: Some("Peer".into()),
+                    source_number: None,
                     group_id: None,
                     text: Some("hello".into()),
                     text_bytes: None,
@@ -32411,6 +33722,7 @@ mod tests {
                 filename: Some("tenor.gif".into()),
                 content_type: Some("video/mp4".into()),
                 blur_hash: None,
+                attachment_caption: Some("A;B,% 中".into()),
                 gif: true,
             },
             MessagesSendAttachmentEntry {
@@ -32422,6 +33734,7 @@ mod tests {
                 filename: Some("notes.txt".into()),
                 content_type: Some("text/plain".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             },
         ];
@@ -32442,7 +33755,7 @@ mod tests {
         assert_eq!(attachments.len(), 2);
         assert_eq!(
             attachments[0].as_str().unwrap(),
-            "data:video/mp4;gif=true;filename=tenor.gif;base64,YXR0YWNobWVudCBieXRlcw=="
+            "data:video/mp4;gif=true;caption=A%3BB%2C%25%20%E4%B8%AD;filename=tenor.gif;base64,YXR0YWNobWVudCBieXRlcw=="
         );
         assert_eq!(
             attachments[1].as_str().unwrap(),
@@ -32454,6 +33767,8 @@ mod tests {
             .unwrap()
             .expect("the pending multi gif row exists");
         assert!(row.attachments[0].is_gif);
+        assert_eq!(row.attachments[0].caption.as_deref(), Some("A;B,% 中"));
+        assert_eq!(row.attachments[1].caption, None);
         assert!(!row.attachments[1].is_gif);
     }
 
@@ -32468,7 +33783,7 @@ mod tests {
 
         // 声明尺寸：URI 参数 + descriptor 两键（首个 tick 即终态盒）。
         let prepared = service
-            .prepare_send_attachment_with_dimensions(
+            .prepare_send_attachment_with_caption(
                 &account.id,
                 &AttachmentSendTarget::Conversation(&conversation.id),
                 "req-dims-1",
@@ -32483,6 +33798,7 @@ mod tests {
                 None,
                 false,
                 Some((640, 480)),
+                Some("single caption"),
             )
             .unwrap();
         let PreparedSend::Dispatch { params, .. } = &prepared else {
@@ -32490,7 +33806,7 @@ mod tests {
         };
         assert_eq!(
             params["attachments"][0].as_str().unwrap(),
-            "data:image/jpeg;width=640;height=480;filename=photo.jpg;base64,YXR0YWNobWVudCBieXRlcw=="
+            "data:image/jpeg;width=640;height=480;caption=single%20caption;filename=photo.jpg;base64,YXR0YWNobWVudCBieXRlcw=="
         );
         let row = service
             .store
@@ -32500,6 +33816,10 @@ mod tests {
         assert_eq!(
             (row.attachments[0].width, row.attachments[0].height),
             (Some(640), Some(480))
+        );
+        assert_eq!(
+            row.attachments[0].caption.as_deref(),
+            Some("single caption")
         );
 
         // 未声明：URI 与 descriptor 逐字节回到 1.293 形状。
@@ -32572,6 +33892,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prepare_send_attachment_caption_rejects_empty_oversize_and_view_once() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let b64 = "YXR0YWNobWVudCBieXRlcw==";
+        for (request_id, caption, view_once) in [
+            ("caption-empty", "".to_string(), false),
+            ("caption-over", "a".repeat(65_537), false),
+            ("caption-view-once", "not allowed".to_string(), true),
+        ] {
+            let rejected = service.prepare_send_attachment_with_caption(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                request_id,
+                b64,
+                16,
+                Some("photo.jpg"),
+                Some("image/jpeg"),
+                None,
+                None,
+                false,
+                view_once,
+                None,
+                false,
+                None,
+                Some(&caption),
+            );
+            assert!(rejected.is_err(), "{request_id} must reject");
+            assert!(
+                service
+                    .store
+                    .message_by_client_request(&account.id, request_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
     /// BUG-11 wire 批复数面：条目级声明尺寸只染自己那条的 data URI 与
     /// descriptor，逐条对齐、互不串号。
     #[test]
@@ -32590,6 +33948,7 @@ mod tests {
                 filename: Some("photo.jpg".into()),
                 content_type: Some("image/jpeg".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             },
             MessagesSendAttachmentEntry {
@@ -32600,6 +33959,7 @@ mod tests {
                 filename: Some("notes.txt".into()),
                 content_type: Some("text/plain".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             },
         ];
@@ -32648,6 +34008,7 @@ mod tests {
             filename: None,
             content_type: None,
             blur_hash: None,
+            attachment_caption: None,
             gif: false,
         }];
         let rejected = service.prepare_send_attachment_multi(
@@ -32734,6 +34095,7 @@ mod tests {
                         filename: filename.map(str::to_string),
                         content_type: content_type.map(str::to_string),
                         blur_hash: None,
+                        attachment_caption: None,
                         gif: false,
                     },
                 )
@@ -32849,6 +34211,7 @@ mod tests {
                 filename: Some("a.txt".into()),
                 content_type: Some("text/plain".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             })
             .collect();
@@ -32885,6 +34248,7 @@ mod tests {
                 filename: Some("big.bin".into()),
                 content_type: Some("application/octet-stream".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             })
             .collect();
@@ -35067,6 +36431,7 @@ mod tests {
             source: Some(MEMBER_E164.into()),
             source_uuid: Some(MEMBER_ACI.into()),
             peer_name: None,
+            source_number: None,
             group_id: Some(GROUP_MASTER.into()),
             text: Some("archived".into()),
             text_bytes: Some(8),
@@ -37189,6 +38554,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -37261,6 +38627,7 @@ mod tests {
                 source: source.map(str::to_string),
                 source_uuid: None,
                 peer_name: None,
+                source_number: None,
                 group_id: None,
                 text: None,
                 text_bytes: None,
@@ -38973,6 +40340,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -39003,6 +40371,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: Some("nice story".to_string()),
             text_bytes: Some(10),
@@ -39535,6 +40904,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("Z3JvdXAtYXV0aA".into()),
             text: Some("late group original".into()),
             text_bytes: Some(19),
@@ -39870,6 +41240,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -41248,6 +42619,7 @@ mod tests {
             source: Some(source.into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -42283,6 +43655,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: Some("hi".into()),
             text_bytes: None,
@@ -44758,6 +46131,8 @@ mod tests {
             crate::engine::SyncContactRecord {
                 aci: aci.to_string(),
                 number: number.map(str::to_string),
+                // 契约 1.295：该测试族不携 PNI 材料（缺席臂）。
+                pni: None,
                 name: name.map(str::to_string),
             }
         };
@@ -45144,6 +46519,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("to be deleted".into()),
             text_bytes: Some(13),
@@ -45213,6 +46589,7 @@ mod tests {
                 source: Some(source.into()),
                 source_uuid: None,
                 peer_name: None,
+                source_number: None,
                 group_id: Some("Z3JvdXAtYXV0aA".into()),
                 text: Some(format!("from {source}")),
                 text_bytes: None,
@@ -45338,6 +46715,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("stays".into()),
             text_bytes: Some(5),
@@ -45414,6 +46792,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("before edit".into()),
             text_bytes: Some(11),
@@ -45521,6 +46900,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -45681,6 +47061,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -45752,6 +47133,7 @@ mod tests {
             source: None,
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -45850,6 +47232,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -45940,6 +47323,7 @@ mod tests {
             source: None,
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -46038,6 +47422,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-key".into()),
             text: None,
             text_bytes: None,
@@ -46122,6 +47507,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("plain text".into()),
             text_bytes: Some(10),
@@ -46206,6 +47592,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("late original".into()),
             text_bytes: Some(13),
@@ -46296,6 +47683,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("original body".into()),
             text_bytes: Some(13),
@@ -46383,6 +47771,7 @@ mod tests {
                 source: Some(source.into()),
                 source_uuid: None,
                 peer_name: None,
+                source_number: None,
                 group_id: Some("Z3JvdXAtYnVmZmVy".into()),
                 text: Some(format!("from {source}")),
                 text_bytes: None,
@@ -46613,6 +48002,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("incoming stays".into()),
                     text_bytes: Some(14),
@@ -47130,6 +48520,7 @@ mod tests {
                     source: Some("+15555550101".into()),
                     source_uuid: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: None,
                     text: Some("transcript body".into()),
                     text_bytes: Some(15),
@@ -47196,6 +48587,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("v0".into()),
             text_bytes: Some(2),
@@ -47344,6 +48736,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("peer says".into()),
             text_bytes: Some(9),
@@ -47376,11 +48769,36 @@ mod tests {
         assert_eq!(error.into_api().code, "MESSAGE_NOT_FOUND");
     }
 
+    #[test]
+    fn attachment_download_address_requires_exactly_one_normal_or_quote_index() {
+        for params in [
+            serde_json::json!({
+                "accountId": "a", "conversationId": "c", "messageId": "m", "attachmentIndex": 0
+            }),
+            serde_json::json!({
+                "accountId": "a", "conversationId": "c", "messageId": "m", "quoteAttachmentIndex": 0
+            }),
+        ] {
+            let parsed: AttachmentDownloadParams = serde_json::from_value(params).unwrap();
+            parsed.validate_address().unwrap();
+        }
+        for params in [
+            serde_json::json!({"accountId": "a", "conversationId": "c", "messageId": "m"}),
+            serde_json::json!({
+                "accountId": "a", "conversationId": "c", "messageId": "m",
+                "attachmentIndex": 0, "quoteAttachmentIndex": 0
+            }),
+        ] {
+            let parsed: AttachmentDownloadParams = serde_json::from_value(params).unwrap();
+            assert!(parsed.validate_address().is_err());
+        }
+    }
+
     /// Inbound quote + attachment metadata ride the message row end to end:
     /// ingest persists them, list_messages returns them verbatim.
     #[test]
     fn inbound_quote_and_attachment_metadata_roundtrip_through_the_store() {
-        let (_temp, mut service) = service();
+        let (_temp, mut service) = media_service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let receive = NormalizedReceive {
             required_protocol_version: None,
@@ -47392,6 +48810,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("replying with a file".into()),
             text_bytes: Some(20),
@@ -47451,7 +48870,23 @@ mod tests {
             server_timestamp: None,
         };
         service
-            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .ingest_receive(receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let mut replay = receive;
+        replay.quote.as_mut().unwrap().attachments[0]
+            .thumbnail
+            .as_mut()
+            .unwrap()
+            .locator = Some(crate::store::HistoryAttachmentLocator {
+            key: Some("thumbnail-key".into()),
+            cdn_key: Some("thumbnail-cdn-key".into()),
+            cdn_number: Some(2),
+            digest: Some("thumbnail-digest".into()),
+            ..Default::default()
+        });
+        // 同一 quote 行的迟到 pointer 只补空槽，不改公开 snapshot。
+        service
+            .ingest_receive(replay, crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
 
         let row = service
@@ -47461,6 +48896,8 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
+        let message_id = row.id.clone();
+        let duplicate = row.clone();
         let quote = row
             .quote_snapshot
             .expect("quote snapshot survives the roundtrip");
@@ -47477,11 +48914,81 @@ mod tests {
         let thumb = quoted.thumbnail.as_ref().expect("thumbnail survives");
         assert_eq!(thumb.id, "quote-thumb");
         assert_eq!(thumb.size, Some(1024));
-        assert_eq!(thumb.locator, None);
+        assert_eq!(thumb.locator, None, "公开 quoteSnapshot 不泄 locator");
+        let locators = service
+            .store_ref()
+            .live_quote_attachment_locators(&account.id, &message_id)
+            .unwrap();
+        assert_eq!(locators.len(), 1);
+        assert_eq!(locators[0].key.as_deref(), Some("thumbnail-key"));
+        assert_eq!(locators[0].cdn_key.as_deref(), Some("thumbnail-cdn-key"));
+        assert_eq!(locators[0].cdn_number, Some(2));
         assert_eq!(row.attachments.len(), 1);
         assert_eq!(row.attachments[0].id, "att-1");
         assert_eq!(row.attachments[0].filename.as_deref(), Some("shot.png"));
         assert_eq!(row.attachments[0].size, Some(2048));
+
+        let prepared = service
+            .prepare_quote_attachment_download(&account.id, &conversation.id, &message_id, 0)
+            .unwrap();
+        let PreparedHistoryDownload::Ready {
+            locator,
+            descriptor_size,
+            target,
+            ..
+        } = prepared
+        else {
+            panic!("quote thumbnail must stage its own pointer and file")
+        };
+        assert_eq!(locator.key.as_deref(), Some("thumbnail-key"));
+        assert_eq!(descriptor_size, Some(1024));
+        assert!(target.ends_with("quote-thumb"));
+        assert!(
+            service
+                .prepare_quote_attachment_download(&account.id, &conversation.id, &message_id, 1)
+                .is_err()
+        );
+        std::fs::write(&target, b"abc").unwrap();
+        let opened = service
+            .open_quote_media_handle(&account.id, &conversation.id, &message_id, "quote-thumb", 0)
+            .unwrap();
+        assert_eq!(opened.size_bytes, 3);
+        assert!(
+            service
+                .open_quote_media_handle(&account.id, &conversation.id, &message_id, "other-id", 0)
+                .is_err()
+        );
+        assert!(
+            service
+                .open_quote_media_handle(
+                    &account.id,
+                    &conversation.id,
+                    &message_id,
+                    "quote-thumb",
+                    1
+                )
+                .is_err()
+        );
+        let mut duplicate = duplicate;
+        duplicate.quote_snapshot.as_mut().unwrap().attachments[0]
+            .thumbnail
+            .as_mut()
+            .unwrap()
+            .locator = Some(crate::store::HistoryAttachmentLocator {
+            key: Some("later-key-must-not-overwrite".into()),
+            ..Default::default()
+        });
+        assert!(
+            !service
+                .store_ref()
+                .insert_message(&duplicate, None, None, false)
+                .unwrap()
+        );
+        let preserved = service
+            .store_ref()
+            .live_quote_attachment_locators(&account.id, &message_id)
+            .unwrap();
+        assert_eq!(preserved[0].key.as_deref(), Some("thumbnail-key"));
     }
 
     /// Contract 1.259 (§4.243, batch Z1 · S14), the receive seam: an
@@ -47519,6 +49026,7 @@ mod tests {
                 source: source.map(str::to_string),
                 source_uuid: source_uuid.map(str::to_string),
                 peer_name: peer_name.map(str::to_string),
+                source_number: None,
                 group_id: None,
                 text: Some(text.into()),
                 text_bytes: Some(text.len() as u32),
@@ -47702,6 +49210,7 @@ mod tests {
                 source: source.map(str::to_string),
                 source_uuid: source_uuid.map(str::to_string),
                 peer_name: peer_name.map(str::to_string),
+                source_number: None,
                 group_id: None,
                 text: Some(text.into()),
                 text_bytes: Some(text.len() as u32),
@@ -47753,6 +49262,7 @@ mod tests {
                     aci: PEER_ACI.into(),
                     number: Some(peer_number.into()),
                     name: Some("Sync Peer".into()),
+                    pni: None,
                 }],
                 false,
             )
@@ -47825,6 +49335,448 @@ mod tests {
         assert_eq!(folded.title, "333***33");
     }
 
+    /// 契约 1.295（§4.248 · PNI 会话归并），同步 seam：`apply_sync_contacts`
+    /// 的绑定扫折并 PNI 键会话行——同记录携 aci+pni 即同人证据（官方
+    /// maybeMergeContacts 三键的 pni 腿）。消息/未读承载、无重复行、A5 提示
+    /// 行的官方无号码臂（PNI 不是号码，提示以壳行标题称呼、number 键缺席），
+    /// 台账行落 (account, PNI 键)；重放同批零二次折并（幂等）。
+    #[test]
+    fn sync_contacts_folds_the_discovered_pni_row_into_the_aci_row() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        const PEER_ACI: &str = "44444444-4444-4444-8444-444444444444";
+        const PEER_PNI: &str = "PNI:55555555-5555-4555-8555-555555555555";
+        let receive = |source: Option<&str>,
+                       source_uuid: Option<&str>,
+                       text: &str,
+                       peer_name: Option<&str>,
+                       ts: u64| {
+            NormalizedReceive {
+                required_protocol_version: None,
+                timestamp: Some(ts),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: source.map(str::to_string),
+                source_uuid: source_uuid.map(str::to_string),
+                peer_name: peer_name.map(str::to_string),
+                source_number: None,
+                group_id: None,
+                text: Some(text.into()),
+                text_bytes: Some(text.len() as u32),
+                text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                control: None,
+                server_guid: None,
+                reporting_token: None,
+                server_timestamp: None,
+            }
+        };
+        // ACI 键在用行（sealed-sender 世界：engine 只投影 sourceUuid）。
+        service
+            .ingest_receive(
+                receive(Some(PEER_ACI), Some(PEER_ACI), "live hello", None, 1_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        // PNI 键行（engine 把 PNI 目的地投影为 PNI: 前缀键），带真名标题。
+        service
+            .ingest_receive(
+                receive(Some(PEER_PNI), None, "pni hello", Some("Pni Peer"), 2_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let pni_row = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", PEER_PNI)
+            .unwrap()
+            .expect("the PNI-keyed row exists pre-fold");
+        let live = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", PEER_ACI)
+            .unwrap()
+            .expect("the ACI-keyed row exists pre-fold");
+        assert_ne!(pni_row.id, live.id);
+        // 折前：PNI 行的未读由收路递增。
+        let pre = service
+            .store_ref()
+            .conversation_summary(&account.id, &pni_row.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pre.unread_count, 1);
+
+        let account_row = service
+            .store_ref()
+            .account_by_id(&account.id)
+            .unwrap()
+            .expect("the synced account row");
+        let record = crate::engine::SyncContactRecord {
+            aci: PEER_ACI.into(),
+            number: None,
+            pni: Some(PEER_PNI.into()),
+            name: Some("Sync Pni Peer".into()),
+        };
+        let events = service
+            .apply_sync_contacts(&account_row, std::slice::from_ref(&record), false)
+            .unwrap();
+
+        let merged = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationMerged {
+                    from_conversation_id,
+                    to_conversation,
+                    ..
+                } => Some((from_conversation_id, to_conversation)),
+                _ => None,
+            })
+            .expect("the PNI row folds into the ACI row");
+        assert_eq!(merged.0, &pni_row.id);
+        assert_eq!(merged.1.id, live.id);
+        // A5 提示行：双侧都有消息、壳行标题有用 → 铸行；PNI 不是号码
+        //（官方 getNumber 无号码臂）——number 键缺席，标题键承载显示材料。
+        let notice = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) if record.direction == "system" => {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("the notice rides its own upserted frame");
+        let merge_face = notice
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.conversation_merge.as_ref())
+            .expect("the notice carries the conversationMerge face");
+        assert_eq!(
+            merge_face.obsolete_conversation_title.as_deref(),
+            Some("Pni Peer")
+        );
+        assert_eq!(merge_face.obsolete_conversation_number, None);
+
+        let store = service.store_ref();
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", PEER_PNI)
+                .unwrap()
+                .is_none(),
+            "the PNI-keyed row is retired"
+        );
+        // 承载：两行种子 + 折并提示行，无重复（pni hello 恰一次）。
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![live.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+        let pni_texts: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE body = 'pni hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pni_texts, 1, "no duplicate rows survive the fold");
+        // 未读承载：读水位重算，未读徽章守恒（两条 incoming，提示行不计）。
+        let folded = store
+            .conversation_summary(&account.id, &live.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(folded.unread_count, 2);
+        // 备注键锚点：幸存行以 ACI 暴露 serviceId（桌面 signalRemarkKeyFor），
+        // pni 成为会话属性字段（官方 updatePni 词形，additive 键）。
+        assert_eq!(folded.service_id.as_deref(), Some(PEER_ACI));
+        assert_eq!(folded.pni.as_deref(), Some(PEER_PNI));
+        // 台账：PNI 键折叠快照在册（回滚面）。
+        let ledger: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_identity_merges
+                  WHERE account_id=?1 AND obsolete_peer_key=?2",
+                params![account.id, PEER_PNI],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ledger, 1);
+
+        // 幂等重放：同批证据再来，不再并第二次（无 merge/notice 帧，行集不变）。
+        let replay = service
+            .apply_sync_contacts(&account_row, std::slice::from_ref(&record), false)
+            .unwrap();
+        assert!(
+            replay
+                .iter()
+                .all(|event| !matches!(event, HostSideEvent::ConversationMerged { .. })),
+            "repeated evidence never merges twice"
+        );
+        assert!(
+            replay
+                .iter()
+                .all(|event| !matches!(event, HostSideEvent::MessageUpserted(record) if record.direction == "system")),
+        );
+        let count_after: i64 = service
+            .store_ref()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![live.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after, 3, "replay folds nothing a second time");
+    }
+
+    /// 契约 1.295（§4.248），收路 seam：信封落在 PNI 键行而 sourceUuid 是
+    /// 裸 ACI——绑定臂当场折并（1.259 同路径同帧），落地行重挂 canonical
+    /// 会话 id；绑定盖章先行，PNI 行即使折叠 canonical 缺席也拿 ACI 面。
+    #[test]
+    fn ingest_receive_folds_the_discovered_pni_row_and_reroutes_the_landed_row() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        const PEER_ACI: &str = "66666666-6666-4666-8666-666666666666";
+        const PEER_PNI: &str = "PNI:77777777-7777-4777-8777-777777777777";
+        let receive = |source: Option<&str>, source_uuid: Option<&str>, text: &str, ts: u64| {
+            NormalizedReceive {
+                required_protocol_version: None,
+                timestamp: Some(ts),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: source.map(str::to_string),
+                source_uuid: source_uuid.map(str::to_string),
+                peer_name: Some("Pni Peer".into()),
+                source_number: None,
+                group_id: None,
+                text: Some(text.into()),
+                text_bytes: Some(text.len() as u32),
+                text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                control: None,
+                server_guid: None,
+                reporting_token: None,
+                server_timestamp: None,
+            }
+        };
+        service
+            .ingest_receive(
+                receive(Some(PEER_PNI), None, "pni hello", 1_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        service
+            .ingest_receive(
+                receive(Some(PEER_ACI), Some(PEER_ACI), "live hello", 2_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let pni_row = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", PEER_PNI)
+            .unwrap()
+            .expect("the PNI-keyed row exists pre-fold");
+        let live = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", PEER_ACI)
+            .unwrap()
+            .expect("the ACI-keyed row exists pre-fold");
+
+        let events = service
+            .ingest_receive(
+                receive(Some(PEER_PNI), Some(PEER_ACI), "fold hello", 3_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+
+        let landed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record)
+                    if record.text.as_deref() == Some("fold hello") =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("the landed row upserts");
+        assert_eq!(
+            landed.conversation_id, live.id,
+            "the landed row re-keys with its conversation",
+        );
+        let merged = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationMerged {
+                    from_conversation_id,
+                    ..
+                } => Some(from_conversation_id.clone()),
+                _ => None,
+            })
+            .expect("the merged frame rides");
+        assert_eq!(merged, pni_row.id);
+        let store = service.store_ref();
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", PEER_PNI)
+                .unwrap()
+                .is_none()
+        );
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![live.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // 两行种子 + 折并落地行 + 提示行（壳标题 "Pni Peer" 有用，双侧有消息）。
+        assert_eq!(count, 4);
+    }
+
+    /// 契约 1.295（§4.248），诚实降级臂：引擎未投影 pni（字段缺席/退化），
+    /// 双行证据永不出现——不折并、无 merge 帧、两行原样并存。
+    #[test]
+    fn sync_contacts_without_pni_material_leaves_the_double_row_untouched() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        const PEER_ACI: &str = "88888888-8888-4888-8888-888888888888";
+        const PEER_PNI: &str = "PNI:99999999-9999-4999-8999-999999999999";
+        let receive =
+            |source: Option<&str>, source_uuid: Option<&str>, text: &str| NormalizedReceive {
+                required_protocol_version: None,
+                timestamp: Some(1_000),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: source.map(str::to_string),
+                source_uuid: source_uuid.map(str::to_string),
+                peer_name: None,
+                source_number: None,
+                group_id: None,
+                text: Some(text.into()),
+                text_bytes: Some(text.len() as u32),
+                text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                control: None,
+                server_guid: None,
+                reporting_token: None,
+                server_timestamp: None,
+            };
+        service
+            .ingest_receive(
+                receive(Some(PEER_ACI), Some(PEER_ACI), "live hello"),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        service
+            .ingest_receive(
+                receive(Some(PEER_PNI), None, "pni hello"),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let account_row = service
+            .store_ref()
+            .account_by_id(&account.id)
+            .unwrap()
+            .expect("the synced account row");
+        // pni 缺席（引擎未投影）+ 号码也缺席：零绑定、零折并。
+        let events = service
+            .apply_sync_contacts(
+                &account_row,
+                &[crate::engine::SyncContactRecord {
+                    aci: PEER_ACI.into(),
+                    number: None,
+                    pni: None,
+                    name: Some("No Pni Peer".into()),
+                }],
+                false,
+            )
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, HostSideEvent::ConversationMerged { .. })),
+            "no pni material, no fold"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, HostSideEvent::MessageUpserted(record) if record.direction == "system")),
+        );
+        let store = service.store_ref();
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", PEER_PNI)
+                .unwrap()
+                .is_some(),
+            "the PNI-keyed row stays (honest degradation)"
+        );
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", PEER_ACI)
+                .unwrap()
+                .is_some()
+        );
+        // 退化 pni == aci 同判：材料不构成同人证据。
+        let degenerate = service
+            .apply_sync_contacts(
+                &account_row,
+                &[crate::engine::SyncContactRecord {
+                    aci: PEER_ACI.into(),
+                    number: None,
+                    pni: Some(PEER_ACI.into()),
+                    name: Some("Degenerate".into()),
+                }],
+                false,
+            )
+            .unwrap();
+        assert!(
+            degenerate
+                .iter()
+                .all(|event| !matches!(event, HostSideEvent::ConversationMerged { .. }))
+        );
+    }
+
     /// The engine's P14 metadata faces (contract 1.107, §4.88) ride the
     /// message end to end: the descriptor's caption/blurHash/integrity
     /// pair/flag booleans and the rich `expireTimerVersion`/preview date
@@ -47844,6 +49796,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("with media".into()),
             text_bytes: Some(10),
@@ -47983,6 +49936,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("body".into()),
             text_bytes: Some(4),
@@ -48076,6 +50030,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("quoting you".into()),
             text_bytes: Some(11),
@@ -48155,6 +50110,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("from the phone".into()),
             text_bytes: Some(14),
@@ -48665,6 +50621,7 @@ mod tests {
                 filename: Some("a.txt".into()),
                 content_type: Some("text/plain".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             },
             MessagesSendAttachmentEntry {
@@ -48676,6 +50633,7 @@ mod tests {
                 filename: Some("b.txt".into()),
                 content_type: Some("text/plain".into()),
                 blur_hash: None,
+                attachment_caption: None,
                 gif: false,
             },
         ];
@@ -49208,6 +51166,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: None,
             text: Some("已更新消息定时消失：86400 秒".into()),
             text_bytes: None,
@@ -49488,9 +51447,9 @@ mod tests {
                 "addFromInviteLinkAccess": "ADMINISTRATOR"
             })
         );
-        // Any key outside the engine subset refuses the whole call, naming
-        // the offenders.
-        let error = service
+        // Contract 1.296 (§4.287): the description write key folds onto the
+        // engine's `description` arm — the §4.188 recorded gap closed.
+        let payload = service
             .prepare_groups_update(&base(
                 Some("New Name".into()),
                 Some("KT ops group".into()),
@@ -49498,11 +51457,21 @@ mod tests {
                 None,
                 None,
             ))
+            .unwrap();
+        assert_eq!(payload["title"], json!("New Name"));
+        assert_eq!(payload["description"], json!("KT ops group"));
+        // The member-label write pair stays outside the engine face and
+        // refuses the whole call, naming the offenders (the host words).
+        let error = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                member_label: Some("ops".into()),
+                ..base(None, None, None, None, None)
+            })
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE"
                     && !api.retryable
-                    && api.message.contains("groupDescription")));
+                    && api.message.contains("memberLabel")));
         // Validation outranks the capability gate: the empty change set.
         let error = service
             .prepare_groups_update(&base(None, None, None, None, None))
@@ -49617,8 +51586,10 @@ mod tests {
     /// updateGroup arm, engine `8ea56f6` — the official
     /// modifyAnnouncementsOnly group change action). Both values are real
     /// write intents: only-admins is the announcements-only group,
-    /// every-member lifts it. The other refused keys keep their whole-call
-    /// CAPABILITY_UNAVAILABLE — the engine face still does not carry them.
+    /// every-member lifts it. The member-label write pair keeps its
+    /// whole-call CAPABILITY_UNAVAILABLE — the engine face still does not
+    /// carry those arms (the description key this test once used as the
+    /// refused example folds since contract 1.296).
     #[test]
     fn groups_update_announcements_only_folds_onto_engine_face() {
         let (_temp, service) = service();
@@ -49714,25 +51685,27 @@ mod tests {
             .unwrap();
         assert_eq!(mixed_access["memberLabelPermission"], json!("MEMBER"));
         assert_eq!(mixed_access["announcementsOnly"], json!(true));
-        // The description write key keeps its refusal too — the engine's
-        // updateGroup carries no description arm (the §4.188 recorded gap;
-        // the local validation ladder still runs ahead of the seam).
+        // The member-label write pair keeps its refusal — the engine's
+        // updateGroup carries no member-label write arm (the §4.238
+        // boundary; the local validation ladder still runs ahead of the
+        // seam). The description key, formerly this refusal's example,
+        // folds since contract 1.296.
         let error = service
             .prepare_groups_update(&GroupsUpdateParams {
-                group_description: Some("no engine arm yet".into()),
+                member_label: Some("no engine arm yet".into()),
                 ..params(None)
             })
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE"
                     && !api.retryable
-                    && api.message.contains("groupDescription")));
+                    && api.message.contains("memberLabel")));
         // Mixing a folded access arm with an unsupported key still refuses
         // the whole call naming the unsupported host key — never a partial
         // application (the engine commits the set as one change broadcast).
         let error = service
             .prepare_groups_update(&GroupsUpdateParams {
-                group_description: Some("no engine arm yet".into()),
+                member_label_emoji: Some("🔧".into()),
                 permission_member_label: Some("only-admins".into()),
                 ..params(None)
             })
@@ -49740,12 +51713,154 @@ mod tests {
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE"
                     && !api.retryable
-                    && api.message.contains("groupDescription")
+                    && api.message.contains("memberLabelEmoji")
                     && !api.message.contains("permissionMemberLabel")));
         // An invalid send-messages word keeps its INVALID_REQUEST (the
         // params ladder outranks the fold).
         let error = service
             .prepare_groups_update(&params(Some("nobody".into())))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+    }
+
+    /// The groups.update description/admin/ban folds (contract 1.296,
+    /// §4.287): the desktop conversation-info writes — promote/demote
+    /// admin, ban/unban member, the description edit — ride the engine's
+    /// updateGroup arms. groupDescription folds onto the engine's
+    /// `description` word (the same word its listGroups projection reads,
+    /// §4.188); the four member families fold onto the engine's
+    /// same-named promoteAdmins / demoteAdmins / banMembers / unbanMembers
+    /// arms (the addMembers/removeMembers naming discipline). The arms
+    /// compose with the carried subset into one atomic engine change set;
+    /// the §4.44 member-array bounds still outrank the fold; an engine
+    /// build without the arms answers its own refusal through the
+    /// structured UPSTREAM_ERROR face (the 1.188 posture — the connector
+    /// never disguises the engine gap as a local refusal).
+    #[test]
+    fn groups_update_admin_ban_description_arms_fold_onto_engine_face() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let params = || GroupsUpdateParams {
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            group_name: None,
+            group_description: None,
+            add_members: None,
+            remove_members: None,
+            promote_admins: None,
+            demote_admins: None,
+            ban_members: None,
+            unban_members: None,
+            link_state: None,
+            reset_link: None,
+            permission_add_member: None,
+            permission_edit_details: None,
+            permission_send_messages: None,
+            permission_member_label: None,
+            member_label: None,
+            member_label_emoji: None,
+            avatar: AvatarUpdate::Keep,
+            operation_id: None,
+        };
+        // Each arm folds alone (the desktop's single-intent writes).
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                promote_admins: Some(vec!["+15555550101".into()]),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "promoteAdmins": ["+15555550101"],
+            })
+        );
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                demote_admins: Some(vec!["+15555550102".into()]),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(payload["demoteAdmins"], json!(["+15555550102"]));
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                ban_members: Some(vec!["+15555550103".into()]),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(payload["banMembers"], json!(["+15555550103"]));
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                unban_members: Some(vec!["+15555550104".into()]),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(payload["unbanMembers"], json!(["+15555550104"]));
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                group_description: Some("KT ops group".into()),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "description": "KT ops group",
+            })
+        );
+        // The arms compose with the carried subset in one atomic engine
+        // change set — the desktop's mixed submission (rename + promote +
+        // description edit) is one change broadcast, never two calls.
+        let payload = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                group_name: Some("Renamed".into()),
+                group_description: Some("edited".into()),
+                promote_admins: Some(vec!["+15555550101".into(), "+15555550102".into()]),
+                ban_members: Some(vec!["+15555550103".into()]),
+                ..params()
+            })
+            .unwrap();
+        assert_eq!(payload["title"], json!("Renamed"));
+        assert_eq!(payload["description"], json!("edited"));
+        assert_eq!(
+            payload["promoteAdmins"],
+            json!(["+15555550101", "+15555550102"])
+        );
+        assert_eq!(payload["banMembers"], json!(["+15555550103"]));
+        assert_eq!(payload.as_object().expect("payload is an object").len(), 6);
+        // The §4.44 bounds still outrank the fold: an empty admin array and
+        // an over-bound ban array keep their INVALID_REQUEST (validation
+        // precedes the engine seam).
+        let error = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                promote_admins: Some(vec![]),
+                ..params()
+            })
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let error = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                ban_members: Some(
+                    (0..=MAX_GROUP_MEMBERS)
+                        .map(|index| format!("+15555050{index:03}"))
+                        .collect(),
+                ),
+                ..params()
+            })
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
     }
@@ -50711,6 +52826,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: Some("Peer".into()),
+            source_number: None,
             group_id: Some("group-id-1".into()),
             text: Some("群聊信息已更新".into()),
             text_bytes: None,
@@ -50863,6 +52979,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-id-1".into()),
             text: None,
             text_bytes: None,
@@ -51039,6 +53156,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: Some("group-id-1".into()),
             text: None,
             text_bytes: None,
@@ -51255,6 +53373,7 @@ mod tests {
                     reporting_token: None,
                     server_timestamp: None,
                     peer_name: None,
+                    source_number: None,
                     group_id: Some("dW5rbm93bi1ncm91cA==".into()),
                     text: None,
                     text_bytes: None,
@@ -51319,6 +53438,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -51524,6 +53644,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -51935,6 +54056,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -52095,6 +54217,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,

@@ -96,6 +96,30 @@
   `width`/`height`。无两键的旧 payload 逐字节不变；两键在 data URI 既有参数面之后
   纯附加，不改任何既有键名语义。`ENGINE_CONTRACT_MAX_REVISION` 保持 1.286（引擎
   参数面零新增方法：data URI 参数是既有附件形状的附加参数）。)
+- Contract revision: 1.300 (2026-11-23; §4.291 本机账号 e164 读面：`accounts` 各
+  AccountSummary 新增可选 `e164`，来源为同账号行 `signal_account` 的合法 `+` 前缀号码；
+  `maskedAddress`、日志和诊断脱敏不变。旧 connector 缺席该键时桌面回退 masked。
+  详见 §4.291。)
+- Contract revision: 1.296 (2026-11-22; §4.287 群写面解除 refusal：`groups.update`
+  的 description/admin/ban 四族从整调 CAPABILITY_UNAVAILABLE 拒绝改为折叠转发——
+  `groupDescription` → engine `description` 写臂（与 listGroups 投影同词，§4.188
+  记录缺口就此关闭），`promoteAdmins`/`demoteAdmins`/`banMembers`/`unbanMembers`
+  → engine 同名成员族写臂（addMembers/removeMembers 命名纪律）。桌面
+  SignalConversationInfo 的升/降管理员、ban/unban、群描述编辑写穿由此走通
+  （同一单 change 广播，绝不部分应用）。memberLabel/memberLabelEmoji 对仍整调拒绝
+  （engine 无标签写臂，§4.238 边界不变）。引擎侧写臂为另一仓同批合入：本仓
+  转发先行，无臂 engine build 按其自身拒绝经 UPSTREAM_ERROR 面透出（1.188
+  announcementsOnly 同款姿态，非伪装的本地拒绝）。参数五键 schema 已声明
+  （1.45 面），本批仅重写 refusal 清单描述；`ENGINE_CONTRACT_MAX_REVISION`
+  保持 1.286。完整批记录见 §4.287（本文档末尾附录段）。Tests 1442 → 1443
+  (lib +1)。)
+- Contract revision: 1.295 (2026-11-21; §4.286 PNI 会话归并腿：conversations
+  summary 行新增 additive `pni` 身份键（Storage Service ContactRecord 归一
+  "PNI:<uuid>"，engine sync contacts 投影随动）；`conversations` 三身份列
+  （无锁加列 + 幂等回填）+ `merge_peer_identity` 单事务折并（aci/e164 首钉、
+  pni 新者胜、`aci==peer_key` 零动作），壳行折叠后 merge 事件帧不变
+  （§4.135/1.259）；A5 提示行 PNI 壳走官方无号码臂（号码键缺席）。完整批
+  记录见 §4.286（本文档末尾附录段）。Tests 1441 → 1442 (lib +1)。)
 - Login-window sync projection (2026-11-12, wire additive, engine-compat —
   §4.281 `accounts.getSyncState`; no new contract revision number is claimed here: the
   engine's shared revision constant is still 1.285 and the next bump belongs to the
@@ -22031,3 +22055,230 @@ GIF 旗标/语音元数据同款「指针后置位」写 `AttachmentPointer.widt
 type、不做任何解码；文件/语音/贴纸/预览图/长文本附件不声明尺寸（无自然像素尺寸，
 官方同判）。预加载/持久面（`messages.setAttachmentDimensions`）保持不变，仍是
 "引擎没有声明时的桌面测量"兜底入口。
+
+## §4.285 直聊标题号码腿（title 回退的 E.164 级 · 契约 1.219 后续批）
+
+**症状**：手机按号码新加好友并从手机端发首条消息，桌面 linked 会话标题落
+「PNI***e2」样式的掩码串（用户读作"PIN 码"）。
+
+**根因（两级）**：ingest 标题回退链只有两级——envelope sourceName →
+mask_address(peer)。sent 转录的 destination 阶梯产物若为 PNI 服务 id
+（destinationE164 未随行），或 receive 信封只带 sourceNumber 不带
+sourceName，mask 就成了标题；而 mask_address 的设计用途是**日志脱敏**
+（ids.rs 测试名自证 without_logging_full_number），官方 getTitle 梯
+（profile → system → e164 → …）从不把掩码当标题。
+
+**修复（回退链内插号码腿，三处）**：
+
+1. NormalizedReceive 增补 source_number（receive: envelope.sourceNumber；
+   sent: destination 阶梯的 E.164 形 peer 原样），归一化捕获、有界
+   （MAX_RECEIVE_ID_CHARS），#[serde(skip)] 零 wire 变化。
+2. ingest 标题链变为：peer_name → source_number → peer 本身为 E.164
+   （+ 开头原样透出）→ mask_address（最后兜底，仅服务 id 无号码时）。
+3. title_should_upgrade 增补：**纯 E.164 标题视为占位可升级**（同掩码
+   语义）——号码是官方梯的 fallback 不是终态，contacts/profile 名到达
+   后照升（phase2 回归：ingest 落号码，同步名 "Alice Example" 随后升级）。
+
+**测试**：engine 归一化捕获（sourceNumber 逐字 + uuid 键不变）；
+service 三态（ACI+号码→号码 / E.164 peer→原样不掩码 / PNI 无号码→掩码
+保留）；server_integration phase2 回归绿。
+
+**遗留（下一批 §PNI 归并）**：PNI 键会话与 ACI 键会话的归并（对齐官方
+maybeMergeContacts 三键索引 serviceId/e164/pni）、engine
+SyncContactRecord 补 pni 投影、归并时备注键（serviceId）迁移。
+
+## §4.286 PNI 会话归并（对齐官方 maybeMergeContacts 三键 · 契约 1.295）
+
+**症状**：PNI 注册期联系人（手机按号码新加、对端 ACI 尚未广播）在桌面拆成
+两个会话——一条 ACI 键行（sealed-sender 收路建）+ 一条 `PNI:<uuid>` 键行
+（engine 把 PNI 目的地投影为前缀键）。消息历史、未读、置顶分裂两处；PNI 行
+的标识面全缺席（serviceId/e164 解析不出），桌面备注/语种锚（signalRemarkKeyFor
+= 会话 serviceId(ACI)）挂在半边或孤儿；标题落掩码串（§4.247 已修标题腿，
+行仍双份）。
+
+**根因**：connector 的会话寻址只有单键（peer_key），身份归并材料（同人多键
+证据）没有数据面——1.259（§4.243）的双行折并只认「号码壳 × ACI 行」一对，
+PNI 键行不在其发现范围；engine 的联系人同步投影（SyncContactRecord）也只
+带 aci/number，第三键 pni 从未到达 connector。
+
+**官方锚（Signal-Desktop v8.39.0-alpha.1，只读）**：
+- ConversationController.preload.ts:733 maybeMergeContacts：会话按**三键**
+  （serviceId(ACI)/e164/pni）索引，任一身份材料到达即找全部部分匹配行 →
+  归并为一条（ACI 为主键词形）；
+- models/conversations.preload.ts:2322 updatePni：PNI 合并后**只是会话属性
+  字段**——官方从不把掩码/PNI 当标题或号码展示。
+
+**实现（四件，全部 additive）**：
+
+1. **数据面**：conversations 加三列 `identity_aci/identity_e164/identity_pni`
+   （纯加列走 ensure_additive_columns 无条件幂等补齐，不靠版本号门控——
+   2026-10-20 事故纪律）+ 两个部分索引（POST_MIGRATION 层，老库列就绪后建）。
+   存量回填 `backfill_conversation_identity_columns` 每次开库无条件跑、
+   逐列 IS NULL 闸幂等：形状遍（PNI:/裸 ACI UUID/±E164）+ §4.190 身份梯遍
+   （peer_identities 桥两向补齐；同 peer_key 多 ACI 歧义不回填，宁缺勿错）。
+   新行在 ensure_conversation 插入时随建随落（同一解析器）。
+2. **归并机制**：复用 1.259 `Store::merge_peer_identity` 路径与事件帧
+   （§4.245 先例），只扩发现面——壳/canonical 探针在 peer_key 两拼法之后
+   加身份列兜底（identity_pni/identity_e164/identity_aci，官方部分匹配腿）；
+   折并时 canonical 行 COALESCE 吸收壳行三键身份面（官方 updatePni 词形：
+   归并后 PNI 只是会话属性）；台账快照记录身份面。两个触发 seam：
+   contacts 同步（apply_sync_contacts：同记录携 aci+pni 即同人证据，绑定进
+   折叠扫；pni 不进 peer_identities 桥——桥 PK 每账号每 ACI 一行，写 pni
+   会顶掉号码腿，材料住身份列）与 ingest（1.259 绑定臂原样覆盖：信封落
+   PNI 键行 + sourceUuid 裸 ACI 即折）。盖章面
+   `stamp_peer_identity_binding`：aci/e164 首次钉住、pni 新者胜（对端换号
+   重注册拿新 PNI，官方 updatePni 同语义）。
+3. **投影面**：SyncContactRecord 增 pni（engine 侧投影，trim/非空/
+   MAX_RECEIVE_ID_CHARS 有界；另一代理并行补引擎下发，本批消费面按
+   「缺席=不触发、诚实降级」实现）；summary 的 pni 腿启用（预留位转正）：
+   PNI 形键行投影自己的键，其余行从 identity_pni 投影。
+4. **备注键**：桌面 signalRemarkKeyFor = 会话 serviceId(ACI)。归并后幸存行
+   以 ACI 为键暴露 serviceId（canonical=ACI 键行）；折前 PNI 行经盖章/回填
+   拿 identity_aci → serviceId 解析为 ACI——**备注/语种锚跨折并稳定，不
+   孤儿、不双份**。
+
+**wire**：summary 增量键 pni（材料未到=缺席，pre-1.295 主机逐字节不变）；
+A5 合并提示行对 PNI 壳走官方无号码臂（obsoleteConversationNumber 缺席，
+标题键承载显示材料——PNI 绝不当号码/标题）；`conversation.merged`/
+`conversation.changed` 事件面照旧（§4.135/1.259 帧不变）。既有键语义
+零变化。
+
+**测试**：同步 seam PNI 折并（消息/未读承载、无重复行、提示行无号码臂、
+台账行、幂等重放零二次折并）；ingest seam PNI 折并（落地行重挂 canonical、
+绑定盖章先行）；无 pni 材料 + 退化（pni==aci）零行为变化（双行并存、无
+merge 帧）；存量回填幂等（形状/桥/歧义/群行/二次重开零变化 + summary
+pni/serviceId 投影）。
+
+**边界（诚实降级）**：engine 未投影 pni（字段缺席）→ 归永不触发，行为与
+1.294 逐字节一致；歧义桥材料不回填；canonical 行缺席（PNI-only 认识）→
+不折，PNI 行独立存在并尽力升格 ACI 面；号码壳折并路径（1.259）逐字节
+不变（探针兜底只在原探空后介入，号码词形/提示文案同形）。
+
+## §4.287 群写面解除 refusal：description/admin/ban 四族折叠转发（契约 1.296 · 无 wire 新键，`groups.update` 既有参数解除拒绝）
+
+**动机（桌面写穿被本地拒绝挡死）**：桌面 SignalConversationInfo.vue:2230-2233
+已实现升/降管理员与群描述编辑的 `submitGroupChange({promoteAdmins/demoteAdmins})`
+提交，ban/unban 面同理；但 connector 的 `prepare_groups_update` 对
+`description`/`admins`/`removeAdmins`/`bans`/`unbans` 五个内部键恒答
+CAPABILITY_UNAVAILABLE（§4.188 记录的 engine 无 description 写臂缺口 +
+§4.44 引擎批次边界的 admin/ban 族），桌面写穿从未到达 engine。
+
+**connector（本批，本仓）**：五个键从 refusal 列表移入转发列表——
+
+- `groupDescription` → engine `updateGroup` 的 `description` 臂（值 verbatim，
+  1-4096 字节预算在参数层既闸；与 engine `listGroups` 条目的 `description`
+  投影同词——读面 §4.188 早已就位，写面就此闭环）；
+- `promoteAdmins` → engine `promoteAdmins`；`demoteAdmins` →
+  `demoteAdmins`；`banMembers` → `banMembers`；`unbanMembers` →
+  `unbanMembers`（成员数组 verbatim；engine 成员族词表即 connector host 词
+  ——`addMembers`/`removeMembers` 同款命名纪律）；
+- 折叠与既载子集（title/member/avatar/link-access/inviteLinkPassword/
+  announcementsOnly/三 permission 词）合成**同一单 change 广播**——混合提交
+  （改名 + 升管理员 + 描述编辑）一次 engine 调用，绝不部分应用；
+- §4.44 成员界仍在折叠之前：空数组成员、>1001 条、单条 1-128 字符越界
+  照答 INVALID_REQUEST（本地校验梯先于引擎缝）。
+
+**仍在拒绝集**：`memberLabel`/`memberLabelEmoji` 对——engine `updateGroup`
+无标签写臂（§4.238 边界：标签清除由 engine 从群态按 access-control 臂合成，
+host 直写标签无面）。整调拒绝语义不变（拒绝以 host 词命名键）。
+
+**engine（另一仓同批合入）**：`updateGroup` 新增 `description` /
+`promoteAdmins` / `demoteAdmins` / `banMembers` / `unbanMembers` 写臂
+（对应官方 modify_description / promote/demote（modify_member 角色）与
+ban/unban 族 change 动作）。connector 转发先行合入：无臂 engine build 对
+未知参数按其自身拒绝回答，经 connector 的结构化 UPSTREAM_ERROR 面
+（retryable=false）透出——1.188 announcementsOnly 臂同款姿态（引擎合入后
+自动走通，无需 connector 再动）。`ENGINE_CONTRACT_MAX_REVISION` 保持 1.286
+（engine 参数面零新增方法，既有方法的附加参数）。
+
+**桌面（已就位，零改动）**：SignalConversationInfo 的升/降管理员、ban/unban、
+群描述编辑写穿此前被 CAPABILITY_UNAVAILABLE 整调拒绝（失败序号回落真值）；
+本批起经 connector 折叠真正落群更新，收敛走 receive projection（群 UPDATE
+信封 → 系统行 + conversation.changed，§4.44 纪律）。
+
+**wire**：零新键——五个参数自 1.45（§4.44）起即已在
+`groupsUpdateParams` schema 声明，本批仅解除拒绝并重写 schema 描述的
+refusal 清单（五键描述补记 1.296 折叠）。
+
+**测试**：`groups_update_admin_ban_description_arms_fold_onto_engine_face`
+（新）：五臂各自单独折叠的 payload 钉形；与 title/description 混合成单
+原子 change set；空 admin 数组与超界 ban 数组仍 INVALID_REQUEST（校验
+先于折叠）。`groups_update_and_quit_fold_onto_the_engine_face` 与
+`groups_update_announcements_only_folds_onto_engine_face`（改）：原以
+groupDescription 为拒绝样例的断言改为折叠断言，拒绝样例换成
+memberLabel/memberLabelEmoji 对（含混合携带仍整调拒绝、以 host 词命名）。
+
+**边界（诚实降级）**：engine 无五臂 → 未知参数按 engine 自身拒绝经
+UPSTREAM_ERROR 透出（确定性拒绝，盲重放同败）；memberLabel 对拒绝不变；
+`groups.approveJoinRequests`/`groups.revokeInvites` 的独立 refusal（§4.53/
+§4.57）不在本批范围。
+
+## 4.288 普通附件逐条 caption（Contract 1.297）
+
+`messages.attachments.send` 单数面新增可选 `attachmentCaption`，复数面在
+`attachments[]` 条目新增同名键。它对应官方 AttachmentPointer.caption，与消息级
+`text`（DataMessage.body）分离；connector 分别校验，附件 caption 非空且至多
+65536 UTF-8 字节。viewOnce 不允许任一 caption。
+
+写侧在既有附件 data URI 上附加 `;caption=<percent-encoded>`（filename 同款
+编码），engine 将该参数写入对应 AttachmentSpec.caption 并经既有上传原语产
+出 AttachmentPointer.caption。pending descriptor 同步记录；原始 URI 已按
+clientRequestId+attachmentIndex 持久化，ids-only/补字节重试自然保留该陈述。
+
+无新 engine 方法，`ENGINE_CONTRACT_MAX_REVISION` 保持 1.286；旧调用无键时
+data URI/descriptor/线上形状不变。验收覆盖单发/合并转发、分隔符与 CJK、
+非法输入、重试和旧调用字节不变。
+
+## 4.289 quote 附件缩略图 locator 与下载（Contract 1.298）
+
+`attachments.download` 新增与 `attachmentIndex` 互斥的 `quoteAttachmentIndex`
+（0..7），用于定位 `quoteSnapshot.attachments[index].thumbnail`。两键恰一；
+普通消息附件的旧请求与 locator ladder 不变。quote 缩略图复用同一 attachv2
+下载/校验/解密/落盘链，不新增 base64 数据面。`messages.attachments.open`
+在 quote 请求中额外要求 `quoteAttachmentIndex + attachmentId` 同槽匹配；Main
+不得让同 id 的 outbox 普通附件命中该请求。Desktop 磁盘 mirror 使用
+`quote-thumbnail:<index>` 独立命名空间，真实 thumbnail.id 仅作协议身份。
+
+Store schema 51 新增内部可空 `live_quote_attachment_locators` JSON 列，按 quote
+附件位置保存 thumbnail locator；公开 quoteSnapshot 继续省略 locator/key/path。
+v50 原行不回填、不臆造。旧行或 pointer 缺失保持 INVALID_REQUEST/图标降级；
+已落盘文件按 thumbnail.id 幂等命中。viewOnce 燃烧同时清理 quote thumbnail。
+
+重复接收只按同 thumbnail.id 补空 locator 槽，first-face-wins；remote delete
+与 viewOnce 清除内部列，viewOnce 同时清理缩略图文件。验收覆盖迁移、内部列/
+公开形状隔离、普通/quote 寻址互斥、错误 locator、重复合并、重启下载与 viewOnce
+清理；无新 engine 方法，Engine 契约版本不变。
+
+## 4.291 本机账号 e164 读面（Contract 1.300）
+
+`accounts` 的 AccountSummary 新增可选 `e164`。accounts 表每行都是本机已关联账号，
+因此读取同一行已有的 `signal_account` 不构成额外身份探测；只有合法号码形状才投影，
+ACI 或其他键形仍为缺席。`maskedAddress` 保持原值，日志、诊断包和错误面继续脱敏。
+
+`list_accounts`、单个 `account_summary` 与 proxy-group 列表使用同一 row mapper，
+避免不同读面字段漂移。旧客户端忽略该键时行为不变；新桌面在 displayName/既有用户名
+和备注优先级之后使用 `e164`，缺失才回退 `maskedAddress`。测试覆盖全部读面、
+合法 e164、非 e164 键缺席及诊断字段不扩写。
+
+## 4.290 大文件分块出站与 file URI（Contract 1.299）
+
+`attachments.upload.begin/write/abort` 提供 connector-owned 单文件暂存，单 chunk
+解码后 1..=262144 字节、严格顺序 offset、账号绑定、声明大小帽 100 MiB；活跃
+session 最多 8 个、15 分钟过期。`messages.attachments.sendStaged` 只在完整写入后
+进入既有 prepare/dispatch/settlement 链，旧 `messages.attachments.send` 的 Base64
+形状不变。
+
+暂存路径由 `accountId + clientRequestId + attachment[0]` 的 descriptor id 决定，
+拒绝任意调用方路径和覆盖。上行 `send` 的 attachments 条目改为内部
+`file:<percent-path>;contentType=<mime>;sizeBytes=<n>[;filename=...]` URI，整文件
+Base64 不进 JSON；Engine 校验文件形状/大小后读取并继续调用原 upload 原语。
+pending descriptor、payload 表、同 clientRequestId 幂等、失败 ids-only retry 与
+viewOnce/voice/caption/blurHash/尺寸闸全部复用旧实现。file URI retry 只读取路径与
+metadata，不解码整文件。媒体未开启时能力 `attachment-upload-stream` 不广告。
+
+TTL/abort 清理未完成文件；重启或过期后的无行无 payload 废弃文件可重开，
+已有 message/payload 的路径永不覆盖。验证覆盖顺序/跨账号/超帽 chunk、真实文件
+内容、file URI、pending descriptor、重试载荷恢复、TTL/重启恢复和旧 Base64 回归；
+真实 CDN/Windows 实机另列验收。2026-11-23 独立审计发现过期/重启孤儿文件会撞
+`create_new`，已按活跃/持久化/废弃三态修复并复审为 0 must/0 should。
+

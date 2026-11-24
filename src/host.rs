@@ -31,39 +31,40 @@ use crate::service::{
     AccountDeleteLocalDataParams, AccountsDeviceCapabilitiesParams, AccountsGetDevicesParams,
     AccountsGetSyncStateParams, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
     AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUnlinkDeviceParams,
-    AccountsUpdateConfigurationParams, BackupsCloudStatusParams,
-    BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
-    BackupsExportFileReadChunkParams, BackupsExportParams, BackupsExportPlaintextParams,
-    BackupsExportStatusParams, BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams,
-    BackupsRestoreFromCloudParams, BackupsUploadStatusParams, BackupsUploadToCloudParams,
-    CallsCreateLinkAuthParams, CallsEndorsementsPublicKeyParams, CallsGetStateParams,
-    CallsGroupMembersParams, CallsGroupProofParams, CallsLinkPresentationParams, CallsRelaysParams,
-    CallsSendCallEventParams, CallsSendGroupCallUpdateParams, CallsSendSignalParams,
-    ChatFoldersListParams, ChatFoldersSetRecordsParams, ContactsListParams,
-    ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsClearDraftParams,
-    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
-    ConversationsGetStateParams, ConversationsListParams, ConversationsReportSpamParams,
-    ConversationsSaveDraftParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetPinnedParams, ConversationsSetStateParams, EventsListParams,
-    GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams,
-    GroupsCommonParams, GroupsCreateParams, GroupsGetParams, GroupsInviteLinkPasswordParams,
-    GroupsJoinViaLinkParams, GroupsMigrateParams, GroupsParseInviteLinkParams,
-    GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
-    GroupsUpdateParams, HistoryAttachmentDownloadParams, HistoryImportCancelParams,
-    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams,
-    IdentitiesVerifyParams, LinkRotateParams, LinkSessionParams, LinkStartParams,
-    MessageGetByClientRequestIdParams, MessageGetReceiptsParams, MessageGetTextParams,
-    MessageRequestParams, MessagesAdjacentMediaParams, MessagesAroundParams,
-    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
-    MessagesAttachmentsReadChunkParams, MessagesDeleteForMeMessagesParams,
-    MessagesDeleteForMeParams, MessagesEditParams, MessagesListAttachmentDimensionsParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
-    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
-    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
-    MessagesSendAttachmentParams, MessagesSendContactParams, MessagesSendPinMessageParams,
-    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
-    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendStoryParams,
-    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    AccountsUpdateConfigurationParams, AttachmentUploadAbortParams, AttachmentUploadBeginParams,
+    AttachmentUploadWriteParams, BackupsCloudStatusParams, BackupsExportFileCloseHandleParams,
+    BackupsExportFileOpenParams, BackupsExportFileReadChunkParams, BackupsExportParams,
+    BackupsExportPlaintextParams, BackupsExportStatusParams, BackupsImportSnapshotParams,
+    BackupsImportSnapshotStatusParams, BackupsRestoreFromCloudParams, BackupsUploadStatusParams,
+    BackupsUploadToCloudParams, CallsCreateLinkAuthParams, CallsEndorsementsPublicKeyParams,
+    CallsGetStateParams, CallsGroupMembersParams, CallsGroupProofParams,
+    CallsLinkPresentationParams, CallsRelaysParams, CallsSendCallEventParams,
+    CallsSendGroupCallUpdateParams, CallsSendSignalParams, ChatFoldersListParams,
+    ChatFoldersSetRecordsParams, ContactsListParams, ContactsSetLocalAliasParams,
+    ContactsSyncParams, ConversationsClearDraftParams, ConversationsGetAvatarParams,
+    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
+    ConversationsListParams, ConversationsReportSpamParams, ConversationsSaveDraftParams,
+    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
+    ConversationsSetStateParams, EventsListParams, GroupsApproveJoinRequestsParams,
+    GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams, GroupsCommonParams,
+    GroupsCreateParams, GroupsGetParams, GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams,
+    GroupsMigrateParams, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
+    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
+    HistoryAttachmentDownloadParams, HistoryImportCancelParams, HistoryImportRetryParams,
+    HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
+    LinkRotateParams, LinkSessionParams, LinkStartParams, MessageGetByClientRequestIdParams,
+    MessageGetReceiptsParams, MessageGetTextParams, MessageRequestParams,
+    MessagesAdjacentMediaParams, MessagesAroundParams, MessagesAttachmentsCloseHandleParams,
+    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams,
+    MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams, MessagesEditParams,
+    MessagesListAttachmentDimensionsParams, MessagesListParams, MessagesMarkReadParams,
+    MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams, MessagesRemoteDeleteParams,
+    MessagesReportSpamParams, MessagesRetryTextParams, MessagesSearchParams,
+    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendContactParams,
+    MessagesSendPinMessageParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
+    MessagesSendPollVoteParams, MessagesSendReactionParams, MessagesSendStagedAttachmentParams,
+    MessagesSendStickerParams, MessagesSendStoryParams, MessagesSendTextParams,
+    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
     MessagesSetAttachmentDimensionsParams, MessagesSyncReadParams, MessagesSyncViewedParams,
     NotificationProfilesListParams, NotificationProfilesSetRecordsParams, PhoneLookupParams,
     PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
@@ -2902,6 +2903,148 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                 ),
             }
         }
+        "attachments.upload.begin" => {
+            match serde_json::from_value::<AttachmentUploadBeginParams>(request.params) {
+                Ok(params) => match runtime
+                    .begin_attachment_upload(
+                        params.account_id,
+                        params.client_request_id,
+                        params.size_bytes,
+                    )
+                    .await
+                {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "attachments.upload.begin",
+                        "params",
+                        "invalid upload begin params",
+                    ),
+                ),
+            }
+        }
+        "attachments.upload.write" => {
+            match serde_json::from_value::<AttachmentUploadWriteParams>(request.params) {
+                Ok(params) => match runtime
+                    .write_attachment_upload_chunk(
+                        params.account_id,
+                        params.upload_id,
+                        params.offset,
+                        params.data_base64,
+                    )
+                    .await
+                {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "attachments.upload.write",
+                        "params",
+                        "invalid upload write params",
+                    ),
+                ),
+            }
+        }
+        "attachments.upload.abort" => {
+            match serde_json::from_value::<AttachmentUploadAbortParams>(request.params) {
+                Ok(params) => match runtime
+                    .abort_attachment_upload(params.account_id, params.upload_id)
+                    .await
+                {
+                    Ok(aborted) => HostResponse::success(request_id, json!({ "aborted": aborted })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "attachments.upload.abort",
+                        "params",
+                        "invalid upload abort params",
+                    ),
+                ),
+            }
+        }
+        "messages.attachments.sendStaged" => {
+            match serde_json::from_value::<MessagesSendStagedAttachmentParams>(request.params) {
+                Ok(params) => {
+                    let target = match (
+                        params.conversation_id,
+                        params.kind,
+                        params.peer_key,
+                        params.peer_title,
+                    ) {
+                        (Some(conversation_id), None, None, None) => {
+                            Ok(SendTarget::Conversation(conversation_id))
+                        }
+                        (None, Some(kind), Some(peer_key), peer_title) => Ok(SendTarget::Peer {
+                            kind,
+                            peer_key,
+                            peer_title,
+                        }),
+                        _ => Err(reject_probe(
+                            "messages.attachments.sendStaged",
+                            "conversationId,kind,peerKey",
+                            "exactly one of conversationId or kind+peerKey must be provided",
+                        )),
+                    };
+                    let dimensions = match crate::service::validate_attachment_dimensions(
+                        params.width,
+                        params.height,
+                    ) {
+                        Ok(dimensions) => dimensions,
+                        Err(error) => return HostResponse::failure(request_id, error.into_api()),
+                    };
+                    match target {
+                        Ok(target) => match runtime
+                            .send_attachment_staged(
+                                params.account_id,
+                                target,
+                                params.client_request_id,
+                                params.upload_id,
+                                params.size_bytes,
+                                params.filename,
+                                params.content_type,
+                                params.text,
+                                params.quote_message_id,
+                                params.voice_note,
+                                params.view_once,
+                                params.blur_hash,
+                                params.gif,
+                                dimensions,
+                                params.attachment_caption,
+                            )
+                            .await
+                        {
+                            Ok(message) => HostResponse::success(
+                                request_id,
+                                serde_json::to_value(message).unwrap_or(Value::Null),
+                            ),
+                            Err(error) => HostResponse::failure(request_id, error.into_api()),
+                        },
+                        Err(error) => HostResponse::failure(request_id, error),
+                    }
+                }
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "messages.attachments.sendStaged",
+                        "params",
+                        "invalid staged attachment send params",
+                    ),
+                ),
+            }
+        }
         "messages.attachments.send" => {
             match serde_json::from_value::<MessagesSendAttachmentParams>(request.params) {
                 Ok(params) => {
@@ -2943,14 +3086,15 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                             || params.view_once
                             || params.gif
                             || params.width.is_some()
-                            || params.height.is_some())
+                            || params.height.is_some()
+                            || params.attachment_caption.is_some())
                     {
                         return HostResponse::failure(
                             request_id,
                             reject_probe(
                                 "messages.attachments.send",
-                                "attachments,voiceNote,viewOnce,gif,width,height",
-                                "voiceNote, viewOnce, gif, width and height apply to the singular attachment form only",
+                                "attachments,voiceNote,viewOnce,gif,width,height,attachmentCaption",
+                                "voiceNote, viewOnce, gif, width, height and attachmentCaption apply to the singular attachment form only",
                             ),
                         );
                     }
@@ -3012,7 +3156,7 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                                 }
                             };
                             match runtime
-                                .send_attachment_with_dimensions(
+                                .send_attachment_with_caption(
                                     params.account_id,
                                     target,
                                     params.client_request_id,
@@ -3027,6 +3171,7 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                                     blur_hash,
                                     params.gif,
                                     dimensions,
+                                    params.attachment_caption,
                                 )
                                 .await
                             {

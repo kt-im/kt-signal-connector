@@ -7659,7 +7659,7 @@ async fn groups_update_quit_round_trip_and_guards() {
         refused_update["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("groupDescription"),
+            .contains("memberLabel"),
         "{refused_update}"
     );
     assert_eq!(

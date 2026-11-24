@@ -875,6 +875,13 @@ pub struct NormalizedReceive {
     /// Human label from signal-cli envelope.sourceName when present.
     #[serde(skip)]
     pub peer_name: Option<String>,
+    /// The peer E.164 when the envelope carried one (receive: `sourceNumber`;
+    /// the sent path rides the peer-is-E.164 leg of the title chain). The
+    /// conversation-title fallback's
+    /// number leg ahead of `mask_address` — the official desktop titles an
+    /// unresolved peer by number, never by a masked id.
+    #[serde(skip)]
+    pub source_number: Option<String>,
     #[serde(skip)]
     pub group_id: Option<String>,
     #[serde(skip)]
@@ -2396,6 +2403,12 @@ pub struct SyncPniChangeNumber {
 pub struct SyncContactRecord {
     pub aci: String,
     pub number: Option<String>,
+    /// 契约 1.295（§4.248 · PNI 会话归并）：记录的 PNI 服务键（引擎
+    /// `PNI:<uuid>` 前缀词形，与 number 同族可选/有界）。aci+pni 同记录
+    /// 即同人证据——connector 侧据此把 PNI 键会话折并进 ACI 键会话
+    /// （官方 maybeMergeContacts 三键索引）。缺席 = 引擎未投影该面，
+    /// 归并不触发、诚实降级（pre-1.295 行为零变化）。
+    pub pni: Option<String>,
     pub name: Option<String>,
 }
 
@@ -5718,6 +5731,14 @@ fn normalized_sync_contact_records(value: Option<&Value>) -> Vec<SyncContactReco
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>());
+            // 契约 1.295（§4.248）：PNI 腿与 number 同族解析（trim/非空/
+            // MAX_RECEIVE_ID_CHARS 有界）；缺席键 = 引擎未投影，None。
+            let pni = object
+                .get("pni")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>());
             let name = object
                 .get("name")
                 .and_then(Value::as_str)
@@ -5728,7 +5749,12 @@ fn normalized_sync_contact_records(value: Option<&Value>) -> Vec<SyncContactReco
                         .take(MAX_SYNC_CONTACT_NAME_CHARS)
                         .collect::<String>()
                 });
-            Some(SyncContactRecord { aci, number, name })
+            Some(SyncContactRecord {
+                aci,
+                number,
+                pni,
+                name,
+            })
         })
         .collect()
 }
@@ -7810,6 +7836,15 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.chars().take(64).collect::<String>());
+    // The number leg off the same public envelope metadata (`sourceNumber`):
+    // the title fallback prefers it over the masked id. Bounded like the
+    // other receive-id faces; trimmed-empty folds to None.
+    let source_number = envelope
+        .get("sourceNumber")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>());
     let source_uuid = envelope
         .get("sourceUuid")
         .and_then(Value::as_str)
@@ -7878,6 +7913,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         source,
         source_uuid: source_uuid.clone(),
         peer_name: peer_name.clone(),
+        source_number: source_number.clone(),
         group_id,
         text: text.as_ref().map(|value| value.value.clone()),
         text_bytes: text.as_ref().map(|value| value.bytes),
@@ -8940,6 +8976,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
             text_bytes: Some(MAX_INBOUND_TEXT_BYTES as u32),
@@ -8991,6 +9028,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: None,
             text_bytes: None,
@@ -9060,6 +9098,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some(text.clone()),
             text_bytes: Some(text.len() as u32),
@@ -9156,6 +9195,27 @@ mod tests {
         .unwrap();
         assert_eq!(normalized.peer_name.as_deref(), Some("林菲菲"));
         assert_eq!(normalized.direction, "incoming");
+    }
+
+    #[test]
+    fn receive_normalization_captures_source_number() {
+        let normalized = normalize_receive(&json!({
+            "envelope": {
+                "source": "11111111-1111-1111-1111-111111111111",
+                "sourceNumber": "+15555550101",
+                "timestamp": 1,
+                "dataMessage": { "message": "hi" }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        // The number rides beside the uuid peer key: additive material for
+        // the title fallback, never the row key.
+        assert_eq!(normalized.source_number.as_deref(), Some("+15555550101"));
+        assert_eq!(
+            normalized.source.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
     }
 
     #[test]
@@ -9544,6 +9604,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
             text_bytes: Some(MAX_INBOUND_TEXT_BYTES as u32),
@@ -9598,6 +9659,7 @@ mod tests {
             source: Some("+15555550101".into()),
             source_uuid: None,
             peer_name: None,
+            source_number: None,
             group_id: None,
             text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
             text_bytes: Some(MAX_INBOUND_TEXT_BYTES as u32),
