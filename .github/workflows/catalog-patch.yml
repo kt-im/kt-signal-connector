@@ -1,0 +1,89 @@
+name: Catalog Patch
+
+# 一次性/运维工具：只改写 OSS catalog 的兼容区间，不构建二进制。
+# 用于修正历史发布留下的错误 engineContractRevision（如 0.1.4 的 1.92）。
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: connector 或 engine
+        required: true
+        default: connector
+      version:
+        description: 目标版本（如 0.1.4）
+        required: true
+        default: "0.1.4"
+      min_rev:
+        description: engineContractRevision.min
+        required: true
+        default: "1.200"
+      max_rev:
+        description: engineContractRevision.max
+        required: true
+        default: "1.285"
+      desktop_min:
+        required: true
+        default: "1.0"
+      desktop_max:
+        required: true
+        default: "1.0"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Assume Aliyun OIDC role
+        id: aliyun-oidc
+        uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6
+        with:
+          role-to-assume: ${{ vars.KT_SIGNAL_RUNTIME_RAM_ROLE }}
+          oidc-provider-arn: acs:ram::5590716371345016:oidc-provider/github-actions-KT-Settlement
+          audience: sts.aliyuncs.com
+          role-session-name: kt-signal-catalog-patch
+
+      - name: Patch catalog
+        shell: bash
+        env:
+          OSS_ACCESS_KEY_ID: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-id }}
+          OSS_ACCESS_KEY_SECRET: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-secret }}
+          OSS_STS_TOKEN: ${{ steps.aliyun-oidc.outputs.aliyun-security-token }}
+          COMPONENT: ${{ inputs.component }}
+          VERSION: ${{ inputs.version }}
+          MIN_REV: ${{ inputs.min_rev }}
+          MAX_REV: ${{ inputs.max_rev }}
+          DESKTOP_MIN: ${{ inputs.desktop_min }}
+          DESKTOP_MAX: ${{ inputs.desktop_max }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check --break-system-packages oss2
+          python3 - <<'PYEOF'
+          import os, json, time, oss2
+          auth = oss2.StsAuth(os.environ['OSS_ACCESS_KEY_ID'], os.environ['OSS_ACCESS_KEY_SECRET'], os.environ['OSS_STS_TOKEN'])
+          bucket = oss2.Bucket(auth, 'https://oss-us-west-1.aliyuncs.com', 'kontian-assets')
+          key = 'kt/signal-runtime/catalog.json'
+          comp = os.environ['COMPONENT']; ver = os.environ['VERSION']
+          for attempt in range(5):
+              cat = json.loads(bucket.get_object(key).read())
+              hit = [r for r in cat.get('releases', []) if r.get('component') == comp]
+              if not hit:
+                  raise SystemExit(f'FATAL: component {comp} not found')
+              for r in hit:
+                  if r.get('version') != ver:
+                      print(f'skip {comp} {r.get("version")} (target {ver})'); continue
+                  old = r.get('engineContractRevision')
+                  r['engineContractRevision'] = {'min': os.environ['MIN_REV'], 'max': os.environ['MAX_REV']}
+                  r['desktopApiVersion'] = {'min': os.environ['DESKTOP_MIN'], 'max': os.environ['DESKTOP_MAX']}
+                  print(f'{comp} {ver}: engineContractRevision {old} -> {r["engineContractRevision"]}')
+              cat['generatedAtUnixMs'] = int(time.time() * 1000)
+              bucket.put_object(key, json.dumps(cat, ensure_ascii=False, indent=2).encode())
+              break
+          print('--- verify ---')
+          cat = json.loads(bucket.get_object(key).read())
+          for r in cat['releases']:
+              print(r['component'], r['version'], r['engineContractRevision'], r['desktopApiVersion'])
+          PYEOF
