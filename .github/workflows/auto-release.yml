@@ -1,0 +1,86 @@
+# Auto-tag only after the latest main CI succeeds. The existing prod environment
+# remains the production approval gate; Release still owns build + OSS/catalog publication.
+name: Auto Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: auto-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      should_release: ${{ steps.plan.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+      - id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          tag="v${version}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          set +e
+          bash scripts/prepare-release-tag.sh plan "$tag" "${{ github.event.workflow_run.head_sha || '' }}"
+          status=$?
+          set -e
+          if [[ $status -eq 0 ]]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          elif [[ $status -eq 10 ]]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$status"
+          fi
+
+  publish:
+    needs: plan
+    if: needs.plan.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+      - id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          bash scripts/prepare-release-tag.sh publish "${{ needs.plan.outputs.tag }}"
+          status=$?
+          set -e
+          if [[ $status -eq 0 ]]; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          elif [[ $status -eq 10 ]]; then
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$status"
+          fi
+      - name: Dispatch the existing Release workflow
+        if: steps.tag.outputs.released == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run Release --ref "${{ needs.plan.outputs.tag }}"
